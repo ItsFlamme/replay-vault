@@ -35,8 +35,7 @@ you want to watch, trim or share a clip.
 
 **Sharing and storage**
 - **Post to Discord** through a webhook you set up, or upload for a **share link** (kappa.lol, with a delete link).
-- **Watch from your phone** on your home network or Tailscale.
-- **Auto-cleanup** by size or age (stars are never cleaned up), an **archive** drive or NAS for old clips, and a **cloud backup** folder (OneDrive, Google Drive) for the clips you pick.
+- **Auto-cleanup** by size or age (stars are never cleaned up), and an **archive** drive or NAS for old clips.
 - **Move to a new PC:** export and import your settings in one file.
 
 ## Install
@@ -77,7 +76,7 @@ There's no installer yet.
 ## What it changes on your PC
 
 - **Recorder:** OBS runs hidden, tied to the app, and is closed with it. Its WebSocket listens on port 4466, protected by a random password.
-- **Firewall:** a rule for the private OBS, only if you allow it. The phone page asks Windows for its own permission.
+- **Firewall:** a rule for the private OBS, only if you allow it.
 - **GPU preference:** the private OBS is set to run on the high-performance GPU (for laptops and PCs with two GPUs). On by default; untick it to put your setting back.
 - **Game Bar:** turning off Xbox Game Bar capture is optional and off by default. Unticking restores your own setting.
 - **Startup:** "Start with Windows" adds the app to your user's Run list.
@@ -88,7 +87,6 @@ There's no installer yet.
 - **Anti-cheat:** Desktop capture works with every game. Game capture hooks into the game, so anti-cheats like Vanguard, FACEIT or ESEA may block or flag it. Use Desktop for those.
 - **Protected video:** DRM-protected video (some streaming sites) records as black. That's Windows, not the app.
 - **GPUs:** mostly tested on NVIDIA. AMD and Intel encoders should work through OBS, but they've had little testing.
-- **Phone page:** plain http behind a random key in the link. Use it at home or over Tailscale, not on public Wi-Fi.
 - **Windows only.** OBS runs on Linux and macOS, but this app uses Windows APIs throughout.
 
 ## Building from source
