@@ -2,7 +2,7 @@
 
 **Free, open-source instant replay for Windows. Press a key, keep the last few minutes.**
 
-![License: MIT](https://img.shields.io/badge/license-MIT-blue) ![Windows 10 / 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6) ![Rust](https://img.shields.io/badge/made%20with-Rust-B7410E)
+![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue) ![Windows 10 / 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6) ![Rust](https://img.shields.io/badge/made%20with-Rust-B7410E)
 
 [Install](#install) · [Features](#features) · [Hotkeys](#hotkeys) · [Where your files go](#where-your-files-go) · [Building from source](#building-from-source)
 
@@ -104,5 +104,8 @@ sound and never go online; a few slow or online ones are marked `#[ignore]`.
 
 ## License
 
-[MIT](LICENSE). OBS Studio is GPL-2.0-or-later and is downloaded and run unmodified, not bundled. See
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). You can use, change and share the
+code, but anything built on it has to keep the NOTICE file, which credits ItsFlamme.
+
+OBS Studio is GPL-2.0-or-later and is downloaded and run unmodified, not bundled. See
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Not affiliated with the OBS Project or NVIDIA.
