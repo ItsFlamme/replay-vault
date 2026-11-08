@@ -42,7 +42,8 @@ jobs:
                 title: ("#" + $number + " " + $title)[0:256],
                 url: $url,
                 author: { name: ($author + " " + $action + " an issue"), url: $author_url },
-                description: (if ($body | length) > 1000 then $body[0:1000] + "..." elif ($body | length) == 0 then "(no description)" else $body end),
+                description: (if ($body | length) == 0 then "(no description)"
+                  else "```\n" + ((if ($body | length) > 1000 then $body[0:1000] + "..." else $body end) | gsub("```"; "'''")) + "\n```" end),
                 color: (if $action == "reopened" then 15105570 else 3066993 end)
               }]
             }')
