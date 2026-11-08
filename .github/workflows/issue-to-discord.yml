@@ -36,6 +36,7 @@ jobs:
             --arg body "$ISSUE_BODY" \
             '{
               username: "Replay Vault Issues",
+              thread_name: ((if $action == "reopened" then "Reopened #" else "Issue #" end) + $number + ": " + $title)[0:100],
               allowed_mentions: { parse: [] },
               embeds: [{
                 title: ("#" + $number + " " + $title)[0:256],
