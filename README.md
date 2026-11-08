@@ -53,11 +53,14 @@ There's no installer yet.
 
 | Action | Default |
 |---|---|
-| Save the replay | `Alt+F8` |
-| Show or hide the window | `Alt+~` |
-| Save the last 30 s / 60 s, start or stop recording, screenshot, replay on/off, mic mute | Not set (pick them on the Keybinds page) |
+| Save the replay | `Alt+F10` |
+| Start or stop recording | `Alt+F9` |
+| Screenshot | `Alt+F1` |
+| Instant replay on or off | `Alt+Shift+F10` |
+| Show or hide the window | `Alt+Z` |
+| Save the last 30 s / 60 s, mic mute | Not set (pick them on the Keybinds page) |
 
-`Alt+Z` and `Alt+F10` are left alone by default, because NVIDIA's overlay uses them.
+The defaults are the same keys NVIDIA's ShadowPlay uses, so they feel familiar. NVIDIA's overlay would react to them too, so on NVIDIA PCs a switch on the Keybinds page turns its overlay off while Replay Vault runs, and turns it back on when you quit. If AMD Software uses the same keys, the Keybinds page tells you how to change them. Every key can be changed on the Keybinds page.
 
 ## Where your files go
 
