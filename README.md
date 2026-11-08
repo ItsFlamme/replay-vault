@@ -89,7 +89,7 @@ The defaults are the same keys NVIDIA's ShadowPlay uses, so they feel familiar. 
 
 - **Anti-cheat:** Desktop capture works with every game. Game capture hooks into the game, so anti-cheats like Vanguard, FACEIT or ESEA may block or flag it. Use Desktop for those.
 - **Protected video:** DRM-protected video (some streaming sites) records as black. That's Windows, not the app.
-- **GPUs:** mostly tested on NVIDIA. AMD and Intel encoders should work through OBS, but they've had little testing.
+- **GPUs: only NVIDIA is tested.** Recording on AMD and Intel graphics, and on the CPU (for PCs without a supported card), is **untested**. It goes through OBS, so it should work, but nobody has checked it yet. If you have one of those, please try it and tell us how it went in a GitHub issue or on Discord.
 - **Windows only.** OBS runs on Linux and macOS, but this app uses Windows APIs throughout.
 
 ## Building from source
