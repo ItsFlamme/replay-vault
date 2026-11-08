@@ -1,1 +1,5 @@
 /target
+/PLAN*.md
+/UI-BRIEF.md
+CLAUDE.md
+.claude/
