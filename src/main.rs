@@ -2576,8 +2576,10 @@ mod tests {
         let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
             let mut app = App::preview(cc);
             app.tab = Tab::Keybinds;
-            // A saved value that isn't the default, so Restore defaults changes something on any PC.
-            app.cfg.buffer_secs = Config::default().buffer_secs + 10;
+            // A saved key that isn't the default, so this page's Restore defaults changes something
+            // on any PC, a fresh one included (a General setting here didn't count on Keybinds).
+            app.cfg.hotkey = "Ctrl+Alt+F12".into();
+            assert_ne!(app.cfg.hotkey, Config::default().hotkey);
             app.saved = app.cfg.clone();
             app.applied = recorder_settings(&app.saved);
             app
