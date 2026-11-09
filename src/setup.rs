@@ -156,6 +156,8 @@ impl App {
                 ui.add_space(4.0);
                 ui.checkbox(&mut self.setup_firewall, "Block other devices from reaching the recorder")
                     .on_hover_text("Adds a firewall rule that blocks incoming connections to the private OBS from other devices, so Windows never asks whether it can use your network. Windows asks for permission once.");
+                ui.checkbox(&mut self.cfg.gpu_high, "Run the recorder on the high-performance GPU")
+                    .on_hover_text("Sets Windows' graphics preference (Settings > Display > Graphics) for the private OBS to High performance, so on a PC with two graphics chips it records on the one your games use. Only for that copy; you can change it later under General, and Remove from this PC puts it back.");
             }
         });
 

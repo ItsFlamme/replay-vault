@@ -30,3 +30,7 @@ zip = { version = "9.4.1", default-features = false, features = ["deflate"] }
 egui_kittest = { version = "0.37", features = ["wgpu", "snapshot", "eframe"] }
 # Saves the off-screen toast render (toast.rs tests) as a PNG.
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+# Compiles the exe's version info (product name, version) into it; see build.rs.
+embed-resource = "3.0.12"

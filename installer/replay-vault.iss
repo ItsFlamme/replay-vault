@@ -50,6 +50,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\replay-vault.exe"; Description: "{cm:LaunchProgram,Replay Vault}"; Flags: nowait postinstall skipifsilent
+; An update from the app's Install now runs this silently; open the new version when it's done.
+Filename: "{app}\replay-vault.exe"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 ; The app lives in the tray; stop this installed copy (its OBS goes with it) so its files can

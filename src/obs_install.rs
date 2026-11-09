@@ -275,7 +275,7 @@ pub struct Progress {
 
 pub type Shared = Arc<Mutex<Progress>>;
 
-fn set(p: &Shared, stage: &str, done: u64, total: u64) {
+pub(crate) fn set(p: &Shared, stage: &str, done: u64, total: u64) {
     let mut g = p.lock().unwrap();
     g.stage = stage.into();
     g.done = done;
@@ -283,7 +283,7 @@ fn set(p: &Shared, stage: &str, done: u64, total: u64) {
 }
 
 /// Runs `job` on a thread, reporting into a fresh progress handle.
-fn spawn(job: impl FnOnce(&Shared) -> anyhow::Result<()> + Send + 'static, repaint: impl Fn() + Send + 'static) -> Shared {
+pub(crate) fn spawn(job: impl FnOnce(&Shared) -> anyhow::Result<()> + Send + 'static, repaint: impl Fn() + Send + 'static) -> Shared {
     let p: Shared = Arc::default();
     let p2 = p.clone();
     std::thread::spawn(move || {
@@ -303,7 +303,7 @@ struct Release {
 
 /// GET with timeouts, so a dead connection fails with a message instead of hanging setup forever.
 /// `body` caps the whole download (the OBS zip gets long enough for slow links).
-fn get(url: &str, body: Duration) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+pub(crate) fn get(url: &str, body: Duration) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
     ureq::get(url)
         .header("User-Agent", AGENT)
         .config()

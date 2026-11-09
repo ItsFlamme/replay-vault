@@ -119,7 +119,16 @@ impl App {
         card(ui, "Startup", |ui| {
             self.startup_checkbox(ui);
             ui.checkbox(&mut self.cfg.check_updates, "Tell me when a new version is out")
-                .on_hover_text("Asks GitHub once a day whether a newer Replay Vault is out. Nothing about you or this PC is sent, and nothing is downloaded.");
+                .on_hover_text("Asks GitHub once a day whether a newer Replay Vault is out. Nothing about you or this PC is sent, and nothing is downloaded until you choose Install now.");
+            ui.horizontal(|ui| {
+                if button(ui, "Check for updates").on_hover_text("Asks GitHub now whether a newer Replay Vault is out").clicked() {
+                    let c = ui.ctx().clone();
+                    crate::app_update::check_now(move || c.request_repaint());
+                }
+                if let Some(s) = crate::app_update::status() {
+                    ui.label(RichText::new(s).color(pal().muted));
+                }
+            });
             note(ui, format!("{}, Esc or X hides this window. The app keeps running in the tray.", self.cfg.overlay_hotkey));
         });
         card(ui, "Tips", |ui| {

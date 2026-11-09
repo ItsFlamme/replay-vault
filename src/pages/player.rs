@@ -74,7 +74,7 @@ pub(crate) fn trim_controls(ui: &mut egui::Ui, p: &mut player::Player, t: &mut T
             p.seek(t.start);
             p.play();
         }
-        note(ui, "Drag the purple edges to set the start and end. Ctrl+scroll on the timeline zooms; Shift+scroll moves along.");
+        note(ui, "Drag the purple edges to set the start and end. Ctrl+scroll on the timeline zooms; then scroll, or drag the strip under it, to move along.");
         if t.loud.as_ref().is_some_and(|l| !l.is_empty()) {
             note(ui, "Yellow marks are loud moments: click one, or press M for the next.");
         }
@@ -224,8 +224,9 @@ pub(crate) fn parts_row(ui: &mut egui::Ui, t: &mut TrimEdit, busy: bool) {
 /// Returns the time to show: the edge being moved, or where you're scrubbing.
 ///
 /// `view` is the part of the clip shown, (from, length) in seconds: Ctrl+scroll over the bar zooms
-/// in and out around the pointer, Shift+scroll moves along, and dragging past either end of the
-/// bar moves the view with you. With `follow` (playing), the view keeps the playhead in sight.
+/// in and out around the pointer; zoomed in, scrolling (or Shift+scroll) or dragging the in-view
+/// strip along the bottom moves along, and dragging past either end of the bar moves the view
+/// with you. With `follow` (playing), the view keeps the playhead in sight.
 /// `wave` (media::peaks, may be empty) is drawn as the clip's sound along the bar, and `loud`
 /// (seconds) as yellow marks along the top; scrubbing onto one lands exactly on it. `parts`
 /// (start, end) are shaded green.
@@ -236,8 +237,10 @@ pub(crate) fn range_bar(ui: &mut egui::Ui, len: f64, view: &mut (f64, f64), star
         Scrub,
         Start,
         End,
+        View,
     }
     const REACH: f32 = 10.0; // how close to an edge counts as on it
+    const STRIP: f32 = 10.0; // the bottom of the bar that grabs the in-view strip
     let height = if wave.is_empty() { 36.0 } else { 64.0 };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click_and_drag());
     // Zoomed in down to one second across the bar.
@@ -246,7 +249,9 @@ pub(crate) fn range_bar(ui: &mut egui::Ui, len: f64, view: &mut (f64, f64), star
         v.0 = v.0.clamp(0.0, len - v.1);
     };
     if let Some(hover) = resp.hover_pos() {
-        let (zoom, pan) = ui.input(|i| (i.zoom_delta() as f64, i.smooth_scroll_delta.x as f64));
+        // Zoomed in, the plain wheel moves along too, and the trim page doesn't scroll with it.
+        let wheel = if view.1 < len { ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta.y)) } else { 0.0 };
+        let (zoom, pan) = ui.input(|i| (i.zoom_delta() as f64, (i.smooth_scroll_delta.x + wheel) as f64));
         if zoom != 1.0 {
             // Keep the moment under the pointer where it is.
             let at = view.0 + ((hover.x - rect.left()) / rect.width()) as f64 * view.1;
@@ -260,6 +265,8 @@ pub(crate) fn range_bar(ui: &mut egui::Ui, len: f64, view: &mut (f64, f64), star
     }
     fit(view);
     let v = *view;
+    // Zoomed in, the strip along the bottom (it shows which part is in view) can be dragged.
+    let on_strip = |p: egui::Pos2| v.1 < len && p.y >= rect.bottom() - STRIP;
     let x_of = |t: f64| rect.left() + ((t - v.0) / v.1) as f32 * rect.width();
     let t_of = |x: f32| (v.0 + ((x - rect.left()) / rect.width()) as f64 * v.1).clamp(0.0, len);
     // The edge under the pointer, the nearer one if both are close.
@@ -276,26 +283,32 @@ pub(crate) fn range_bar(ui: &mut egui::Ui, len: f64, view: &mut (f64, f64), star
         grab = None;
         ui.data_mut(|d| d.remove::<Grab>(id));
     } else if grab.is_none() {
-        grab = ui.input(|i| i.pointer.press_origin()).map(|p| under(p.x, *start, *end));
+        grab = ui.input(|i| i.pointer.press_origin()).map(|p| if on_strip(p) { Grab::View } else { under(p.x, *start, *end) });
         ui.data_mut(|d| d.insert_temp(id, grab.unwrap_or(Grab::Scrub)));
     }
     let mut show = None;
     if let (Some(pos), Some(g)) = (resp.interact_pointer_pos(), grab) {
         let at = t_of(pos.x);
-        show = Some(match g {
+        show = match g {
+            // The strip is the whole clip across the bar.
+            Grab::View => {
+                view.0 += (resp.drag_delta().x / rect.width()) as f64 * len;
+                fit(view);
+                None
+            }
             Grab::Start => {
                 *start = at.min(*end - 0.5).max(0.0);
-                *start
+                Some(*start)
             }
             Grab::End => {
                 *end = at.max(*start + 0.5).min(len);
-                *end
+                Some(*end)
             }
-            Grab::Scrub => loud.iter().copied().find(|&m| (x_of(m) - pos.x).abs() <= 6.0).unwrap_or(at),
-        });
+            Grab::Scrub => Some(loud.iter().copied().find(|&m| (x_of(m) - pos.x).abs() <= 6.0).unwrap_or(at)),
+        };
     }
     // Keep what's being dragged, or the playhead while playing, in view.
-    if let Some(t) = show.or(follow.then_some(playhead)) {
+    if let Some(t) = show.or((follow && grab != Some(Grab::View)).then_some(playhead)) {
         if t < view.0 {
             view.0 = t;
         } else if t > view.0 + view.1 {
@@ -351,15 +364,25 @@ pub(crate) fn range_bar(ui: &mut egui::Ui, len: f64, view: &mut (f64, f64), star
     }
     let px = x_of(show.unwrap_or(playhead));
     painter.line_segment([egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())], egui::Stroke::new(2.0, pal().text));
-    // Zoomed in: a thin strip along the bottom shows which part of the clip is in view.
+    // Zoomed in: a thin strip along the bottom shows which part of the clip is in view, thicker
+    // while pointed at or dragged.
+    let strip_lit = active == Some(Grab::View) || (!resp.is_pointer_button_down_on() && resp.hover_pos().is_some_and(on_strip));
     if v.1 < len {
-        let y = rect.bottom() - 1.5;
+        let w = if strip_lit { 6.0 } else { 3.0 };
+        let y = rect.bottom() - w / 2.0;
         let at = |t: f64| rect.left() + (t / len) as f32 * rect.width();
-        painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], egui::Stroke::new(3.0, pal().raised));
-        painter.line_segment([egui::pos2(at(v.0), y), egui::pos2(at(v.0 + v.1), y)], egui::Stroke::new(3.0, accent_light()));
+        painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], egui::Stroke::new(w, pal().raised));
+        painter.line_segment([egui::pos2(at(v.0), y), egui::pos2(at(v.0 + v.1), y)], egui::Stroke::new(w, accent_light()));
     }
     let on_edge = matches!(active, Some(Grab::Start | Grab::End));
-    resp.on_hover_text("Drag an edge to set the start or end, or drag anywhere else to look through the clip").on_hover_cursor(if on_edge { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::PointingHand });
+    let cursor = if strip_lit {
+        egui::CursorIcon::Grab
+    } else if on_edge {
+        egui::CursorIcon::ResizeHorizontal
+    } else {
+        egui::CursorIcon::PointingHand
+    };
+    resp.on_hover_text("Drag an edge to set the start or end, or drag anywhere else to look through the clip. Zoomed in, scroll or drag the strip along the bottom to move along.").on_hover_cursor(cursor);
     show
 }
 

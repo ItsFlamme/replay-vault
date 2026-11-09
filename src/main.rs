@@ -258,6 +258,11 @@ struct App {
     exports: std::collections::HashMap<std::path::PathBuf, Arc<ExportJob>>,
     exported: Option<(String, std::path::PathBuf)>,
     confirm_remove: bool,
+    /// The new-version popup was closed with Later at this many finds (see `app_update::finds`).
+    update_later: u32,
+    /// Installing a new version: its download, or why it failed.
+    update_job: Option<obs_install::Shared>,
+    update_error: Option<String>,
     /// A settings file picked with Import settings, waiting for its changes to be confirmed. Its
     /// folders aren't looked at until then (a network one would be contacted).
     import: Option<config::Export>,
@@ -535,6 +540,9 @@ impl App {
             exports: Default::default(),
             exported: None,
             confirm_remove: false,
+            update_later: 0,
+            update_job: None,
+            update_error: None,
             import: None,
             favorites: Default::default(),
             renaming: None,
@@ -841,8 +849,10 @@ impl App {
         {
             ui.horizontal(|ui| {
                 ui.add_space(4.0);
-                ui.hyperlink_to(RichText::new(format!("Version {} is out", n.version)).small(), &n.url)
-                    .on_hover_text("Opens the download page on GitHub. Install it over this one; your settings and clips stay.");
+                if ui.link(RichText::new(format!("Version {} is out", n.version)).small()).on_hover_text("Shows what's new and lets you install it").clicked() {
+                    self.update_later = u32::MAX;
+                    self.update_error = None;
+                }
             });
             ui.add_space(8.0);
         }
@@ -945,9 +955,91 @@ impl App {
         self.finish_trim();
     }
 
-    /// A dialog is up: rename, new tag, recycle, upload, Discord, import or Remove.
+    /// A dialog is up: rename, new tag, recycle, upload, Discord, import, Remove or a new version.
     fn dialog_open(&self) -> bool {
+        self.asked_dialog_open() || self.update_due()
+    }
+
+    /// One of the dialogs the user opened is up (all but the new-version popup).
+    fn asked_dialog_open(&self) -> bool {
         self.confirm_upload.is_some() || self.confirm_discord.is_some() || self.confirm_remove || self.renaming.is_some() || self.tagging.is_some() || self.import.is_some() || self.confirm_recycle.is_some()
+    }
+
+    /// The new-version popup is up: a newer version was found and not put off with Later, or it's
+    /// being installed. It waits while a recording runs or setup is open.
+    fn update_due(&self) -> bool {
+        app_update::found().is_some()
+            && (self.update_job.is_some() || self.update_error.is_some() || (app_update::finds() != self.update_later && !self.recording && self.wizard.is_none()))
+    }
+
+    /// The new-version popup: what's new, then Install now (or the download page, for the portable
+    /// copy) and Later. While installing it shows the download, then quits for the installer.
+    fn update_dialog(&mut self, ctx: &egui::Context, n: &app_update::Newer) {
+        let installer = n.installer.clone().filter(|_| app_update::installed());
+        let progress = self.update_job.as_ref().map(|j| j.lock().unwrap().clone());
+        if let Some(r) = progress.as_ref().and_then(|p| p.result.clone()) {
+            self.update_job = None;
+            match r.and_then(|()| app_update::run_installer().map_err(|e| format!("couldn't start the installer: {e}"))) {
+                Ok(()) => {
+                    log::write(&format!("Installing Replay Vault {}; closing for the installer.", n.version));
+                    shutdown();
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    log::write(&format!("Couldn't update to Replay Vault {}: {e}", n.version));
+                    self.update_error = Some(e);
+                }
+            }
+            return;
+        }
+        if progress.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        let mut later = false;
+        let r = egui::Modal::new(egui::Id::unique("update_popup")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.label(RichText::new(format!("Replay Vault {} is out", n.version)).strong().size(16.0));
+            ui.label(RichText::new(format!("You have {}. Your settings and clips stay.", env!("CARGO_PKG_VERSION"))).color(pal().muted));
+            if !n.notes.is_empty() {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| ui.label(&n.notes));
+            }
+            ui.add_space(8.0);
+            if let Some(p) = &progress {
+                ui.label(format!("Downloading: {} of {}", clips::size(p.done), clips::size(p.total)));
+                ui.add(egui::ProgressBar::new(if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 }));
+                return;
+            }
+            if let Some(e) = &self.update_error {
+                ui.label(RichText::new(format!("Couldn't update: {e}")).color(RED));
+            }
+            let install = installer.clone().filter(|_| self.update_error.is_none());
+            ui.horizontal(|ui| {
+                let (label, hint) = match install {
+                    Some(_) => ("Install now", "Downloads it, checks it and installs it over this copy, then opens the new version"),
+                    None => ("Open download page", "Opens the release on GitHub, to download it and install it over this copy"),
+                };
+                if primary(ui, !self.recording, RichText::new(label).strong(), egui::Vec2::ZERO).on_hover_text(hint).on_disabled_hover_text("Stop the recording first").clicked() {
+                    match install {
+                        Some(i) => {
+                            let c = ui.ctx().clone();
+                            self.update_job = Some(app_update::download(i, move || c.request_repaint()));
+                        }
+                        None => {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(&n.url));
+                            later = true;
+                        }
+                    }
+                }
+                if button(ui, "Later").on_hover_text("Closes this. The sidebar keeps a link to it.").clicked() {
+                    later = true;
+                }
+            });
+        });
+        if later || (r.should_close() && progress.is_none()) {
+            self.update_later = app_update::finds();
+            self.update_error = None;
+        }
     }
 
     /// The dialog that's up, if any (see `dialog_open`). Each is taken out of its field while
@@ -1100,6 +1192,12 @@ impl App {
                 Some(false) => self.confirm_remove = false,
                 None => {}
             }
+        }
+        if !self.asked_dialog_open()
+            && self.update_due()
+            && let Some(n) = app_update::found()
+        {
+            self.update_dialog(ctx, &n);
         }
     }
 
@@ -1525,11 +1623,19 @@ mod tests {
             }
         }
         for (tab, wizard, name) in pages {
-            let builder = egui_kittest::Harness::builder().with_size([size[0], size[1]]).with_accessibility_check(false);
+            let builder = egui_kittest::Harness::builder().with_max_steps(12).with_size([size[0], size[1]]).with_accessibility_check(false);
             let mut h = builder.wgpu().build_eframe(|cc| {
                 let mut app = App::preview(cc);
                 app.cfg.folder = demo.clone();
                 app.saved.folder = demo.clone();
+                // Screens for the website and README show the default keys, not this PC's own.
+                if std::env::var_os("SCREENS_FOLDER").is_some() {
+                    let d = Config::default();
+                    for c in [&mut app.cfg, &mut app.saved] {
+                        (c.hotkey, c.overlay_hotkey, c.hotkey_30, c.hotkey_60) = (d.hotkey.clone(), d.overlay_hotkey.clone(), d.hotkey_30.clone(), d.hotkey_60.clone());
+                        (c.hotkey_record, c.hotkey_screenshot, c.hotkey_replay, c.hotkey_mic) = (d.hotkey_record.clone(), d.hotkey_screenshot.clone(), d.hotkey_replay.clone(), d.hotkey_mic.clone());
+                    }
+                }
                 app.applied = recorder_settings(&app.cfg);
                 app.tab = tab;
                 app.wizard = wizard;
@@ -1869,7 +1975,7 @@ mod tests {
         // part kept, with its loud moments marked.
         let wave: Vec<f32> = (0..30 * media::PEAKS_PER_SEC).map(|i| if (200..260).contains(&i) { 0.9 } else if i == 80 || i == 440 { 0.7 } else { 0.05 + 0.1 * ((i as f32) * 0.7).sin().abs() }).collect();
         let parts_wave = wave.clone();
-        let mut h = egui_kittest::Harness::builder().with_size([size[0] - 260.0, 100.0]).wgpu().build_ui(move |ui| {
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([size[0] - 260.0, 100.0]).wgpu().build_ui(move |ui| {
             apply_theme(ui.ctx());
             let (mut view, mut start, mut end) = ((0.0, 30.0), 6.0, 18.0);
             egui::Frame::new().fill(pal().card).inner_margin(12).show(ui, |ui| {
@@ -1879,7 +1985,7 @@ mod tests {
         h.step();
         h.render().unwrap().save(out.join("waveform.png")).unwrap();
         // Two parts kept (green) and a third being picked, with their chips and the save button.
-        let mut h = egui_kittest::Harness::builder().with_size([size[0] - 260.0, 150.0]).wgpu().build_ui(move |ui| {
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([size[0] - 260.0, 150.0]).wgpu().build_ui(move |ui| {
             apply_theme(ui.ctx());
             let mut t = TrimEdit { path: "x.mp4".into(), len: 30.0, start: 14.0, end: 18.0, view: (0.0, 30.0), gains: vec![], want_split: false, wave: Arc::default(), job: None, parts: vec![(2.0, 5.5), (20.0, 26.0)], gif: None, gif_msg: None, loud: None };
             egui::Frame::new().fill(pal().card).inner_margin(12).show(ui, |ui| {
@@ -1891,7 +1997,7 @@ mod tests {
         h.step();
         h.render().unwrap().save(out.join("trim-parts.png")).unwrap();
         // Save as GIF: a 4 s part (ready), the whole 30 s (too long), and one being made.
-        let mut h = egui_kittest::Harness::builder().with_size([520.0, 140.0]).wgpu().build_ui(move |ui| {
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([520.0, 140.0]).wgpu().build_ui(move |ui| {
             apply_theme(ui.ctx());
             let gif = Arc::new(ExportJob::default());
             gif.pct.store(40, std::sync::atomic::Ordering::Relaxed);
@@ -1922,7 +2028,7 @@ mod tests {
         for (theme, light) in [("minimalist", false), ("minimalist", true), ("retro", false), ("retro", true)] {
             for (tab, t) in tabs {
                 let built = std::time::Instant::now();
-                let mut h = egui_kittest::Harness::builder().with_size([1100.0, 700.0]).with_accessibility_check(false).wgpu().build_eframe(|cc| {
+                let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).wgpu().build_eframe(|cc| {
                     let mut app = App::preview(cc);
                     (app.cfg.folder, app.cfg.theme, app.cfg.light_mode, app.tab) = (demo.clone(), theme.into(), light, tab);
                     app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Help"].map(String::from).to_vec();
@@ -1970,7 +2076,7 @@ mod tests {
         let path = out.join(format!("{name}.png"));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let demo = demo_folder();
-        let mut h = egui_kittest::Harness::builder().with_size(size).with_accessibility_check(false).wgpu().build_eframe(|cc| {
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size(size).with_accessibility_check(false).wgpu().build_eframe(|cc| {
             let mut app = App::preview(cc);
             app.cfg.folder = demo.clone();
             app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Help"].map(String::from).to_vec();
@@ -2350,7 +2456,7 @@ mod tests {
     fn nav_items_are_named() {
         use egui_kittest::kittest::Queryable;
         for theme in ["minimalist", "retro"] {
-            let mut h = egui_kittest::Harness::builder().with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
+            let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
                 let mut app = App::preview(cc);
                 (app.cfg.theme, app.tab) = (theme.into(), Tab::Clips);
                 app.saved = app.cfg.clone();
@@ -2367,7 +2473,7 @@ mod tests {
     #[test]
     fn whats_new_newest_opens_and_closes() {
         use egui_kittest::kittest::Queryable;
-        let mut h = egui_kittest::Harness::builder().with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
             let mut app = App::preview(cc);
             app.tab = Tab::WhatsNew;
             app
@@ -2385,9 +2491,10 @@ mod tests {
     #[test]
     fn new_version_link_in_sidebar() {
         use egui_kittest::kittest::Queryable;
-        app_update::set_found(Some(app_update::Newer { version: "9.0.0".into(), url: "https://github.com/ItsFlamme/replay-vault/releases/tag/v9.0.0".into() }));
+        let _one_at_a_time = FOUND_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        app_update::set_found(Some(nine()));
         let harness = |check: bool| {
-            let mut h = egui_kittest::Harness::builder().with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(move |cc| {
+            let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(move |cc| {
                 let mut app = App::preview(cc);
                 app.saved.check_updates = check;
                 app
@@ -2401,12 +2508,72 @@ mod tests {
         assert!(!off, "no link with the check turned off");
     }
 
+    /// The found release is global, so the tests that set it take turns.
+    static FOUND_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn nine() -> app_update::Newer {
+        app_update::Newer {
+            version: "9.0.0".into(),
+            url: "https://github.com/ItsFlamme/replay-vault/releases/tag/v9.0.0".into(),
+            notes: "- Faster saves".into(),
+            installer: None,
+        }
+    }
+
+    /// On a PC without the recorder yet, setup shows the GPU preference (ticked by default) next to
+    /// the firewall rule, so it isn't set without the user seeing it. Never clicks: setup writes
+    /// settings as it goes. With SCREENS_OUT set it also saves a picture of the step.
+    #[test]
+    fn setup_shows_gpu_choice() {
+        use egui_kittest::kittest::Queryable;
+        fn build(cc: &mut eframe::CreationContext<'_>) -> App {
+            let mut app = App::preview(cc);
+            app.wizard = Some(0);
+            app.obs_exe = None;
+            app
+        }
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 900.0]).with_accessibility_check(false).build_eframe(build);
+        h.run();
+        assert!(h.query_by_label("Run the recorder on the high-performance GPU").is_some());
+        assert!(h.query_by_label("Block other devices from reaching the recorder").is_some());
+        assert!(Config::default().gpu_high, "ticked unless the user unticks it");
+        if let Some(out) = std::env::var_os("SCREENS_OUT") {
+            let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 900.0]).with_accessibility_check(false).wgpu().build_eframe(build);
+            h.run();
+            h.render().unwrap().save(std::path::Path::new(&out).join("setup-obs.png")).unwrap();
+        }
+    }
+
+    /// The sidebar link opens the new-version popup with what's new; this test copy isn't
+    /// installed, so it offers the download page. Later closes it.
+    #[test]
+    fn new_version_popup() {
+        use egui_kittest::kittest::Queryable;
+        let _one_at_a_time = FOUND_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        app_update::set_found(Some(nine()));
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| App::preview(cc));
+        h.run();
+        let shown_before = h.query_by_label("Replay Vault 9.0.0 is out").is_some();
+        h.get_by_label_contains("Version 9.0.0 is out").click();
+        h.run();
+        let shown = h.query_by_label("Replay Vault 9.0.0 is out").is_some() && h.query_by_label("- Faster saves").is_some();
+        let offer = h.query_by_label("Open download page").is_some() && h.query_by_label("Install now").is_none();
+        h.get_by_label("Later").click();
+        h.run();
+        let gone = h.query_by_label("Replay Vault 9.0.0 is out").is_none();
+        app_update::set_found(None);
+        assert!(!shown_before, "not counted as found in tests, so it waits for the click");
+        assert!(shown, "title and what's new");
+        assert!(offer, "not installed: the download page, not Install now");
+        assert!(gone, "Later closes it");
+    }
+
     /// Changes show the Save bar; Discard and Restore defaults work. Never clicks Save, so the
     /// settings file is left alone.
     #[test]
     fn save_bar_discard_and_defaults() {
         use egui_kittest::kittest::Queryable;
-        let mut h = egui_kittest::Harness::builder().with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
             let mut app = App::preview(cc);
             app.tab = Tab::Keybinds;
             // A saved value that isn't the default, so Restore defaults changes something on any PC.
@@ -2480,18 +2647,23 @@ mod tests {
 
         /// A press at `from_x`, a drag to `to_x` a few pixels a frame, and a release.
         fn drag(&mut self, from_x: f32, to_x: f32) {
+            self.drag_at(from_x, to_x, Self::Y);
+        }
+
+        /// The same at height `y` on the bar.
+        fn drag_at(&mut self, from_x: f32, to_x: f32, y: f32) {
             let button = |x, pressed| egui::Event::PointerButton {
-                pos: egui::pos2(x, Self::Y),
+                pos: egui::pos2(x, y),
                 button: egui::PointerButton::Primary,
                 pressed,
                 modifiers: Default::default(),
             };
-            self.frame(vec![egui::Event::PointerMoved(egui::pos2(from_x, Self::Y))], None);
+            self.frame(vec![egui::Event::PointerMoved(egui::pos2(from_x, y))], None);
             self.frame(vec![button(from_x, true)], None);
             let steps = 20;
             for k in 1..=steps {
                 let x = from_x + (to_x - from_x) * k as f32 / steps as f32;
-                self.frame(vec![egui::Event::PointerMoved(egui::pos2(x, Self::Y))], None);
+                self.frame(vec![egui::Event::PointerMoved(egui::pos2(x, y))], None);
             }
             self.frame(vec![button(to_x, false)], None);
             self.frame(vec![], None);
@@ -2621,7 +2793,7 @@ mod tests {
     /// once there are too many. Uses a clip that doesn't exist, so nothing is decoded.
     #[test]
     fn scrub_frames_one_at_a_time_and_capped() {
-        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).build_eframe(|cc| App::preview(cc));
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_accessibility_check(false).build_eframe(|cc| App::preview(cc));
         let ctx = h.ctx.clone();
         let app = h.state_mut();
         let path = std::env::temp_dir().join("instant-replay-no-such-clip.mp4");
@@ -2660,7 +2832,7 @@ mod tests {
             std::fs::write(dir.join(n), b"not really a picture").unwrap();
         }
         let folder = dir.display().to_string();
-        let mut h = egui_kittest::Harness::builder().with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
             let mut app = App::preview(cc);
             app.tab = Tab::Clips;
             // The keys work on the clip lists (Home's rows don't take them).
@@ -2699,7 +2871,7 @@ mod tests {
             std::fs::write(dir.join(n), b"not really a picture").unwrap();
         }
         let folder = dir.display().to_string();
-        let mut h = egui_kittest::Harness::builder().with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
             let mut app = App::preview(cc);
             (app.tab, app.view, app.cfg.folder) = (Tab::Clips, ClipsView::All, folder);
             app.saved.folder = app.cfg.folder.clone();
@@ -2732,7 +2904,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (old, new) = (dir.join("a.png"), dir.join("b.png"));
         std::fs::write(&old, b"not really a picture").unwrap();
-        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).build_eframe(|cc| App::preview(cc));
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_accessibility_check(false).build_eframe(|cc| App::preview(cc));
         let app = h.state_mut();
         app.picked = vec![old.clone()];
         app.selected = Some(old.clone());
@@ -2755,7 +2927,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.png"), b"x").unwrap();
         let folder = dir.display().to_string();
-        let mut h = egui_kittest::Harness::builder().with_accessibility_check(false).build_eframe(|cc| {
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_accessibility_check(false).build_eframe(|cc| {
             let mut app = App::preview(cc);
             (app.tab, app.cfg.folder) = (Tab::Clips, folder);
             app.saved.folder = app.cfg.folder.clone();
@@ -2784,6 +2956,25 @@ mod tests {
         // Dragging in the middle only scrubs.
         b.drag(b.x_of(4.0), b.x_of(5.0));
         assert!((b.start - 1.0).abs() < 0.1 && (b.end - 7.0).abs() < 0.1, "after scrubbing: {}..{}", b.start, b.end);
+    }
+
+    #[test]
+    fn range_bar_moves_along_when_zoomed() {
+        let mut b = Bar::new();
+        // The whole clip in view: the plain wheel is left for the page.
+        b.wheel(b.x_of(5.0), -3.0, Default::default());
+        assert_eq!(b.view, (0.0, 10.0));
+        // Zoomed in, the wheel turned down moves later.
+        b.view = (0.0, 2.0);
+        b.wheel(b.x_of(1.0), -3.0, Default::default());
+        assert!(b.view.0 > 0.0 && b.view.1 == 2.0, "view after the wheel: {:?}", b.view);
+        // Dragging the strip along the bottom (the whole clip across the bar) moves the view
+        // with it: 300 of 1000 px is 3 of 10 s. The edges stay put.
+        let at = b.view.0;
+        let x = b.rect.left() + (at / 10.0) as f32 * b.rect.width() + 5.0;
+        b.drag_at(x, x + 300.0, b.rect.top() + 34.0);
+        assert!((b.view.0 - (at + 3.0).min(8.0)).abs() < 0.1, "view after dragging the strip from {at}: {:?}", b.view);
+        assert_eq!((b.start, b.end), (0.0, 10.0));
     }
 
     #[test]

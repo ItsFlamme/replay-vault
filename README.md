@@ -4,7 +4,7 @@ Free, open-source instant replay for Windows. It keeps the last few minutes of y
 
 ![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue) ![Windows 10 and 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6)
 
-![The clips library, with clips sorted by game](docs/clips.png)
+![A tour of Replay Vault: the clips library, sharing, tags, montage and settings](docs/tour.gif)
 
 ## Overview
 
@@ -52,7 +52,7 @@ Replay Vault has no accounts, tracking or analytics. It connects to the internet
 
 - download and update OBS Studio and the Microsoft Visual C++ runtime it needs
 - look up game cover art on Steam by the game's name (can be turned off)
-- check GitHub once a day for a newer version of Replay Vault (can be turned off)
+- check GitHub once a day for a newer version of Replay Vault (can be turned off), and download it only when you click Install now
 - send feedback, upload a share link or post to Discord, and only when you use those features
 
 Clips, settings and logs stay on your PC: clips in `Videos\Replay Vault Clips` by default, settings and logs in `%APPDATA%\replay-vault`, and the private OBS copy in `%LOCALAPPDATA%\replay-vault`.
