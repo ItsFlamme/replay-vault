@@ -456,6 +456,9 @@ fn signed_by_microsoft(path: &Path) -> bool {
     Command::new(recorder::windows_exe("powershell.exe"))
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .env("IR_CHECK", path)
+        // Started from PowerShell 7, its module path would be inherited and Windows PowerShell
+        // would find 7's Security module first, which it can't load.
+        .env_remove("PSModulePath")
         .creation_flags(CREATE_NO_WINDOW)
         .status()
         .is_ok_and(|s| s.success())
@@ -615,11 +618,7 @@ mod tests {
     /// A Windows program passes the installer's signature check; a file we just wrote doesn't.
     #[test]
     fn signature_check() {
-        // GitHub's Windows Server runners don't report netsh.exe as Microsoft-signed; the app only
-        // checks a downloaded Microsoft installer, so the positive case runs on real PCs only.
-        if std::env::var_os("GITHUB_ACTIONS").is_none() {
-            assert!(signed_by_microsoft(&recorder::windows_exe("netsh.exe")));
-        }
+        assert!(signed_by_microsoft(&recorder::windows_exe("netsh.exe")));
         let fake = std::env::temp_dir().join("instant-replay-unsigned.exe");
         fs::write(&fake, b"MZ not really").unwrap();
         assert!(!signed_by_microsoft(&fake));
