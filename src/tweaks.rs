@@ -1,4 +1,5 @@
-//! Optional Windows settings: Game Bar capture off, NVIDIA's overlay off, and the
+//! Optional Windows settings: Game Bar capture off, NVIDIA's overlay off, AMD Software's Instant
+//! Replay and hotkeys off (untested), and the
 //! high-performance GPU for the private OBS copy. Each value's original is saved the first time it's changed (tweaks.json in the app's
 //! settings folder), so turning the option off, or Remove, puts it back exactly. All per-user
 //! (HKCU), no admin needed.
@@ -241,6 +242,24 @@ pub fn give_back_nvidia_overlay() {
     if saved().keys().any(|k| k.starts_with(&format!("{NVIDIA_KEY}|"))) && set_nvidia_overlay_off(false).is_ok() {
         start_nvidia_overlay();
     }
+}
+
+/// AMD Software (Adrenalin) keeps its Record & Stream settings here (amd.rs reads them). The user's
+/// own values win over the machine-wide ones, so these are set per user.
+const AMD_KEY: &str = r"Software\AMD\DVR";
+/// Instant Replay off, and Settings > Hotkeys > Use Hotkeys off (which stops Alt+Z, Alt+R and the
+/// rest, the in-game overlay's keys included).
+const AMD_OFF: [(&str, u32); 2] = [("InstantReplayEnabled", 0), ("HotkeysDisabled", 1)];
+
+/// Switches AMD Software's Instant Replay and hotkeys off. UNTESTED: written from the values amd.rs
+/// reads, never tried on a PC with AMD Software. Nothing is closed, so AMD Software picks it up
+/// when it next starts (a PC restart). Unlike NVIDIA's it stays off while the app is closed: put
+/// back only when unticked or on Remove. `off = false` puts the user's own values back.
+pub fn set_amd_off(off: bool) -> anyhow::Result<()> {
+    for (value, data) in AMD_OFF {
+        if off { change(AMD_KEY, value, json!({ "dword": data }))? } else { restore(AMD_KEY, value)? }
+    }
+    Ok(())
 }
 
 /// Windows' per-app graphics preference (Settings > Display > Graphics) for `exe`: "High

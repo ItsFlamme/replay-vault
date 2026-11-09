@@ -1,5 +1,6 @@
 //! AMD Software (Adrenalin): its Instant Replay records alongside ours, and its hotkeys (Alt+Z,
-//! Ctrl+Shift+S...) can be the same as ours, so both apps would react. Only read, never changed.
+//! Ctrl+Shift+S...) can be the same as ours, so both apps would react. Read here; switched off
+//! only when the user ticks it on Keybinds (tweaks::set_amd_off, untested on an AMD PC).
 
 use std::collections::BTreeMap;
 

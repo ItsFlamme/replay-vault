@@ -52,6 +52,9 @@ pub struct Config {
     /// Turns NVIDIA's overlay and Instant Replay off while set, so its hotkeys don't fire with ours
     /// (put back when unset or on Remove).
     pub nvidia_off: bool,
+    /// Turns AMD Software's Instant Replay and hotkeys off while set (untested on an AMD PC; put
+    /// back when unset or on Remove).
+    pub amd_off: bool,
     /// Asks Windows to run the private OBS copy on the high-performance GPU.
     pub gpu_high: bool,
     /// Clip file names are the game, then the date and time in this style.
@@ -178,6 +181,7 @@ impl Default for Config {
             save_sound: false,
             game_bar_off: false,
             nvidia_off: false,
+            amd_off: false,
             gpu_high: true,
             name_style: 0,
             save_popup: true,
@@ -391,6 +395,7 @@ pub const FIELDS: &[(&str, Option<Page>, bool, Kind)] = {
         ("save_sound", Some(General), false, Setting),
         ("game_bar_off", Some(General), false, Setting),
         ("nvidia_off", Some(Keybinds), false, Setting),
+        ("amd_off", Some(Keybinds), false, Setting),
         ("gpu_high", Some(General), true, Setting),
         ("name_style", Some(General), true, Setting),
         ("save_popup", Some(General), false, Setting),

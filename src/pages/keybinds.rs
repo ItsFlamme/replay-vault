@@ -221,27 +221,43 @@ impl App {
     }
 
     /// AMD Software's Instant Replay records alongside this app, and its hotkeys may be ours too.
-    /// Shown only when one of those clashes; AMD's settings are never changed from here.
+    /// Shown when one of those clashes, or while this app has them switched off (untested).
     pub(crate) fn amd_card(&mut self, ui: &mut egui::Ui) {
         let Some(amd) = self.amd.get_or_insert_with(amd::detect).clone() else { return };
         let ours: Vec<(&str, hotkey::Combo)> = Target::ALL.into_iter().filter_map(|t| Some((t.name(), hotkey::Combo::parse(self.hotkey_of(t))?))).collect();
         let clashes = amd.clashes(&ours);
-        if !amd.replay_on && clashes.is_empty() {
+        let ours_off = self.cfg.amd_off || self.saved.amd_off;
+        if !amd.replay_on && clashes.is_empty() && !ours_off {
             return;
         }
         card(ui, "AMD Software", |ui| {
             let step = |ui: &mut egui::Ui, text: String| {
-                ui.label(RichText::new(format!("•  {text}")).color(pal().text)).on_hover_text("Change it in AMD Software yourself; Replay Vault doesn't touch its settings.");
+                ui.label(RichText::new(format!("•  {text}")).color(pal().text)).on_hover_text("Change it in AMD Software yourself, or tick the box above.");
             };
-            if amd.replay_on {
+            if amd.replay_on && !self.cfg.amd_off {
                 ui.label(RichText::new("AMD Software's Instant Replay is on. It records in the background too, using the same video encoder.").small().color(pal().amber))
                     .on_hover_text("Two recorders on one GPU can drop frames in clips and cost FPS in games.");
-                step(ui, "AMD Software > Settings > Record & Stream: turn off Instant Replay".into());
             }
-            for (combo, name) in &clashes {
-                ui.label(RichText::new(format!("AMD Software also uses {combo}, set here for \"{name}\", so both apps would react to it.")).small().color(pal().amber))
-                    .on_hover_text("Pick another key here, or change AMD's.");
-                step(ui, format!("AMD Software > Settings > Hotkeys: change or turn off {combo}"));
+            if !self.cfg.amd_off {
+                for (combo, name) in &clashes {
+                    ui.label(RichText::new(format!("AMD Software also uses {combo}, set here for \"{name}\", so both apps would react to it.")).small().color(pal().amber))
+                        .on_hover_text("Pick another key here, or change AMD's.");
+                }
+            }
+            ui.checkbox(&mut self.cfg.amd_off, "Turn off AMD's Instant Replay and hotkeys (untested)").on_hover_text(
+                "Sets the values AMD Software keeps for its Instant Replay and Use Hotkeys switches. Not tried on a PC with AMD Software yet, so check AMD Software afterwards. Unticking it, or Remove, puts your own settings back.",
+            );
+            if self.saved.amd_off {
+                note(ui, "AMD Software reads this when it starts: restart the PC, then check that Record & Stream > Instant Replay and Hotkeys > Use Hotkeys are off. If they aren't, switch them off there and tell us.");
+            }
+            if !self.cfg.amd_off {
+                note(ui, "Or switch them off yourself:");
+                if amd.replay_on {
+                    step(ui, "AMD Software > Settings > Record & Stream: turn off Instant Replay".into());
+                }
+                for (combo, _) in &clashes {
+                    step(ui, format!("AMD Software > Settings > Hotkeys: change or turn off {combo}"));
+                }
             }
             ui.add_space(2.0);
             if button(ui, "Check again").on_hover_text("Looks again at AMD Software's settings").clicked() {

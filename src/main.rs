@@ -689,6 +689,23 @@ impl App {
             }
             self.nvidia = None;
         }
+        // AMD Software's Instant Replay and hotkeys (untested), at every start too. Only switched
+        // off on a PC that has AMD Software, so nothing is written for it anywhere else.
+        let amd_off = self.saved.amd_off;
+        if amd_off != before.amd_off && (!amd_off || amd::detect().is_some()) {
+            match tweaks::set_amd_off(amd_off) {
+                Ok(()) if start => {}
+                Ok(()) if amd_off => log::write("Turned AMD Software's Instant Replay and hotkeys off (untested); it picks this up when it next starts."),
+                Ok(()) => log::write("Put AMD Software's Instant Replay and hotkey settings back."),
+                Err(e) => {
+                    log::write(&format!("Couldn't change AMD Software's settings: {e:#}"));
+                    if !start {
+                        self.status = format!("Couldn't change AMD Software's settings: {e:#}");
+                    }
+                }
+            }
+            self.amd = None;
+        }
         let s = &self.saved;
         obs::SAVE_POPUP.store(s.save_popup, std::sync::atomic::Ordering::Relaxed);
         obs::SORT_BY_GAME.store(s.sort_by_game, std::sync::atomic::Ordering::Relaxed);
@@ -1602,7 +1619,7 @@ mod tests {
             .chain([(Tab::General, None, "general-accent".to_string()), (Tab::General, None, "general-no-tips".to_string()), (Tab::Clips, None, "clips-selected-accent".to_string())])
             .chain([(Tab::Video, None, "video-hint".to_string())])
             .chain([(Tab::Keybinds, None, "keybinds-nvidia".to_string()), (Tab::Keybinds, None, "keybinds-nvidia-off".to_string())])
-            .chain([(Tab::Keybinds, None, "keybinds-amd".to_string())])
+            .chain([(Tab::Keybinds, None, "keybinds-amd".to_string()), (Tab::Keybinds, None, "keybinds-amd-off".to_string())])
             .chain(["feedback-draft", "feedback-sent", "feedback-error", "feedback-limit"].map(|n| (Tab::Feedback, None, n.to_string())))
             .chain([(Tab::Audio, None, "audio-apps".to_string()), (Tab::Video, None, "video-follow".to_string())])
             .chain([(Tab::Video, None, "video-hdr".to_string())])
@@ -1722,6 +1739,12 @@ mod tests {
                     app.nvidia = Some((false, false));
                     let save = hotkey::Combo::parse(&app.cfg.hotkey).unwrap();
                     app.amd = Some(Some(amd::Amd { replay_on: true, hotkeys_off: false, hotkeys: vec![("SaveInstantReplay".into(), save)] }));
+                }
+                // The same after ticking the AMD switch-off and saving (only shown; nothing written).
+                if name.ends_with("keybinds-amd-off") {
+                    app.nvidia = Some((false, false));
+                    (app.cfg.amd_off, app.saved.amd_off) = (true, true);
+                    app.amd = Some(Some(amd::Amd { replay_on: false, hotkeys_off: true, hotkeys: vec![] }));
                 }
                 // Setup's welcome with an OBS of their own found (the question only; nothing read).
                 if name == "setup1" {
@@ -1931,9 +1954,9 @@ mod tests {
                     };
                     h.query_all_by_label(label).next().unwrap().scroll_to_me();
                 }
-                if name.ends_with("keybinds-amd") && i == 30 {
+                if name.contains("keybinds-amd") && i == 30 {
                     use egui_kittest::kittest::Queryable;
-                    h.get_by_label("Check again").scroll_to_me();
+                    h.query_all_by_label("Check again").last().unwrap().scroll_to_me();
                 }
                 if name.starts_with("feedback") && i == 30 {
                     use egui_kittest::kittest::Queryable;
