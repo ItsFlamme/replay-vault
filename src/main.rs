@@ -61,6 +61,11 @@ use pages::keybinds::*;
 
 /// Built from a work branch rather than master or a release (see build.rs).
 pub(crate) const DEV_BUILD: bool = option_env!("RV_DEV_BUILD").is_some();
+/// Keybinds' switches that turn off NVIDIA's overlay and AMD Software's Instant Replay: only in
+/// dev builds until they free those apps' keys (NVIDIA's helper keeps its shortcuts with the
+/// overlay off). Without them nothing is changed for NVIDIA or AMD, and a setting saved by a dev
+/// build is put back when the app closes.
+pub(crate) const OVERLAY_SWITCHES: bool = DEV_BUILD;
 /// The window's title, which a second launch also uses to find the running copy.
 pub(crate) const APP_TITLE: &str = if DEV_BUILD { "Replay Vault (Dev build)" } else { "Replay Vault" };
 
@@ -185,6 +190,10 @@ struct App {
     capturing: Option<Target>,
     /// Every key as last registered; None until then, and while one is being set.
     registered: Option<Vec<String>>,
+    /// Keys another app held when last tried, and when that was: they're tried again every few
+    /// seconds, so they work once that app lets go (NVIDIA's overlay closing at start, say).
+    hotkey_failed: Vec<Target>,
+    hotkeys_tried: std::time::Instant,
     tab: Tab,
     /// The settings as last written to disk; the Save bar shows while `cfg` differs.
     saved: Config,
@@ -494,6 +503,8 @@ impl App {
             hotkey_error: None,
             capturing: None,
             registered: None,
+            hotkey_failed: Vec::new(),
+            hotkeys_tried: std::time::Instant::now(),
             tab: Tab::General,
             saved: Config::default(),
             started: std::time::Instant::now(),
@@ -664,7 +675,7 @@ impl App {
             }
         }
         // At every start too, in case an NVIDIA update switched it back on.
-        if s.nvidia_off != before.nvidia_off {
+        if OVERLAY_SWITCHES && s.nvidia_off != before.nvidia_off {
             match tweaks::set_nvidia_overlay_off(s.nvidia_off) {
                 // At start, closing it waits on another thread, so the window isn't held up.
                 Ok(()) if s.nvidia_off && start => {
@@ -692,7 +703,7 @@ impl App {
         // AMD Software's Instant Replay and hotkeys (untested), at every start too. Only switched
         // off on a PC that has AMD Software, so nothing is written for it anywhere else.
         let amd_off = self.saved.amd_off;
-        if amd_off != before.amd_off && (!amd_off || amd::detect().is_some()) {
+        if OVERLAY_SWITCHES && amd_off != before.amd_off && (!amd_off || amd::detect().is_some()) {
             match tweaks::set_amd_off(amd_off) {
                 Ok(()) if start => {}
                 Ok(()) if amd_off => log::write("Turned AMD Software's Instant Replay and hotkeys off (untested); it picks this up when it next starts."),
@@ -1318,6 +1329,9 @@ fn archive_rule(cfg: &Config) -> Option<clips::Archive> {
     ok.then(|| clips::Archive { dir: dir.into(), after: std::time::Duration::from_secs(cfg.archive_days as u64 * 86_400) })
 }
 
+/// How often a hotkey another app held is tried again.
+const HOTKEY_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Don't leave the hidden recorder running after the app closes, or NVIDIA's overlay off.
 fn shutdown() {
     obs::end_session("app closed");
@@ -1353,6 +1367,10 @@ impl eframe::App for App {
         self.pump_jobs(ui.ctx());
         self.finish_capture();
         self.sync_hotkeys();
+        // Keeps trying a key another app held, even from the tray.
+        if !self.hotkey_failed.is_empty() {
+            ui.ctx().request_repaint_after(HOTKEY_RETRY);
+        }
         // Setup has no Save button: what's picked there is kept as it goes.
         if self.wizard.is_some() && self.cfg != self.saved {
             self.keep_settings();
@@ -1618,8 +1636,7 @@ mod tests {
             .chain(tabs.map(|(t, n)| (t, None, format!("{n}-tip"))))
             .chain([(Tab::General, None, "general-accent".to_string()), (Tab::General, None, "general-no-tips".to_string()), (Tab::Clips, None, "clips-selected-accent".to_string())])
             .chain([(Tab::Video, None, "video-hint".to_string())])
-            .chain([(Tab::Keybinds, None, "keybinds-nvidia".to_string()), (Tab::Keybinds, None, "keybinds-nvidia-off".to_string())])
-            .chain([(Tab::Keybinds, None, "keybinds-amd".to_string()), (Tab::Keybinds, None, "keybinds-amd-off".to_string())])
+            .chain(["keybinds-nvidia", "keybinds-nvidia-off", "keybinds-amd", "keybinds-amd-off"].map(|n| (Tab::Keybinds, None, n.to_string())).into_iter().filter(|_| OVERLAY_SWITCHES))
             .chain(["feedback-draft", "feedback-sent", "feedback-error", "feedback-limit"].map(|n| (Tab::Feedback, None, n.to_string())))
             .chain([(Tab::Audio, None, "audio-apps".to_string()), (Tab::Video, None, "video-follow".to_string())])
             .chain([(Tab::Video, None, "video-hdr".to_string())])

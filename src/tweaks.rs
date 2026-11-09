@@ -182,6 +182,53 @@ pub fn nvidia_overlay_running() -> bool {
     programs().iter().any(|(_, _, name)| name.eq_ignore_ascii_case(NVIDIA_OVERLAY_EXE))
 }
 
+/// NVIDIA's shortcuts as its overlay saves them in NVIDIA_KEY: `{name}Count` keys, held in
+/// `{name}0`, `{name}1`..., each a virtual-key code as 4-byte binary. With the names NVIDIA shows.
+const NVIDIA_SHORTCUTS: [(&str, &str); 10] = [
+    ("GFEOverlayHKeyV2", "Open NVIDIA overlay"),
+    ("ScreenshotHKey", "Screenshot"),
+    ("ManualHKey", "Start/stop recording"),
+    ("DVRHKey", "Save Instant Replay"),
+    ("IRToggleHKey", "Instant Replay on/off"),
+    ("AnselUIHKey", "Photo mode"),
+    ("FSUIHKeyV1", "Game filters"),
+    ("PMOCOverlayHKey", "Performance overlay"),
+    ("MicToggleHKey", "Microphone on/off"),
+    ("ChatUIToggleHKey", "Chat"),
+];
+
+/// NVIDIA's helper that holds its shortcuts. It keeps them even with the overlay closed or
+/// switched off, and NVIDIA restarts it if it's closed.
+const NVIDIA_HELPER_EXE: &str = "nvsphelper64.exe";
+
+/// The NVIDIA shortcut that uses `c`, while NVIDIA's helper is running and holding them.
+pub fn nvidia_shortcut_for(c: crate::hotkey::Combo) -> Option<&'static str> {
+    if !programs().iter().any(|(_, _, name)| name.eq_ignore_ascii_case(NVIDIA_HELPER_EXE)) {
+        return None;
+    }
+    let byte = |value: String| read(NVIDIA_KEY, &value)["binary"].get(0).and_then(Value::as_u64);
+    NVIDIA_SHORTCUTS.iter().find_map(|(name, label)| {
+        let count = byte(format!("{name}Count")).unwrap_or(0);
+        let vks: Vec<u64> = (0..count).filter_map(|i| byte(format!("{name}{i}"))).collect();
+        (nvidia_combo(&vks) == Some(c)).then_some(*label)
+    })
+}
+
+/// NVIDIA's key list (modifiers first, e.g. [18, 112] for Alt+F1) as keys, or None if it's empty.
+fn nvidia_combo(vks: &[u64]) -> Option<crate::hotkey::Combo> {
+    let mut c = crate::hotkey::Combo { vk: 0, ctrl: false, alt: false, shift: false, win: false };
+    for &vk in vks {
+        match vk {
+            16 => c.shift = true,
+            17 => c.ctrl = true,
+            18 => c.alt = true,
+            91 | 92 => c.win = true,
+            _ => c.vk = u16::try_from(vk).ok()?,
+        }
+    }
+    (c.vk != 0).then_some(c)
+}
+
 /// NVIDIA's running overlay programs and the NVIDIA host (an nvcontainer.exe) that started them,
 /// host first.
 fn overlay_and_host(list: &[(u32, u32, String)]) -> Vec<u32> {
@@ -283,6 +330,17 @@ pub fn restore_all() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvidia_key_lists() {
+        use crate::hotkey::Combo;
+        assert_eq!(nvidia_combo(&[18, 112]), Combo::parse("Alt+F1"));
+        assert_eq!(nvidia_combo(&[17, 18, 77]), Combo::parse("Ctrl+Alt+M"));
+        assert_eq!(nvidia_combo(&[18, 16, 90]), Combo::parse("Alt+Shift+Z"));
+        assert_eq!(nvidia_combo(&[192]), Some(Combo { vk: 192, ctrl: false, alt: false, shift: false, win: false }));
+        assert_eq!(nvidia_combo(&[]), None);
+        assert_eq!(nvidia_combo(&[18]), None);
+    }
 
     /// Round trip on a value of our own under HKCU, never a real Windows setting.
     #[test]

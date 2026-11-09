@@ -1,22 +1,53 @@
-# Replay Vault
+<p align="center">
+  <img src="docs/banner.gif" alt="Replay Vault: press a key, keep the play" width="100%">
+</p>
 
-Free, open-source instant replay for Windows. It keeps the last few minutes of your game in memory, and one key press saves them as a clip.
+<p align="center">
+  <b>Free, open-source instant replay for Windows.</b><br>
+  It keeps the last few minutes of your game in memory. Press <kbd>Alt</kbd> + <kbd>F10</kbd> and they're saved as a clip.
+</p>
 
-![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue) ![Windows 10 and 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6)
+<p align="center">
+  <a href="../../releases/latest"><img src="https://img.shields.io/badge/Download-for%20Windows-8448f0?style=for-the-badge" alt="Download for Windows"></a>
+  <a href="https://replayvault.app"><img src="https://img.shields.io/badge/replayvault.app-211a2d?style=for-the-badge" alt="Website"></a>
+  <a href="https://discord.gg/n2KYWUPqGY"><img src="https://img.shields.io/badge/Discord-211a2d?style=for-the-badge&logo=discord&logoColor=a678ff" alt="Discord"></a>
+</p>
 
-![A tour of Replay Vault: the clips library, sharing, tags, montage and settings](docs/tour.gif)
+<p align="center">
+  <img src="https://img.shields.io/badge/license-Apache%202.0-352a47" alt="License: Apache 2.0">
+  <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-352a47" alt="Windows 10 and 11">
+</p>
 
-## Overview
+<p align="center">
+  <img src="docs/tour.gif" alt="A tour of Replay Vault: saving a clip, scrubbing, trimming, sharing, tags, audio tracks, setup and keys">
+</p>
 
-Replay Vault records your screen and sound into a rolling buffer. Nothing is written to disk until you press the save key. Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.com) that the app downloads and manages, so you get OBS's GPU encoding without setting up OBS. If you already use OBS, your own install and its settings are not changed.
+## How it works
 
-Main features:
+| 1. It keeps rolling | 2. You press the key | 3. It's a clip |
+|---|---|---|
+| Your screen and sound are recorded into memory, round and round. Nothing is written to disk yet. | Right after the moment, from inside the game: <kbd>Alt</kbd> + <kbd>F10</kbd>, or your own key. | The last minute (or up to 20) lands in your clips folder, ready to watch, trim or share. |
 
-- Instant replay from 10 seconds to 20 minutes, plus full recordings and screenshots
-- Separate audio tracks for game and microphone, or only the apps you choose
-- A clips library with per-game folders, search, stars and tags
-- Trimming, GIF export, and smaller copies sized for Discord or vertical video
-- Optional automatic cleanup by size or age, and archiving to another drive
+Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.com) that the app downloads and manages, so you get OBS's GPU encoding without setting up OBS. If you already use OBS, your own install and its settings are not changed.
+
+## What's on the tapes
+
+**Recording**
+- Instant replay from 10 seconds to 20 minutes, or keys that save just the last 30 or 60 seconds
+- Full recording and screenshots on their own keys
+- Desktop capture by default, which is safe with anti-cheat. Game capture is there if you want it.
+- Game and mic on separate tracks, noise suppression, or record only the apps you pick
+
+**Clips and trim**
+- A clips page with folders per game, search, stars and tags
+- Hover over a clip to scrub through it, or play it in the built-in player
+- Trim with an audio waveform and a volume per track
+- Copies sized for Discord, 720p or vertical 9:16, GIFs and a montage maker
+
+**Sharing**
+- Post to your Discord channel through your own webhook
+- Upload for a share link, and keep the link that deletes it later
+- Clean up old clips by size or age, and move old ones to an archive drive
 
 ## Requirements
 
@@ -38,13 +69,13 @@ Each release includes `SHA256SUMS.txt`. To verify a download, compare it with th
 
 | Action | Key |
 |---|---|
-| Save the replay | `Alt+F10` |
-| Show or hide the window | `Alt+Z` |
-| Start or stop a recording | `Alt+F9` |
-| Screenshot | `Alt+F1` |
-| Turn instant replay on or off | `Alt+Shift+F10` |
+| Save the replay | <kbd>Alt</kbd> + <kbd>F10</kbd> |
+| Show or hide the window | <kbd>Alt</kbd> + <kbd>X</kbd> |
+| Start or stop a recording | <kbd>Alt</kbd> + <kbd>F11</kbd> |
+| Screenshot | <kbd>Alt</kbd> + <kbd>F12</kbd> |
+| Turn instant replay on or off | <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>F11</kbd> |
 
-All keys can be changed on the Keybinds page.
+All keys can be changed on the Keybinds page. They avoid NVIDIA's and AMD's default shortcuts, which those apps keep even with their overlays off. If another app already uses a key you pick, the Keybinds page says which one.
 
 ## Privacy
 
@@ -59,7 +90,7 @@ Clips, settings and logs stay on your PC: clips in `Videos\Replay Vault Clips` b
 
 ## Uninstall
 
-Use **General > Remove from this PC** in the app first. It undoes the changes the app made (startup entry, firewall rule, GPU preference and any Windows, NVIDIA or AMD settings you turned off) and moves the private OBS copy to the Recycle Bin. Your clips are kept. Then uninstall it from Windows Settings, or delete the portable folder.
+Use **General > Remove from this PC** in the app first. It undoes the changes the app made (startup entry, firewall rule, GPU preference and any Windows settings you turned off) and moves the private OBS copy to the Recycle Bin. Your clips are kept. Then uninstall it from Windows Settings, or delete the portable folder.
 
 ## Building from source
 

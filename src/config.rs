@@ -161,15 +161,17 @@ impl Default for Config {
             track_count: 1,
             track_names: Default::default(),
             chat_tracks: [false; 6],
-            // NVIDIA's own keys, so ShadowPlay players keep their habits. NVIDIA's overlay uses the
-            // same ones; the Keybinds page offers to turn it off.
+            // Save is NVIDIA's Alt+F10, so ShadowPlay players keep the habit (the recorder reads it
+            // itself, so NVIDIA can't block it). The rest stay off NVIDIA's defaults (Alt+Z, Alt+F9,
+            // Alt+F1, Alt+Shift+F10) and AMD's (Alt+Z, Alt+R): NVIDIA holds its keys even with its
+            // overlay off, so ours couldn't be registered.
             hotkey: "Alt+F10".into(),
-            overlay_hotkey: "Alt+Z".into(),
+            overlay_hotkey: "Alt+X".into(),
             hotkey_30: String::new(),
             hotkey_60: String::new(),
-            hotkey_record: "Alt+F9".into(),
-            hotkey_screenshot: "Alt+F1".into(),
-            hotkey_replay: "Alt+Shift+F10".into(),
+            hotkey_record: "Alt+F11".into(),
+            hotkey_screenshot: "Alt+F12".into(),
+            hotkey_replay: "Alt+Shift+F11".into(),
             hotkey_mic: String::new(),
             sort_by_game: true,
             steam_covers: true,

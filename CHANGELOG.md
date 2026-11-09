@@ -19,7 +19,7 @@ Notable changes in each release. The app's What's new page is built from this fi
 - Auto-cleanup by size or age, and an archive drive for old clips.
 - Send feedback from the app, and this What's new page.
 - Installer and portable zip.
-- Keybinds can turn off NVIDIA's overlay, and AMD Software's Instant Replay and hotkeys (the AMD switch is untested so far), so their keys don't fire with ours.
+- Default keys stay clear of NVIDIA's and AMD's own shortcuts, and if one of them holds a key you pick, Keybinds says which shortcut uses it.
 - Tells you when a new version is out and installs it with one click (Install now), after checking the download against its published checksum. You can turn the daily check off under General, or check any time with Check for updates.
 
 Recording is tested on NVIDIA. AMD, Intel and CPU recording are untested.

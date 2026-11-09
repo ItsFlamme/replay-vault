@@ -68,14 +68,21 @@ impl App {
     }
 
     /// Registers the app's own hotkeys (all but the save key, which OBS has) when any key changed
-    /// since the last time, but not while one is being set. An empty one is off.
+    /// since the last time, but not while one is being set. An empty one is off. Keys another app
+    /// held are tried again every few seconds (only those, so working keys aren't touched), and
+    /// work as soon as it lets go: NVIDIA's overlay is closed on another thread at start, and
+    /// ticking its box closes it a moment after.
     pub(crate) fn sync_hotkeys(&mut self) {
         let keys: Vec<String> = Target::ALL.into_iter().map(|t| self.hotkey_of(t).clone()).collect();
-        if self.capturing.is_some() || !hotkey::is_running() || self.registered.as_ref() == Some(&keys) {
+        let changed = self.registered.as_ref() != Some(&keys);
+        let retry = !self.hotkey_failed.is_empty() && self.hotkeys_tried.elapsed() >= crate::HOTKEY_RETRY;
+        if self.capturing.is_some() || !hotkey::is_running() || !(changed || retry) {
             return;
         }
         self.registered = Some(keys);
+        self.hotkeys_tried = std::time::Instant::now();
         let mut errors = Vec::new();
+        let mut failed = Vec::new();
         for target in Target::ALL {
             let Some(action) = target.action() else { continue };
             let text = self.hotkey_of(target).clone();
@@ -83,13 +90,30 @@ impl App {
             if combo.is_none() && !text.is_empty() {
                 errors.push(format!("'{text}' isn't a key that works. Click it to set a new one."));
             }
+            if !changed && !self.hotkey_failed.contains(&target) {
+                continue;
+            }
             // Another app (NVIDIA, Discord, ...) may hold the combo already.
             if let Err(e) = hotkey::set_combo(action, combo) {
-                let amd = if self.amd.get_or_insert_with(amd::detect).is_some() { " AMD Software is likely using it (AMD Software > Settings > Hotkeys)." } else { "" };
-                errors.push(format!("{}: {e}{amd}", target.name()));
+                failed.push(target);
+                let who = combo.map(|c| self.who_holds(c)).unwrap_or_default();
+                errors.push(format!("{}: {e}{who}", target.name()));
             }
         }
+        self.hotkey_failed = failed;
         self.hotkey_error = (!errors.is_empty()).then(|| errors.join(" "));
+    }
+
+    /// Which app likely holds `c`, said only when that app is there and uses it: NVIDIA (one of its
+    /// shortcuts, which it holds even with its overlay off) or AMD Software (its keys, while on).
+    fn who_holds(&mut self, c: hotkey::Combo) -> String {
+        if let Some(shortcut) = tweaks::nvidia_shortcut_for(c) {
+            return format!(" NVIDIA uses it for its \"{shortcut}\" shortcut: pick another key here, or change that one in NVIDIA's overlay (Settings > Keyboard shortcuts).");
+        }
+        if self.amd.get_or_insert_with(amd::detect).as_ref().is_some_and(|a| !a.clashes(&[("", c)]).is_empty()) {
+            return " AMD Software uses it (AMD Software > Settings > Hotkeys).".into();
+        }
+        String::new()
     }
 
     pub(crate) fn start_capture(&mut self, target: Target, ctx: &egui::Context) {
@@ -216,8 +240,10 @@ impl App {
             note(ui, format!("The save key keeps the last {}, even in a game. Click a key, then press the combination you want; Esc cancels.", mmss(self.cfg.buffer_secs)));
             note(ui, "Use Ctrl, Alt, Shift or Win with a letter or number; F-keys, Pause, Insert, Home, End, Page Up/Down, Print Screen and Scroll Lock also work on their own.");
         });
-        self.nvidia_card(ui);
-        self.amd_card(ui);
+        if crate::OVERLAY_SWITCHES {
+            self.nvidia_card(ui);
+            self.amd_card(ui);
+        }
     }
 
     /// AMD Software's Instant Replay records alongside this app, and its hotkeys may be ours too.
@@ -266,7 +292,7 @@ impl App {
         });
     }
 
-    /// NVIDIA's overlay uses the same keys (Alt+Z, Alt+F10...), so both apps would react to them.
+    /// NVIDIA's overlay has its own Instant Replay and Save key (Alt+F10), so both apps would react.
     /// Shown when it's on, or when this app turned it off.
     pub(crate) fn nvidia_card(&mut self, ui: &mut egui::Ui) {
         let (on, running) = *self.nvidia.get_or_insert_with(|| (tweaks::nvidia_overlay_on(), tweaks::nvidia_overlay_running()));
@@ -275,7 +301,7 @@ impl App {
         }
         card(ui, "NVIDIA overlay", |ui| {
             if on && !self.cfg.nvidia_off {
-                ui.label(RichText::new("NVIDIA's overlay is on. Its keys (Alt+Z, Alt+F10, Alt+F9, Alt+F1) do the same things as these, so both apps would react to them.").small().color(pal().amber));
+                ui.label(RichText::new("NVIDIA's overlay is on. Its Instant Replay records alongside ours, and its Save key (Alt+F10 unless you changed it) would save in both apps.").small().color(pal().amber));
             }
             ui.checkbox(&mut self.cfg.nvidia_off, "Turn off NVIDIA's overlay and Instant Replay")
                 .on_hover_text("The same switch as in the NVIDIA app. Unticking it, or Remove, puts your own setting back.");
