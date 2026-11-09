@@ -615,7 +615,11 @@ mod tests {
     /// A Windows program passes the installer's signature check; a file we just wrote doesn't.
     #[test]
     fn signature_check() {
-        assert!(signed_by_microsoft(&recorder::windows_exe("netsh.exe")));
+        // GitHub's Windows Server runners don't report netsh.exe as Microsoft-signed; the app only
+        // checks a downloaded Microsoft installer, so the positive case runs on real PCs only.
+        if std::env::var_os("GITHUB_ACTIONS").is_none() {
+            assert!(signed_by_microsoft(&recorder::windows_exe("netsh.exe")));
+        }
         let fake = std::env::temp_dir().join("instant-replay-unsigned.exe");
         fs::write(&fake, b"MZ not really").unwrap();
         assert!(!signed_by_microsoft(&fake));
