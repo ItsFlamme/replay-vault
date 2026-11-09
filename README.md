@@ -79,7 +79,7 @@ Each release includes `SHA256SUMS.txt`. To verify a download, compare it with th
 | Screenshot | <kbd>Alt</kbd> + <kbd>F12</kbd> |
 | Turn instant replay on or off | <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>F11</kbd> |
 
-All keys can be changed on the Keybinds page. They avoid NVIDIA's and AMD's default shortcuts, which those apps keep even with their overlays off. If another app already uses a key you pick, the Keybinds page says which one.
+All keys can be changed on the Keybinds page. Save is <kbd>Alt</kbd> + <kbd>F10</kbd> on purpose, the same key as NVIDIA's instant replay, so ShadowPlay players keep the habit; if NVIDIA's own instant replay is also on, it saves a clip too. The other keys avoid NVIDIA's and AMD's default shortcuts, which those apps keep even with their overlays off. If another app already uses a key you pick, the Keybinds page says which one.
 
 ## Privacy
 
