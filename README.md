@@ -37,6 +37,7 @@ Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.c
 - Full recording and screenshots on their own keys
 - Desktop capture by default, which is safe with anti-cheat. Game capture is there if you want it.
 - Game and mic on separate tracks, noise suppression, or record only the apps you pick
+- Optional pause when no game is open, back on by itself when one is
 
 **Clips and trim**
 - A clips page with folders per game, search, stars and tags
@@ -45,6 +46,7 @@ Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.c
 - Copies sized for Discord, 720p or vertical 9:16, GIFs and a montage maker
 
 **Sharing**
+- Drag a clip into Discord, a browser or a folder, or play and copy the last clip from the tray
 - Post to your Discord channel through your own webhook
 - Upload for a share link, and keep the link that deletes it later
 - Clean up old clips by size or age, and move old ones to an archive drive
@@ -57,8 +59,10 @@ Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.c
 ## Install
 
 1. Download the latest installer (`ReplayVault-<version>-setup.exe`) or the portable zip from [Releases](../../releases). The installer does not need administrator rights.
-2. Run it. A short setup asks for your clips folder, save key, screen and sound devices.
-3. On first run the app downloads OBS Studio (about 225 MB) into its own folder and checks it against the published SHA-256 hash.
+2. Run it. A short setup downloads OBS Studio (about 225 MB), checks it against its published SHA-256 hash, and asks where it and your clips should go.
+3. Setup then picks a quality that suits your PC, or uses the video and sound settings from your own OBS if you have one. Keys, sound and everything else can be changed later.
+
+After that the app updates itself: when a new version is out it asks, and **Update now** downloads it, checks it and puts it in place. Settings and clips stay.
 
 Each release includes `SHA256SUMS.txt`. To verify a download, compare it with the output of `Get-FileHash <file>`.
 
@@ -83,10 +87,10 @@ Replay Vault has no accounts, tracking or analytics. It connects to the internet
 
 - download and update OBS Studio and the Microsoft Visual C++ runtime it needs
 - look up game cover art on Steam by the game's name (can be turned off)
-- check GitHub once a day for a newer version of Replay Vault (can be turned off), and download it only when you click Install now
+- check GitHub once a day for a newer version of Replay Vault (can be turned off), and download it only when you click Update now
 - send feedback, upload a share link or post to Discord, and only when you use those features
 
-Clips, settings and logs stay on your PC: clips in `Videos\Replay Vault Clips` by default, settings and logs in `%APPDATA%\replay-vault`, and the private OBS copy in `%LOCALAPPDATA%\replay-vault`.
+Clips, settings and logs stay on your PC: clips in `Videos\Replay Vault Clips` and the private OBS copy in `%LOCALAPPDATA%\replay-vault` by default (setup can put both on another drive), settings and logs in `%APPDATA%\replay-vault`.
 
 ## Uninstall
 
