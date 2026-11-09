@@ -20,7 +20,7 @@ SCENES = [
     ("clips-tags.png", "", "Stars and tags", "Search, star and tag clips. Starred ones are never cleaned up."),
     ("audio.png", "", "Game and mic apart", "Each sound on its own track, so you can drop your mic later."),
     ("setup2.png", "", "Set up in a minute", "Quality is picked for your PC. Your own OBS is never touched."),
-    ("keybinds-nvidia.png", "", "Keys that stay yours", "Change any key. If NVIDIA or AMD already has one, it says which."),
+    ("keybinds.png", "", "Keys that stay yours", "Change any key. If NVIDIA or AMD already has one, it says which."),
 ]
 
 W, H = 1200, 600
