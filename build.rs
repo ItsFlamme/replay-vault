@@ -31,8 +31,13 @@ fn version_info() {
     let ver = std::env::var("CARGO_PKG_VERSION").unwrap();
     let mut n = ver.split(['.', '-']).map(|p| p.parse::<u16>().unwrap_or(0));
     let nums = format!("{},{},{},0", n.next().unwrap_or(0), n.next().unwrap_or(0), n.next().unwrap_or(0));
+    // The cassette (tools/app_icon.py): Explorer, the Start menu and desktop shortcuts show it.
+    let ico = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("assets").join("replay-vault.ico");
+    println!("cargo:rerun-if-changed={}", ico.display());
+    let ico = ico.display().to_string().replace('\\', "\\\\");
     let rc = format!(
         r#"#include <winver.h>
+1 ICON "{ico}"
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION {nums}
 PRODUCTVERSION {nums}

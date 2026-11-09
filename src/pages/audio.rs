@@ -87,18 +87,6 @@ pub(crate) fn device_parts(name: &str) -> (&str, &str) {
     }
 }
 
-/// Keeps track 1 the full mix: every device recorded on any track is on it too. Voice chat
-/// never is, since it's already in the playback sound.
-pub(crate) fn everything_on_track1(cfg: &mut Config) {
-    let n = cfg.tracks();
-    for d in cfg.devices.values_mut() {
-        if d.tracks[..n].iter().any(|&t| t) {
-            d.tracks[0] = true;
-        }
-    }
-    cfg.chat_tracks[0] = false;
-}
-
 /// Records only this mic (or none), on `tracks`.
 pub(crate) fn set_mic(cfg: &mut Config, key: Option<&str>, tracks: [bool; 6]) {
     for (_, d) in cfg.devices.iter_mut().filter(|(k, _)| k.starts_with("in:")) {
@@ -177,9 +165,7 @@ impl App {
             });
             if pick != current.unwrap_or(custom_at) {
                 self.audio_custom = pick == custom_at;
-                if self.audio_custom {
-                    everything_on_track1(&mut self.cfg);
-                } else {
+                if !self.audio_custom {
                     set_sound_preset(&mut self.cfg, pick);
                 }
             }
@@ -234,8 +220,8 @@ impl App {
         self.more_options(ui, Tab::Audio, Self::audio_more);
     }
 
-    /// Custom sound: how many tracks, a name for each, and what goes on it. Track 1 always has
-    /// everything, so a clip plays right in any player.
+    /// Custom sound: how many tracks, a name for each, and what goes on it, track 1 included, so
+    /// a device whose sound is already in another (like a mixer's stream mix) can stay off it.
     pub(crate) fn custom_tracks(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Tracks");
@@ -244,18 +230,17 @@ impl App {
             }
         });
         let n = self.cfg.tracks();
-        // Everything recorded is on track 1, so that's the list to pick from.
-        let recorded: Vec<(String, String)> = self
-            .cfg
-            .devices
-            .iter()
-            .filter(|(_, d)| d.tracks[0])
-            .map(|(k, d)| (k.clone(), d.name.split(" (").next().unwrap_or(&d.name).trim().to_string()))
+        // Every device recorded on any track; one taken off all of them is turned on again
+        // under More options.
+        let recorded: Vec<(String, String)> = ["out:", "in:"]
+            .into_iter()
+            .flat_map(|p| used_devices(&self.cfg, p).map(|(k, _)| k.clone()).collect::<Vec<_>>())
+            .map(|k| {
+                let name = &self.cfg.devices[&k].name;
+                let short = name.split(" (").next().unwrap_or(name).trim().to_string();
+                (k, short)
+            })
             .collect();
-        let locked = |ui: &mut egui::Ui, why: &str| {
-            ui.add_enabled(false, egui::Checkbox::without_text(&mut true)).on_disabled_hover_text(why);
-        };
-        let mut changed = false;
         // Like OBS's Advanced Audio Properties: a row per sound, a column per track.
         egui::Grid::new("custom_tracks").num_columns(n + 1).spacing([10.0, 6.0]).min_col_width(28.0).show(ui, |ui| {
             ui.label(RichText::new("Sound").strong());
@@ -270,38 +255,28 @@ impl App {
                     ui.label(icon(glyph, 14.0).color(pal().muted));
                     ui.label(name.as_str());
                 });
-                locked(ui, "Track 1 always has every sound");
-                for i in 1..n {
+                for i in 0..n {
                     if let Some(d) = self.cfg.devices.get_mut(k) {
-                        changed |= ui.add(egui::Checkbox::without_text(&mut d.tracks[i])).on_hover_text(format!("Put {name} on track {}", i + 1)).changed();
+                        ui.add(egui::Checkbox::without_text(&mut d.tracks[i])).on_hover_text(format!("Put {name} on track {}", i + 1));
                     }
                 }
                 ui.end_row();
             }
-
-            ui.horizontal(|ui| {
-                ui.label(icon(icon::CHAT, 14.0).color(pal().muted));
-                ui.label("Voice chat (Discord)");
-            });
-            locked(ui, "Discord is already in the game and PC sound on track 1");
-            for i in 1..n {
-                changed |= ui.add(egui::Checkbox::without_text(&mut self.cfg.chat_tracks[i])).on_hover_text(format!("Discord's sound on its own, on track {}", i + 1)).changed();
-            }
-            ui.end_row();
         });
+        // Discord's own capture is only for "Game, mic and chat separate". Custom has no row for
+        // it, and Discord is already in the playback sound, so it's never recorded here.
+        self.cfg.chat_tracks = [false; 6];
+        note(ui, "Track 1 is what most players and Discord play, so put everything you want heard on it. If one device already carries another's sound (like a mixer's stream mix), leave the other off that track.");
         if n > 1 {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Track names").color(pal().muted)).on_hover_text("Shown when trimming. Track 1 is always Everything.");
-                for i in 1..n {
+                ui.label(RichText::new("Track names").color(pal().muted)).on_hover_text("Shown when trimming");
+                for i in 0..n {
                     let auto = device_track_name(&self.cfg, i);
                     ui.label((i + 1).to_string());
                     ui.add(egui::TextEdit::singleline(&mut self.cfg.track_names[i]).desired_width(100.0).char_limit(24).hint_text(auto)).on_hover_text("A name for this track, shown when trimming");
                 }
             });
-        }
-        if changed {
-            everything_on_track1(&mut self.cfg);
         }
     }
 

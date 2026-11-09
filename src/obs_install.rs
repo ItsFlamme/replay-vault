@@ -210,6 +210,21 @@ pub fn private_dir() -> PathBuf {
     install_root().join("obs-studio")
 }
 
+/// Moves what the app keeps in the install folder to the Recycle Bin (the private OBS, a waiting
+/// update or download, the update stamp), then removes the folder if that left it empty. Only
+/// these by name, so anything else in a folder the user picked stays. Returns what couldn't go.
+pub fn recycle_install_root() -> Vec<String> {
+    let root = install_root();
+    let ours = [private_dir(), staged_dir(), root.join("obs-studio.old"), root.join("obs-download.zip"), update_stamp(), crate::app_update::installer_path()];
+    let problems = ours
+        .iter()
+        .filter(|p| p.exists())
+        .filter_map(|p| crate::clips::recycle(p).err().map(|e| format!("{}: {e:#}", p.display())))
+        .collect();
+    let _ = fs::remove_dir(&root);
+    problems
+}
+
 fn staged_dir() -> PathBuf {
     install_root().join("obs-studio.update")
 }

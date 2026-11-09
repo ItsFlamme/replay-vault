@@ -2,7 +2,17 @@
 
 Notable changes in each release. The app's What's new page is built from this file.
 
-## Unreleased
+## 0.1.1
+
+### Changed
+
+- Setup has one Browse instead of two: picking where the recorder goes puts it in Replay Vault OBS and your clips beside it in Replay Vault Clips. The clips folder can still be moved under General.
+- Remove from this PC now uninstalls the app too, with its shortcuts, and clears everything it kept (private OBS, a waiting update, settings). Only your clips stay.
+- Custom sound: track 1 isn't locked any more, so a device whose sound is already in another (like a GoXLR's stream mix) can stay off it and nothing is heard twice. Custom no longer has a separate Discord voice chat row, since Discord is already in the game and PC sound; "Game, mic and chat separate" still gives it a track of its own.
+
+### New
+
+- The app has its own icon, the Replay Vault cassette, in the taskbar, Start menu and on the desktop shortcut.
 
 ## 0.1.0
 

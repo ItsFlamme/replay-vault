@@ -233,8 +233,8 @@ impl App {
                 });
             });
             card(ui, "Remove", |ui| {
-                note(ui, "Puts back everything the app changed on this PC and moves its private OBS copy to the Recycle Bin. Your clips stay.");
-                if button(ui, "Remove from this PC...").on_hover_text("Undoes what the app changed on this PC. Asks first; your clips stay.").clicked() {
+                note(ui, "Puts back everything the app changed on this PC, moves its private OBS copy and settings to the Recycle Bin and uninstalls the app. Your clips stay.");
+                if button(ui, "Remove from this PC...").on_hover_text("Undoes what the app changed and uninstalls it. Asks first; your clips stay.").clicked() {
                     self.confirm_remove = true;
                 }
             });

@@ -269,8 +269,6 @@ impl Config {
     pub fn sanitize(&mut self) {
         let d = Self::default();
         self.track_count = self.track_count.clamp(1, 6);
-        // Track 1 already has voice chat, from the playback devices.
-        self.chat_tracks[0] = false;
         self.buffer_secs = self.buffer_secs.clamp(10, 1200);
         self.quality = self.quality.min(3);
         self.name_style = self.name_style.min(crate::recorder::NAME_STYLES.len() as u8 - 1);
@@ -633,7 +631,7 @@ mod tests {
         assert_eq!(long.chat_tracks, [true, true, false, false, false, false]);
         let mut long = long;
         long.sanitize();
-        assert!(!long.chat_tracks[0], "track 1 already has voice chat");
+        assert!(long.chat_tracks[0], "voice chat may go on track 1 too");
     }
 
     /// A file with every value out of range (hand-edited, or a hostile settings file) loads and

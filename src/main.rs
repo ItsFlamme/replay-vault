@@ -95,6 +95,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 700.0])
             .with_min_inner_size([860.0, 560.0])
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/replay-vault-256.png")).unwrap_or_default())
             .with_visible(false),
         ..Default::default()
     };
@@ -1211,9 +1212,9 @@ impl App {
             }
         }
         if self.confirm_remove {
-            let confirm = Confirm { label: "Remove", hint: "Puts this PC back and closes the app. Your clips stay.", danger: true };
+            let confirm = Confirm { label: "Remove", hint: "Puts this PC back and uninstalls the app. Your clips stay.", danger: true };
             match modal(ctx, "remove_confirm", 380.0, "Remove Replay Vault from this PC?", confirm, CANCEL, |ui| {
-                ui.label("This stops recording and puts back everything the app changed: Start with Windows, Game Bar and graphics settings, and the firewall rule (Windows asks first). The private OBS copy and the app's settings go to the Recycle Bin, then the app closes. Your clips and your own OBS stay as they are.");
+                ui.label("This stops recording and puts back everything the app changed: Start with Windows, Game Bar and graphics settings, and the firewall rule (Windows asks first). The private OBS copy and the app's settings go to the Recycle Bin, then the app uninstalls itself along with its shortcuts. Your clips and your own OBS stay as they are.");
                 (true, false)
             }) {
                 Some(true) => self.remove_everything(),
@@ -1244,20 +1245,49 @@ impl App {
         if let Err(e) = obs_install::remove_firewall_rule() {
             problems.push(format!("Firewall rule: {e:#}"));
         }
-        let private = obs_install::private_dir();
-        if private.exists()
-            && let Err(e) = clips::recycle(&private) {
-            problems.push(format!("Private OBS copy at {}: {e:#}", private.display()));
+        problems.extend(obs_install::recycle_install_root().into_iter().map(|p| format!("Private OBS: {p}")));
+        if let Err(e) = clips::recycle(&config::dir()) {
+            problems.push(format!("Settings at {}: {e:#}", config::dir().display()));
+        }
+        if let Err(e) = uninstall_app() {
+            problems.push(format!("The app itself: {e:#}"));
         }
         if !problems.is_empty() {
-            // Left on the Desktop, since the settings folder is about to go.
+            // Left on the Desktop, since the settings folder is gone.
             let note = dirs::desktop_dir().unwrap_or_default().join("Replay Vault - remove notes.txt");
             let _ = std::fs::write(&note, format!("Removed, except:\r\n{}\r\n", problems.join("\r\n")));
         }
-        let _ = clips::recycle(&config::dir());
         std::process::exit(0);
     }
+}
 
+/// Takes the app itself off the PC once it has quit. An installed copy runs its uninstaller,
+/// which also takes away the Start menu and desktop shortcuts. A portable copy deletes its exe
+/// and notices a moment after it quits. A dev build is left alone.
+fn uninstall_app() -> anyhow::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().ok_or_else(|| anyhow::anyhow!("no folder"))?;
+    if app_update::installed() {
+        std::process::Command::new(dir.join("unins000.exe")).args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]).spawn()?;
+    } else if !DEV_BUILD {
+        let files: Vec<String> = [exe.clone(), dir.join("LICENSE"), dir.join("NOTICE"), dir.join("THIRD-PARTY-NOTICES.md")]
+            .iter()
+            .map(|p| format!("\"{}\"", p.display()))
+            .collect();
+        // Waits about 2 s for this process to end, so its exe can be deleted. rd only removes
+        // the folder if nothing else is in it.
+        std::process::Command::new("cmd")
+            .raw_arg(format!("/c ping -n 3 127.0.0.1 >nul & del /f /q {} & rd \"{}\"", files.join(" "), dir.display()))
+            .current_dir(std::env::temp_dir())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()?;
+    }
+    Ok(())
+}
+
+impl App {
     /// A one-line hint at the top of a page, until its x is clicked. Kept right away, no Save.
     fn tip(&mut self, ui: &mut egui::Ui) {
         let page = self.tab.name();
@@ -1699,7 +1729,7 @@ mod tests {
                     set_sound_preset(&mut app.cfg, if name == "audio-chat" { 2 } else { 1 });
                 }
                 if name == "audio-custom" {
-                    (app.audio_custom, app.cfg.track_count, app.cfg.chat_tracks[4]) = (true, 5, true);
+                    (app.audio_custom, app.cfg.track_count) = (true, 5);
                     app.cfg.track_names[3] = "Music".into();
                 }
                 if name.starts_with("audio-c") {
@@ -2318,7 +2348,7 @@ mod tests {
                     set_look(a, theme, light);
                     a.tab = Tab::Audio;
                     set_sound_preset(&mut a.cfg, 1);
-                    (a.audio_custom, a.cfg.track_count, a.cfg.chat_tracks[4]) = (true, 5, true);
+                    (a.audio_custom, a.cfg.track_count) = (true, 5);
                     a.cfg.track_names[3] = "Music".into();
                 }, |_, _| {});
             }
@@ -2471,16 +2501,12 @@ mod tests {
         assert_eq!(on(&c, "out:speakers"), Some([false; 6]));
         assert!(!c.devices.contains_key("out:default"));
 
-        // Two playback devices on different tracks is custom; the lock puts both on track 1.
+        // Two playback devices on different tracks is custom, and track 1 needn't have both.
         let mut c = Config { track_count: 3, ..Config::default() };
         c.devices.clear();
         c.devices.insert("out:chat".into(), config::DeviceSel { name: String::new(), tracks: six([false, true, false]) });
         c.devices.insert("out:game".into(), config::DeviceSel { name: String::new(), tracks: six([true, false, false]) });
         assert_eq!(sound_preset(&c), None);
-        c.chat_tracks[0] = true;
-        everything_on_track1(&mut c);
-        assert!(c.devices.values().all(|d| d.tracks[0]));
-        assert!(!c.chat_tracks[0]);
 
         // Picking a mic records only that one, on the tracks given.
         set_mic(&mut c, Some("in:usb"), t([1, 0, 1, 0, 0, 0]));
@@ -2519,7 +2545,7 @@ mod tests {
             app
         });
         h.run();
-        let item = "Full recording and screenshots on their own keys.";
+        let item = "The app has its own icon, the Replay Vault cassette, in the taskbar, Start menu and on the desktop shortcut.";
         assert!(h.query_by_label(item).is_some());
         h.get_by_label_contains("(this version)").click();
         // Past the closing animation.

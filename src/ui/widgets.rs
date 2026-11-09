@@ -33,7 +33,6 @@ pub(crate) mod icon {
     pub const VIDEO: char = '\u{E714}';
     pub const AUDIO: char = '\u{E767}';
     pub const MIC: char = '\u{E720}'; // Microphone
-    pub const CHAT: char = '\u{E8F2}'; // ChatBubbles
     pub const HELP: char = '\u{E897}'; // Help
     pub const FEEDBACK: char = '\u{E8BD}'; // Message
     pub const NEW: char = '\u{E81C}'; // History

@@ -90,7 +90,7 @@ Clips, settings and logs stay on your PC: clips in `Videos\Replay Vault Clips` b
 
 ## Uninstall
 
-Use **General > Remove from this PC** in the app first. It undoes the changes the app made (startup entry, firewall rule, GPU preference and any Windows settings you turned off) and moves the private OBS copy to the Recycle Bin. Your clips are kept. Then uninstall it from Windows Settings, or delete the portable folder.
+Use **General > Remove from this PC** in the app. It undoes the changes the app made (startup entry, firewall rule, GPU preference and any Windows settings you turned off), moves the private OBS copy and the app's settings to the Recycle Bin, then uninstalls the app and its shortcuts. Your clips are kept.
 
 ## Building from source
 

@@ -25,6 +25,7 @@ OutputBaseFilename=ReplayVault-{#AppVersion}-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\assets\replay-vault.ico
 UninstallDisplayIcon={app}\replay-vault.exe
 UninstallDisplayName=Replay Vault
 ; Closes a running copy (and so its hidden OBS) before files are replaced.
@@ -59,4 +60,4 @@ Filename: "{app}\replay-vault.exe"; Flags: nowait; Check: WizardSilent
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -Command ""Get-Process replay-vault -ErrorAction SilentlyContinue | Where-Object Path -eq '{app}\replay-vault.exe' | Stop-Process -Force"""; Flags: runhidden; RunOnceId: "StopApp"
 
 [Messages]
-ConfirmUninstall=Remove Replay Vault?%n%nYour clips and settings stay. To also undo what the app changed on this PC (its private OBS, firewall rule, GPU and Game Bar settings), cancel and use General > Remove from this PC first.
+ConfirmUninstall=Remove Replay Vault?%n%nYour clips and settings stay. To also undo what the app changed on this PC (its private OBS, firewall rule, GPU and Game Bar settings), cancel and use General > Remove from this PC instead (it uninstalls the app too).

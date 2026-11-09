@@ -2,6 +2,15 @@
 
 use crate::*;
 
+/// The clips folder that goes with the private OBS in `obs_dir` ("D:\Games\Replay Vault OBS"):
+/// "Replay Vault Clips" beside it, or the usual Videos folder when OBS is in its default place ("").
+fn clips_next_to(obs_dir: &str) -> String {
+    match std::path::Path::new(obs_dir.trim()).parent() {
+        Some(parent) if !obs_dir.trim().is_empty() => parent.join("Replay Vault Clips").display().to_string(),
+        _ => Config::default().folder,
+    }
+}
+
 impl App {
     /// Setup's first card: the save key and where clips go.
     pub(crate) fn setup_clips_card(&mut self, ui: &mut egui::Ui) {
@@ -12,7 +21,13 @@ impl App {
                 ui.end_row();
 
                 ui.label("Clips folder");
-                folder_field(ui, &mut self.cfg.folder, "");
+                if self.obs_exe.is_none() {
+                    // Picked together with OBS's folder above, so setup has one Browse.
+                    ui.add(egui::Label::new(RichText::new(&self.cfg.folder).color(pal().muted)).truncate())
+                        .on_hover_text("Set with OBS's folder above. You can move it later under General.");
+                } else {
+                    folder_field(ui, &mut self.cfg.folder, "");
+                }
                 ui.end_row();
             });
         });
@@ -139,11 +154,11 @@ impl App {
                 // Where it goes: any drive, so it needn't take space on the system drive.
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Install to").color(pal().muted));
-                    if button(ui, "Browse").on_hover_text("Pick another drive or folder for the recorder").clicked()
-                        && let Some(dir) = overlay::file_dialog().set_title("Where should OBS go?").pick_folder() {
+                    if button(ui, "Browse").on_hover_text("Pick a drive or folder: the recorder goes in Replay Vault OBS and your clips in Replay Vault Clips, side by side").clicked()
+                        && let Some(dir) = overlay::file_dialog().set_title("Where should OBS and your clips go?").pick_folder() {
                         new_dir = Some(dir.join("Replay Vault OBS").display().to_string());
                     }
-                    if custom_dir && button(ui, "Default").on_hover_text("Back to the app's own folder on the system drive").clicked() {
+                    if custom_dir && button(ui, "Default").on_hover_text("Back to the app's own folder on the system drive, and clips in Videos").clicked() {
                         new_dir = Some(String::new());
                     }
                 });
@@ -167,6 +182,10 @@ impl App {
             });
         }
         if let Some(dir) = new_dir {
+            // Clips go where the recorder went, unless the clips folder was set by hand.
+            if self.cfg.folder == clips_next_to(&self.cfg.obs_dir) {
+                self.cfg.folder = clips_next_to(&dir);
+            }
             self.cfg.obs_dir = dir;
             obs_install::set_install_root(&self.cfg.obs_dir);
             log::write(&format!("Private OBS folder set to {}", obs_install::private_dir().display()));
@@ -242,5 +261,17 @@ impl App {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clips_go_beside_the_recorder() {
+        assert_eq!(clips_next_to(r"E:\Replay Vault OBS"), r"E:\Replay Vault Clips");
+        assert_eq!(clips_next_to(r"D:\Games\Replay Vault OBS"), r"D:\Games\Replay Vault Clips");
+        assert_eq!(clips_next_to(""), Config::default().folder);
     }
 }

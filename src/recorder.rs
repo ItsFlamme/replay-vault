@@ -413,9 +413,9 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
             items.push(json!({ "name": name, "visible": true }));
         }
     }
-    // Voice chat on tracks of its own: Discord's sound alone, matched by its exe like the apps
-    // above. Track 1 has it already, from the playback devices.
-    let chat: u32 = (1..n).filter(|&i| cfg.chat_tracks[i]).map(|i| 1 << i).sum();
+    // Voice chat on the tracks picked for it: Discord's sound alone, matched by its exe like the
+    // apps above.
+    let chat: u32 = (0..n).filter(|&i| cfg.chat_tracks[i]).map(|i| 1 << i).sum();
     if chat != 0 {
         let name = unique(&items, "Voice chat".to_string());
         sources.push(json!({
@@ -669,7 +669,7 @@ mod tests {
     }
 
     /// Six tracks: RecTracks covers them all with a bitrate each, each source's mixers are its
-    /// ticked tracks, voice chat gets its own capture on its tracks only (never track 1), and
+    /// ticked tracks, voice chat gets its own capture on its ticked tracks (track 1 too), and
     /// the memory estimate grows by a track's 192 kbps.
     #[test]
     fn six_tracks_and_voice_chat() {
@@ -684,13 +684,16 @@ mod tests {
         assert_eq!(source(&scene, "wasapi_input_capture")[0]["mixers"], 0b10_0101);
         let chat = source(&scene, "wasapi_process_output_capture");
         assert_eq!((chat.len(), chat[0]["name"].as_str()), (1, Some("Voice chat")));
-        assert_eq!(chat[0]["mixers"], 0b00_1000, "track 4 only, not track 1");
+        assert_eq!(chat[0]["mixers"], 0b00_1001, "tracks 1 and 4");
         assert!(chat[0]["settings"]["window"].as_str().unwrap().ends_with(":Discord.exe"));
         // Ticks past the track count aren't recorded, and no chat track means no chat capture.
         cfg.track_count = 3;
         let (basic, scene) = written("three", &mut cfg, &test_monitor());
         assert!(basic.contains("\nRecTracks=7\n"));
         assert_eq!(source(&scene, "wasapi_input_capture")[0]["mixers"], 0b101);
+        assert_eq!(source(&scene, "wasapi_process_output_capture")[0]["mixers"], 0b001, "track 4's tick is past the count");
+        cfg.chat_tracks = [false, false, false, true, false, false];
+        let (_, scene) = written("three-nochat", &mut cfg, &test_monitor());
         assert!(source(&scene, "wasapi_process_output_capture").is_empty());
         let mb = |t: u8| plan(&Config { track_count: t, buffer_secs: 300, ..Config::default() }, &test_monitor()).mb;
         assert!((7..=10).contains(&(mb(2) - mb(1))), "about 7 MB per track for 5 minutes, with headroom: {}", mb(2) - mb(1));
