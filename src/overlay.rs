@@ -142,3 +142,72 @@ pub fn close() {
 pub fn toggle() {
     if is_visible() { close() } else { show() }
 }
+
+/// Where the window was (left, top, right, bottom, in screen pixels) and the page that was open,
+/// kept across starts in window.json. Not a setting: it's never part of Save / Discard.
+#[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
+pub struct Placement {
+    pub rect: Option<[i32; 4]>,
+    pub page: String,
+}
+
+fn placement_file() -> std::path::PathBuf {
+    if cfg!(test) { std::env::temp_dir().join("replay-vault-window-test.json") } else { crate::config::dir().join("window.json") }
+}
+
+pub fn load_placement() -> Placement {
+    std::fs::read_to_string(placement_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+/// Remembers where the window is now (unless it's minimized or hidden) and `page`, writing only
+/// when either changed.
+pub fn save_placement(page: &str) {
+    static LAST: std::sync::Mutex<Option<Placement>> = std::sync::Mutex::new(None);
+    let Some(window) = hwnd() else { return };
+    let mut r = RECT::default();
+    let rect = unsafe { (is_visible() && GetWindowRect(window, &mut r).is_ok()).then_some([r.left, r.top, r.right, r.bottom]) };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    // Minimized or in the tray: keep the place it had before.
+    let rect = rect.or_else(|| last.as_ref().and_then(|p| p.rect)).or_else(|| load_placement().rect);
+    let now = Placement { rect, page: page.into() };
+    if last.as_ref() == Some(&now) {
+        return;
+    }
+    let _ = std::fs::create_dir_all(crate::config::dir());
+    let _ = std::fs::write(placement_file(), serde_json::to_string(&now).unwrap_or_default());
+    *last = Some(now);
+}
+
+/// Puts the window back where `p` says, if that place is still on a screen (a monitor may have
+/// been unplugged since); otherwise it's centered on first show as before.
+pub fn restore_placement(p: &Placement) {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOZORDER};
+    let (Some(window), Some([left, top, right, bottom])) = (hwnd(), p.rect) else { return };
+    // The title bar's middle has to be on a screen, so the window can be grabbed.
+    let grab = RECT { left: (left + right) / 2 - 20, top: top + 4, right: (left + right) / 2 + 20, bottom: top + 24 };
+    if right - left < 200 || bottom - top < 200 || unsafe { MonitorFromRect(&grab, MONITOR_DEFAULTTONULL) }.is_invalid() {
+        return;
+    }
+    unsafe {
+        if SetWindowPos(window, None, left, top, right - left, bottom - top, SWP_NOZORDER | SWP_NOACTIVATE).is_ok() {
+            PLACED.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A damaged window.json is ignored; a good one comes back as written.
+    #[test]
+    fn placement_reads_back() {
+        std::fs::write(placement_file(), "not json").unwrap();
+        assert_eq!(load_placement(), Placement::default());
+        let p = Placement { rect: Some([100, 80, 1200, 780]), page: "Clips".into() };
+        std::fs::write(placement_file(), serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(load_placement(), p);
+        let _ = std::fs::remove_file(placement_file());
+    }
+}

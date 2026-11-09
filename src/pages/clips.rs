@@ -51,6 +51,9 @@ pub(crate) struct ClipActions {
     pub(crate) pick: Option<std::path::PathBuf>,
     /// A card clicked with Ctrl (false) or Shift (true) held, for the selection.
     pub(crate) select: Option<(std::path::PathBuf, bool)>,
+    /// A card dragged out of the app (with the other picked clips, if it's one of them), and
+    /// where the drag began.
+    pub(crate) drag_out: Option<(std::path::PathBuf, egui::Pos2)>,
 }
 
 /// A new file (trim, share copy, GIF, montage) being made in the background: how far along
@@ -625,6 +628,14 @@ impl App {
         if let Some(path) = act.play {
             self.play(&path);
         }
+        if let Some((path, at)) = act.drag_out {
+            let paths = if self.picked.contains(&path) { self.picked.clone() } else { vec![path] };
+            if let Err(e) = crate::drag_out::start(&paths) {
+                self.clips_msg = Some(format!("Couldn't drag it out: {e:#}"));
+            }
+            // Windows took the button's release; egui still thinks it's down until it's told.
+            self.drag_out_ended = Some(at);
+        }
         if let (Some(path), Some(m)) = (act.pick, &mut self.montage) {
             match m.clips.iter().position(|c| *c == path) {
                 Some(i) => _ = m.clips.remove(i),
@@ -994,7 +1005,7 @@ impl App {
         let shown = ui.scope_builder(body, |ui| frame.show(ui, |ui| ui.vertical(|ui| {
             ui.set_width(w);
             ui.spacing_mut().item_spacing.y = 4.0;
-            let (rect, thumb) = ui.allocate_exact_size(egui::vec2(w, w * 9.0 / 16.0), egui::Sense::click());
+            let (rect, thumb) = ui.allocate_exact_size(egui::vec2(w, w * 9.0 / 16.0), egui::Sense::click_and_drag());
             let rounding = egui::CornerRadius { nw: R_CARD, ne: R_CARD, sw: 0, se: 0 };
             let width = (w * 1.5) as usize;
             // Hover scrubbing: across a video, the pointer's place picks the frame, in 16 steps
@@ -1073,9 +1084,11 @@ impl App {
                 paint_icon(ui.painter(), c, egui::Align2::CENTER_CENTER, icon::CHECK, 12.0, on_accent());
             }
             let hint = if picked.is_some() { "Adds it to the montage" } else if item.is_picture { "Opens the picture" } else { "Plays the clip. Move across it to preview." };
-            let thumb = thumb.on_hover_text(format!("{hint}\nCtrl+click or Shift+click picks several clips.")).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let thumb = thumb.on_hover_text(format!("{hint}\nDrag it into Discord, a browser or a folder to share it.\nCtrl+click or Shift+click picks several clips.")).on_hover_cursor(egui::CursorIcon::PointingHand);
             let mods = ui.input(|i| i.modifiers);
-            if thumb.clicked() && (mods.command || mods.shift) {
+            if thumb.drag_started() && picked.is_none() {
+                act.drag_out = Some((path.clone(), thumb.interact_pointer_pos().unwrap_or(rect.center())));
+            } else if thumb.clicked() && (mods.command || mods.shift) {
                 act.select = Some((path.clone(), mods.shift));
             } else if thumb.clicked() {
                 self.picked.clear();

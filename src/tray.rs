@@ -27,12 +27,16 @@ pub(crate) fn make_tray(ctx: &egui::Context, cmds: Sender<Cmd>) -> anyhow::Resul
     let pause = MenuItem::new("Pause replay", false, None);
     let open = MenuItem::new("Open Replay Vault", true, None);
     let folder = MenuItem::new("Open clips folder", true, None);
+    let play_last = MenuItem::new("Play last clip", true, None);
+    let copy_last = MenuItem::new("Copy last clip", true, None);
     let startup = CheckMenuItem::new("Start with Windows", true, startup::is_enabled(), None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
-    menu.append_items(&[&status, &PredefinedMenuItem::separator(), &save, &pause, &open, &folder, &startup, &PredefinedMenuItem::separator(), &quit])?;
+    menu.append_items(&[&status, &PredefinedMenuItem::separator(), &save, &pause, &open, &folder, &play_last, &copy_last, &startup, &PredefinedMenuItem::separator(), &quit])?;
     let (save_id, pause_id, open_id, folder_id, startup_id, quit_id) =
         (save.id().clone(), pause.id().clone(), open.id().clone(), folder.id().clone(), startup.id().clone(), quit.id().clone());
+
+    let (play_id, copy_id) = (play_last.id().clone(), copy_last.id().clone());
 
     let c = ctx.clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
@@ -45,6 +49,16 @@ pub(crate) fn make_tray(ctx: &egui::Context, cmds: Sender<Cmd>) -> anyhow::Resul
             let _ = cmds.send(Cmd::SetReplay(!REPLAY_ON.load(std::sync::atomic::Ordering::Relaxed)));
         } else if e.id == folder_id {
             clips::open(std::path::Path::new(&Config::load().folder), false);
+        } else if e.id == play_id || e.id == copy_id {
+            match last_clip() {
+                Some(p) if e.id == play_id => clips::open(&p, false),
+                Some(p) => {
+                    if let Err(e) = clips::copy_file(&p) {
+                        log::write(&format!("Couldn't copy the last clip: {e:#}"));
+                    }
+                }
+                None => log::write("No clip to play or copy yet."),
+            }
         } else if e.id == startup_id {
             if let Err(e) = startup::set_enabled(!startup::is_enabled()) {
                 log::write(&format!("Couldn't change the startup setting: {e}"));
@@ -71,6 +85,11 @@ pub(crate) fn make_tray(ctx: &egui::Context, cmds: Sender<Cmd>) -> anyhow::Resul
         .with_icon(tray_icon_image(TrayLook::Off)?)
         .build()?;
     Ok((tray, TrayMenu { status, save, pause, startup, shown: None }))
+}
+
+/// The newest video in the clips folder (screenshots and GIFs aside), for Play and Copy last clip.
+fn last_clip() -> Option<std::path::PathBuf> {
+    clips::list(&Config::load().folder, usize::MAX).into_iter().find(|c| !c.is_picture).map(|c| c.path)
 }
 
 /// What the tray icon shows: replay off (or no recorder), replay on, or a full recording running.
@@ -133,4 +152,18 @@ pub(crate) fn tray_rgba(look: TrayLook) -> Vec<u8> {
         }
     }
     rgba
+}
+
+#[cfg(test)]
+mod tests {
+    /// On this PC, read only: the clip Play/Copy last clip would use, and whether a game is in
+    /// front right now. Run by hand with `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_last_clip_and_game() {
+        let folder = crate::config::Config::load().folder;
+        println!("clips folder: {folder}");
+        println!("last clip: {:?}", super::last_clip());
+        println!("game in front: {}", crate::autopause::game_in_front(std::path::Path::new(&folder)));
+    }
 }

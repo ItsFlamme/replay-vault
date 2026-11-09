@@ -565,6 +565,9 @@ fn run_elevated(file: &Path, args: &str) -> anyhow::Result<u32> {
 
 /// Swaps in a downloaded update. Call before the recorder starts.
 pub fn apply_staged_update() -> Option<String> {
+    // The last swap's old copy, if a file in it was still in use then: deleted for good, not
+    // recycled.
+    let _ = fs::remove_dir_all(install_root().join("obs-studio.old"));
     let staged = staged_dir();
     let version = fs::read_to_string(staged.join("version.txt")).ok()?.trim().to_string();
     recorder::stop();

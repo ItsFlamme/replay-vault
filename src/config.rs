@@ -100,6 +100,9 @@ pub struct Config {
     pub show_tips: bool,
     /// Look for a newer Replay Vault on GitHub once a day (General).
     pub check_updates: bool,
+    /// Stop instant replay after 2 minutes with no game in front, and start it again when one
+    /// is (General; see autopause.rs).
+    pub pause_without_game: bool,
     /// The app's accent color, an index into the list on the General page (0 is purple), or one
     /// past its end for `custom_accent`.
     pub accent: u8,
@@ -206,6 +209,7 @@ impl Default for Config {
             tips_seen: Vec::new(),
             show_tips: true,
             check_updates: true,
+            pause_without_game: false,
             accent: 0,
             custom_accent: "#8448F0".into(),
             theme: "minimalist".into(),
@@ -418,6 +422,7 @@ pub const FIELDS: &[(&str, Option<Page>, bool, Kind)] = {
         ("tips_seen", None, false, View),
         ("show_tips", Some(General), false, Setting),
         ("check_updates", Some(General), false, Setting),
+        ("pause_without_game", Some(General), false, Setting),
         ("accent", Some(General), false, Setting),
         ("custom_accent", Some(General), false, Setting),
         ("theme", Some(General), false, Setting),

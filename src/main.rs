@@ -2,11 +2,13 @@
 
 mod amd;
 mod app_update;
+mod autopause;
 mod clips;
 mod config;
 mod covers;
 mod devices;
 mod display;
+mod drag_out;
 mod feedback;
 mod hotkey;
 mod log;
@@ -131,6 +133,7 @@ enum Tab {
 impl Tab {
     /// The settings pages, in the sidebar's order under SETTINGS.
     const SETTINGS: [Tab; 5] = [Tab::General, Tab::Keybinds, Tab::Video, Tab::Audio, Tab::Feedback];
+    const ALL: [Tab; 8] = [Tab::Clips, Tab::General, Tab::Keybinds, Tab::Video, Tab::Audio, Tab::Feedback, Tab::Help, Tab::WhatsNew];
 
     /// Its name (in the sidebar and title, and its key for More options and tips), its sidebar
     /// glyph, the line under its title, and its sidebar link's hover text.
@@ -278,6 +281,8 @@ struct App {
     confirm_remove: bool,
     /// The new-version popup was closed with Later at this many finds (see `app_update::finds`).
     update_later: u32,
+    /// The window was opened for the new-version popup at this many finds.
+    update_pushed: u32,
     /// Installing a new version: its download, or why it failed.
     update_job: Option<obs_install::Shared>,
     update_error: Option<String>,
@@ -301,6 +306,10 @@ struct App {
     /// Clips picked with Ctrl+click, Shift+click or Ctrl+A, in the order picked; with 2 or more the
     /// selection bar acts on them all.
     picked: Vec<std::path::PathBuf>,
+    /// Where a drag out of the app ended: Windows kept the button's release, so egui gets it here.
+    drag_out_ended: Option<egui::Pos2>,
+    /// When the window's place and page were last looked at (see `overlay::save_placement`).
+    placement_checked: std::time::Instant,
     /// Picked clips waiting for "Move to Recycle Bin?" to be answered.
     confirm_recycle: Option<Vec<std::path::PathBuf>>,
     /// Share copies waiting to be made, one at a time after the running ones.
@@ -441,6 +450,7 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         let previews = clips::Previews::new(move || ctx.request_repaint());
 
+        autopause::start(cmd_tx.clone(), &REPLAY_ON, || Config::load().folder);
         let (tray, tray_error) = match make_tray(&cc.egui_ctx, cmd_tx.clone()) {
             Ok(t) => (Some(t), None),
             Err(e) => (None, Some(e)),
@@ -466,6 +476,12 @@ impl App {
         };
         if needs_setup {
             app.status.clear();
+        }
+        // The window's last place and page.
+        let placement = overlay::load_placement();
+        overlay::restore_placement(&placement);
+        if let Some(tab) = Tab::ALL.into_iter().find(|t| t.name() == placement.page) {
+            app.tab = tab;
         }
         if let Some(v) = updated {
             app.status = format!("OBS was updated to {v}.");
@@ -565,6 +581,7 @@ impl App {
             exported: None,
             confirm_remove: false,
             update_later: 0,
+            update_pushed: 0,
             update_job: None,
             update_error: None,
             import: None,
@@ -576,6 +593,8 @@ impl App {
             noting: None,
             selected: None,
             picked: Vec::new(),
+            drag_out_ended: None,
+            placement_checked: std::time::Instant::now(),
             confirm_recycle: None,
             export_queue: Default::default(),
             search: String::new(),
@@ -928,7 +947,9 @@ impl App {
                 // Why it isn't recording: on up to two lines (the sidebar keeps room for them),
                 // all of it on hover.
                 let small = egui::TextStyle::Small.resolve(ui.style());
-                let mut why = egui::text::LayoutJob::simple(self.status.clone(), small, pal().muted, ui.available_width());
+                let paused = self.connected && autopause::PAUSED.load(std::sync::atomic::Ordering::Relaxed);
+                let status = if paused { "Paused: no game open. Starts again when one is.".to_string() } else { self.status.clone() };
+                let mut why = egui::text::LayoutJob::simple(status, small, pal().muted, ui.available_width());
                 why.wrap.max_rows = 2;
                 ui.add(egui::Label::new(why).wrap()).on_hover_text(&self.status);
             }
@@ -1013,14 +1034,15 @@ impl App {
             && (self.update_job.is_some() || self.update_error.is_some() || (app_update::finds() != self.update_later && !self.recording && self.wizard.is_none()))
     }
 
-    /// The new-version popup: what's new, then Install now (or the download page, for the portable
-    /// copy) and Later. While installing it shows the download, then quits for the installer.
+    /// The new-version popup: what's new, then Install now and Later (the download page only if
+    /// the release has nothing this copy can install). While updating it shows the download, then
+    /// quits for the installer, or (portable) swaps the exe and restarts.
     fn update_dialog(&mut self, ctx: &egui::Context, n: &app_update::Newer) {
-        let installer = n.installer.clone().filter(|_| app_update::installed());
+        let installer = app_update::pick(n);
         let progress = self.update_job.as_ref().map(|j| j.lock().unwrap().clone());
         if let Some(r) = progress.as_ref().and_then(|p| p.result.clone()) {
             self.update_job = None;
-            match r.and_then(|()| app_update::run_installer().map_err(|e| format!("couldn't start the installer: {e}"))) {
+            match r.and_then(|()| app_update::apply().map_err(|e| format!("couldn't put the new version in place: {e}"))) {
                 Ok(()) => {
                     log::write(&format!("Installing Replay Vault {}; closing for the installer.", n.version));
                     shutdown();
@@ -1057,7 +1079,7 @@ impl App {
             let install = installer.clone().filter(|_| self.update_error.is_none());
             ui.horizontal(|ui| {
                 let (label, hint) = match install {
-                    Some(_) => ("Install now", "Downloads it, checks it and installs it over this copy, then opens the new version"),
+                    Some(_) => ("Update now", "Downloads it, checks it and puts it in place of this copy, then opens the new version. Settings and clips stay."),
                     None => ("Open download page", "Opens the release on GitHub, to download it and install it over this copy"),
                 };
                 if primary(ui, !self.recording, RichText::new(label).strong(), egui::Vec2::ZERO).on_hover_text(hint).on_disabled_hover_text("Stop the recording first").clicked() {
@@ -1072,7 +1094,7 @@ impl App {
                         }
                     }
                 }
-                if button(ui, "Later").on_hover_text("Closes this. The sidebar keeps a link to it.").clicked() {
+                if button(ui, "Update later").on_hover_text("Closes this. The sidebar keeps a link to it, and it asks again at the next check (once a day).").clicked() {
                     later = true;
                 }
             });
@@ -1394,7 +1416,14 @@ fn mmss(secs: u32) -> String {
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
+        overlay::save_placement(self.tab.name());
         shutdown();
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if let Some(pos) = self.drag_out_ended.take() {
+            raw.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1407,6 +1436,21 @@ impl eframe::App for App {
         }
         self.handle_events();
         self.pump_jobs(ui.ctx());
+        // The window's place and page, for next start (the tray's Quit skips on_exit).
+        if self.placement_checked.elapsed() >= std::time::Duration::from_secs(1) {
+            self.placement_checked = std::time::Instant::now();
+            overlay::save_placement(self.tab.name());
+        }
+        // A new version comes to the user: from the tray the window opens with its popup, once per
+        // find, but never over a game (it waits until none is in front).
+        if self.update_due() && self.update_job.is_none() && self.update_pushed != app_update::finds() && overlay::is_hidden() {
+            if autopause::game_in_front(std::path::Path::new(&self.saved.folder)) {
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(60));
+            } else {
+                self.update_pushed = app_update::finds();
+                overlay::show();
+            }
+        }
         self.finish_capture();
         self.sync_hotkeys();
         // Keeps trying a key another app held, even from the tray.
@@ -1429,6 +1473,7 @@ impl eframe::App for App {
         }
         NOTES.store(self.cfg.show_tips, std::sync::atomic::Ordering::Relaxed);
         app_update::ENABLED.store(self.saved.check_updates, std::sync::atomic::Ordering::Relaxed);
+        autopause::ENABLED.store(self.saved.pause_without_game, std::sync::atomic::Ordering::Relaxed);
         // The look previews as it's picked, before Save. Kept per window (egui context), so a new
         // one gets it on its first frame too.
         let custom = parse_hex(&self.cfg.custom_accent).map_or(0x8448F0, |c| u32::from_be_bytes([0, c.r(), c.g(), c.b()]));
@@ -2559,7 +2604,7 @@ mod tests {
             app
         });
         h.run();
-        let item = "Pressing Esc while setting a key cancels it without hiding the app.";
+        let item = "The tray menu has Play last clip and Copy last clip (pastes into Discord or a folder as the file).";
         assert!(h.query_by_label(item).is_some());
         h.get_by_label_contains("(this version)").click();
         // Past the closing animation.
@@ -2597,6 +2642,7 @@ mod tests {
             url: "https://github.com/ItsFlamme/replay-vault/releases/tag/v9.0.0".into(),
             notes: "- Faster saves".into(),
             installer: None,
+            portable: Some(app_update::Installer { url: "https://github.com/ItsFlamme/replay-vault/releases/download/v9.0.0/ReplayVault-9.0.0.exe".into(), size: 1, sha256: "0".repeat(64) }),
         }
     }
 
@@ -2625,7 +2671,8 @@ mod tests {
     }
 
     /// The sidebar link opens the new-version popup with what's new; this test copy isn't
-    /// installed, so it offers the download page. Later closes it.
+    /// installed, so it updates itself from the release's exe: Install now, not the download
+    /// page. Later closes it.
     #[test]
     fn new_version_popup() {
         use egui_kittest::kittest::Queryable;
@@ -2637,14 +2684,14 @@ mod tests {
         h.get_by_label_contains("Version 9.0.0 is out").click();
         h.run();
         let shown = h.query_by_label("Replay Vault 9.0.0 is out").is_some() && h.query_by_label("- Faster saves").is_some();
-        let offer = h.query_by_label("Open download page").is_some() && h.query_by_label("Install now").is_none();
-        h.get_by_label("Later").click();
+        let offer = h.query_by_label("Update now").is_some() && h.query_by_label("Open download page").is_none();
+        h.get_by_label("Update later").click();
         h.run();
         let gone = h.query_by_label("Replay Vault 9.0.0 is out").is_none();
         app_update::set_found(None);
         assert!(!shown_before, "not counted as found in tests, so it waits for the click");
         assert!(shown, "title and what's new");
-        assert!(offer, "not installed: the download page, not Install now");
+        assert!(offer, "portable: Update now from the release's exe, not the download page");
         assert!(gone, "Later closes it");
     }
 

@@ -1,7 +1,10 @@
 //! New versions of Replay Vault: once a day (or when asked), GitHub's latest published release is
 //! compared with this version. Nothing about the user or the PC is sent (only the request itself,
 //! like any web page). Drafts and pre-releases don't count. Installing one downloads the release's
-//! installer, checks it against the SHA-256 GitHub published for it, and runs it.
+//! installer (or, for a portable copy, its exe), checks it against the SHA-256 GitHub published
+//! for it, and runs it (or swaps it in and restarts). Only the app's own files are replaced, and
+//! the old ones are deleted for good, never left in the Recycle Bin. Settings, notes, tags and
+//! clips live elsewhere (`config::dir`, the clips folder) and are never touched.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -50,6 +53,8 @@ pub struct Newer {
     pub url: String,
     pub notes: String,
     pub installer: Option<Installer>,
+    /// The release's exe on its own, for portable copies.
+    pub portable: Option<Installer>,
 }
 
 /// A release's installer: where to download it, its size and GitHub's SHA-256 of it.
@@ -78,14 +83,16 @@ fn newer_in(json: &serde_json::Value, current: &str) -> Option<Newer> {
     }
     let version = tag.trim_start_matches('v').to_string();
     // Only this release's own installer, from this repository, with a checksum to check it by.
-    let name = format!("ReplayVault-{version}-setup.exe");
-    let installer = json["assets"].as_array().into_iter().flatten().find(|a| a["name"].as_str() == Some(&name)).and_then(|a| {
-        let url = a["browser_download_url"].as_str().filter(|u| u.starts_with(DOWNLOADS))?;
-        let sha256 = a["digest"].as_str()?.strip_prefix("sha256:")?.to_lowercase();
-        (sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit())).then(|| Installer { url: url.into(), size: a["size"].as_u64().unwrap_or(0), sha256 })
-    });
+    let asset = |name: String| {
+        json["assets"].as_array().into_iter().flatten().find(|a| a["name"].as_str() == Some(&name)).and_then(|a| {
+            let url = a["browser_download_url"].as_str().filter(|u| u.starts_with(DOWNLOADS))?;
+            let sha256 = a["digest"].as_str()?.strip_prefix("sha256:")?.to_lowercase();
+            (sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit())).then(|| Installer { url: url.into(), size: a["size"].as_u64().unwrap_or(0), sha256 })
+        })
+    };
+    let (installer, portable) = (asset(format!("ReplayVault-{version}-setup.exe")), asset(format!("ReplayVault-{version}.exe")));
     let notes = json["body"].as_str().unwrap_or_default().lines().take_while(|l| !l.starts_with("Check a download")).collect::<Vec<_>>().join("\n");
-    Some(Newer { version, url: url.into(), notes: notes.trim().into(), installer })
+    Some(Newer { version, url: url.into(), notes: notes.trim().into(), installer, portable })
 }
 
 /// For tests: what a check found. `finds` isn't counted, so the popup only shows in a test that
@@ -136,10 +143,20 @@ fn check_and_keep() -> String {
 }
 
 /// Checks a minute after start, then once a day while `ENABLED`; `repaint` runs after each check.
-/// Also clears away the installer of an update that has since been installed.
+/// Also deletes what an update left behind: its installer, or a portable copy's old exe.
 pub fn start(repaint: impl Fn() + Send + 'static) {
     std::thread::spawn(move || {
         let _ = fs::remove_file(installer_path());
+        if let Ok(exe) = std::env::current_exe() {
+            // The old exe can take a moment to be let go of after the restart.
+            for _ in 0..10 {
+                let left = [beside(&exe, "old"), beside(&exe, "new")].into_iter().filter(|p| fs::remove_file(p).is_err() && p.exists()).count();
+                if left == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
         std::thread::sleep(Duration::from_secs(60));
         loop {
             if ENABLED.load(Ordering::Relaxed) {
@@ -181,9 +198,48 @@ pub fn installer_path() -> PathBuf {
     obs_install::install_root().join("replay-vault-setup.exe")
 }
 
-/// Downloads `inst` to `installer_path` on a thread, checking it against its SHA-256 as it comes.
+/// What to download for this copy: the installer for an installed one, the exe for a portable one.
+pub fn pick(n: &Newer) -> Option<Installer> {
+    if installed() { n.installer.clone() } else { n.portable.clone() }
+}
+
+/// `exe` with ".old" or ".new" after it: where a portable update parks the old exe and stages
+/// the new one, beside it (so the swap is a rename on the same drive).
+fn beside(exe: &Path, what: &str) -> PathBuf {
+    let mut name = exe.as_os_str().to_owned();
+    name.push(format!(".{what}"));
+    PathBuf::from(name)
+}
+
+/// Downloads `inst` (from `pick`) on a thread, checking it against its SHA-256 as it comes: to
+/// `installer_path`, or beside a portable copy's exe.
 pub fn download(inst: Installer, repaint: impl Fn() + Send + 'static) -> Shared {
-    obs_install::spawn(move |p| fetch(&inst, &installer_path(), p), repaint)
+    let dest = match std::env::current_exe() {
+        Ok(exe) if !installed() => beside(&exe, "new"),
+        _ => installer_path(),
+    };
+    obs_install::spawn(move |p| fetch(&inst, &dest, p), repaint)
+}
+
+/// Puts the downloaded update in place; the app must quit right after. Installed: the installer
+/// replaces the app's files. Portable: the new exe takes the old one's name (the old one, still
+/// running, is parked beside it and deleted for good at the next start) and is started once this
+/// copy has quit.
+pub fn apply() -> std::io::Result<()> {
+    if installed() {
+        return run_installer();
+    }
+    let exe = std::env::current_exe()?;
+    swap(&exe)?;
+    restart(&exe)
+}
+
+/// Starts `exe` after a moment, once this copy has let go of the one-copy-at-a-time lock.
+fn restart(exe: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let line = format!("ping -n 3 127.0.0.1 >nul & start \"\" \"{}\"", exe.display());
+    std::process::Command::new("cmd").arg("/c").raw_arg(format!("\"{line}\"")).current_dir(std::env::temp_dir()).creation_flags(CREATE_NO_WINDOW).spawn().map(|_| ())
 }
 
 fn fetch(inst: &Installer, dest: &Path, p: &Shared) -> anyhow::Result<()> {
@@ -221,7 +277,19 @@ fn fetch(inst: &Installer, dest: &Path, p: &Shared) -> anyhow::Result<()> {
 
 /// Starts the downloaded installer: it installs over this copy, keeping settings and clips, and
 /// opens the new version when it's done. The app must quit right after.
-pub fn run_installer() -> std::io::Result<()> {
+/// Puts `exe`.new in `exe`'s place, parking `exe` as `exe`.old; on failure `exe` is put back.
+fn swap(exe: &Path) -> std::io::Result<()> {
+    let (new, old) = (beside(exe, "new"), beside(exe, "old"));
+    let _ = fs::remove_file(&old);
+    fs::rename(exe, &old)?;
+    if let Err(e) = fs::rename(&new, exe) {
+        let _ = fs::rename(&old, exe);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn run_installer() -> std::io::Result<()> {
     std::process::Command::new(installer_path()).args(["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]).spawn().map(|_| ())
 }
 
@@ -268,6 +336,73 @@ mod tests {
         assert!(with(json!([asset("ReplayVault-0.2.0-setup.exe", ours, "")])).installer.is_none(), "no checksum");
         assert!(with(json!([asset("ReplayVault-0.1.9-setup.exe", ours, &format!("sha256:{sha}"))])).installer.is_none(), "another version's");
         assert!(with(json!([])).installer.is_none());
+        // A portable copy's update: the release's exe, checked the same way.
+        let exe = "https://github.com/ItsFlamme/replay-vault/releases/download/v0.2.0/ReplayVault-0.2.0.exe";
+        let n = with(json!([asset("ReplayVault-0.2.0.exe", exe, &format!("sha256:{sha}")), asset("ReplayVault-0.2.0-setup.exe", ours, &format!("sha256:{sha}"))]));
+        assert_eq!(n.portable, Some(Installer { url: exe.into(), size: 7, sha256: sha.clone() }));
+        assert!(with(json!([asset("ReplayVault-0.2.0.exe", exe, "")])).portable.is_none(), "no checksum");
+    }
+
+    /// A portable update puts the new exe in the old one's place and parks the old one; if the
+    /// new one can't be moved in, the old one goes back.
+    #[test]
+    fn portable_swap() {
+        let dir = std::env::temp_dir().join("replay-vault-swap-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("replay-vault.exe");
+        fs::write(&exe, b"old").unwrap();
+        assert!(swap(&exe).is_err(), "nothing downloaded");
+        assert_eq!(fs::read(&exe).unwrap(), b"old", "put back");
+        fs::write(beside(&exe, "new"), b"new").unwrap();
+        swap(&exe).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"new");
+        assert_eq!(fs::read(beside(&exe, "old")).unwrap(), b"old", "parked, deleted at the next start");
+        assert!(!beside(&exe, "new").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The real thing against GitHub, as a portable 0.1.1 would do it: finds the latest release,
+    /// downloads its exe beside a stand-in exe, checks it, swaps it in, and the restart line starts
+    /// a program in a folder with a space. A tampered checksum is refused and the file thrown away.
+    /// Run by hand: `cargo test --release live_portable_update -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_portable_update() {
+        let dir = std::env::temp_dir().join("replay-vault live update");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("root")).unwrap();
+        obs_install::set_install_root(dir.join("root").to_str().unwrap());
+        let resp = ureq::get(LATEST).header("User-Agent", "replay-vault-test").header("Accept", "application/vnd.github+json").call().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&resp.into_body().read_to_string().unwrap()).unwrap();
+        let n = newer_in(&json, "0.1.1").expect("a newer release than 0.1.1");
+        assert!(n.installer.is_some(), "installer asset");
+        let inst = n.portable.clone().expect("portable exe asset");
+        let exe = dir.join("ReplayVault.exe");
+        fs::write(&exe, b"old").unwrap();
+        // Tampered: refused, nothing left behind.
+        let bad = Installer { sha256: "0".repeat(64), ..inst.clone() };
+        let p: Shared = Default::default();
+        assert!(fetch(&bad, &beside(&exe, "new"), &p).is_err());
+        assert!(!beside(&exe, "new").exists(), "a bad download is deleted");
+        // The real one.
+        fetch(&inst, &beside(&exe, "new"), &p).unwrap();
+        assert_eq!(fs::metadata(beside(&exe, "new")).unwrap().len(), inst.size);
+        swap(&exe).unwrap();
+        assert!(fs::metadata(&exe).unwrap().len() > 1_000_000, "the new exe is in place");
+        assert_eq!(fs::read(beside(&exe, "old")).unwrap(), b"old");
+        // The restart line, on a script that leaves a mark (no window).
+        let mark = dir.join("ran.txt");
+        let vbs = dir.join("restart test.vbs");
+        fs::write(&vbs, format!("CreateObject(\"Scripting.FileSystemObject\").CreateTextFile(\"{}\").Close", mark.display())).unwrap();
+        restart(&vbs).unwrap();
+        let started = (0..30).any(|_| {
+            std::thread::sleep(Duration::from_millis(500));
+            mark.exists()
+        });
+        assert!(started, "the restart line started the program");
+        obs_install::set_install_root("");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -59,6 +59,10 @@ Filename: "{app}\replay-vault.exe"; Flags: nowait; Check: WizardSilent
 ; be removed. Only this copy: a portable one elsewhere keeps running.
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -Command ""Get-Process replay-vault -ErrorAction SilentlyContinue | Where-Object Path -eq '{app}\replay-vault.exe' | Stop-Process -Force"""; Flags: runhidden; RunOnceId: "StopApp"
 
+[InstallDelete]
+; An update clears the old copy's leftovers for good (files are replaced in place, never recycled).
+Type: files; Name: "{app}\debug.log"
+
 [UninstallDelete]
 ; Chromium (in OBS's browser, or an overlay injected into the app) leaves a debug.log in the
 ; app's folder; without this the folder stays behind with just that file in it.

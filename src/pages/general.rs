@@ -110,6 +110,9 @@ impl App {
             });
             ui.checkbox(&mut self.cfg.sort_by_game, "Sort clips into a folder per game")
                 .on_hover_text("Named after the title of the window in front when you save. Only the title is read; the game itself is never opened or touched.");
+            ui.checkbox(&mut self.cfg.pause_without_game, "Pause instant replay when no game is open").on_hover_text(
+                "After 2 minutes with no game in front, replay stops to save memory and power, and starts again when a game is in front. A game is something full screen, or a window you've saved clips from before. Leave this off to clip anything on your desktop.",
+            );
         });
         appearance(ui, &mut self.cfg);
         card(ui, "When a clip is saved", |ui| {
@@ -119,7 +122,7 @@ impl App {
         card(ui, "Startup", |ui| {
             self.startup_checkbox(ui);
             ui.checkbox(&mut self.cfg.check_updates, "Tell me when a new version is out")
-                .on_hover_text("Asks GitHub once a day whether a newer Replay Vault is out. Nothing about you or this PC is sent, and nothing is downloaded until you choose Install now.");
+                .on_hover_text("Asks GitHub once a day whether a newer Replay Vault is out. Nothing about you or this PC is sent, and nothing is downloaded until you choose Update now.");
             ui.horizontal(|ui| {
                 if button(ui, "Check for updates").on_hover_text("Asks GitHub now whether a newer Replay Vault is out").clicked() {
                     let c = ui.ctx().clone();
