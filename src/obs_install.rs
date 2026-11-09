@@ -145,6 +145,8 @@ fn read_acl(path: &Path) -> anyhow::Result<Option<Acl>> {
             for i in 0..(*dacl).AceCount as u32 {
                 let mut ace = std::ptr::null_mut();
                 GetAce(dacl, i, &mut ace)?;
+                // GetAce fills it on success; never read through an empty one regardless.
+                anyhow::ensure!(!ace.is_null(), "permission entry {i} of {} is missing", path.display());
                 let kind = (*(ace as *const ACE_HEADER)).AceType;
                 // Allowed (0) and denied (1) entries have the same layout, the SID at SidStart.
                 let sid = PSID((&raw const (*(ace as *const ACCESS_ALLOWED_ACE)).SidStart).cast_mut().cast());
@@ -399,7 +401,7 @@ fn fetch(rel: &Release, dest: &Path, p: &Shared) -> anyhow::Result<()> {
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
         // enclosed_name rejects paths that would escape the folder.
-        let Some(rel_path) = entry.enclosed_name() else { continue };
+        let Some(rel_path) = entry.enclosed_name().filter(|r| !unused(r)) else { continue };
         let out = tmp.join(rel_path);
         if entry.is_dir() {
             fs::create_dir_all(&out)?;
@@ -563,8 +565,44 @@ fn run_elevated(file: &Path, args: &str) -> anyhow::Result<u32> {
     Ok(code)
 }
 
-/// Swaps in a downloaded update. Call before the recorder starts.
+/// Whether `rel`, a path inside the OBS zip or our copy, is debug symbols (.pdb, about 80 MB in
+/// OBS 33), which OBS never loads, so it's left out. OBS's own plugins all stay, even the ones the
+/// recorder never uses (capture cards, the browser): OBS 32+ treats each `core\<plugin>` as
+/// required and loads no plugin at all, encoders included, if one is missing (tested 2026-11-09).
+fn unused(rel: &Path) -> bool {
+    rel.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdb"))
+}
+
+/// Takes the debug symbols out of a copy unpacked before they were left out.
+pub(crate) fn prune(dir: &Path) {
+    fn walk(dir: &Path, freed: &mut u64) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                walk(&path, freed);
+            } else if unused(&path) {
+                let size = e.metadata().map_or(0, |m| m.len());
+                if fs::remove_file(&path).is_ok() {
+                    *freed += size;
+                }
+            }
+        }
+    }
+    let mut freed = 0;
+    // Only where the .pdb files live, so a start doesn't walk OBS's thousands of data files.
+    for sub in ["core", "bin", "obs-plugins"] {
+        walk(&dir.join(sub), &mut freed);
+    }
+    if freed > 0 {
+        crate::log::write(&format!("Removed OBS's debug files, which it never loads ({} MB).", freed >> 20));
+    }
+}
+
+/// Swaps in a downloaded update, and takes OBS's debug files out of our copy (`prune`). Call
+/// before the recorder starts.
 pub fn apply_staged_update() -> Option<String> {
+    prune(&private_dir());
     // The last swap's old copy, if a file in it was still in use then: deleted for good, not
     // recycled.
     let _ = fs::remove_dir_all(install_root().join("obs-studio.old"));
@@ -613,6 +651,23 @@ pub fn check_for_update() -> anyhow::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only debug symbols are taken out of an OBS copy; every plugin stays (OBS needs them all).
+    #[test]
+    fn prune_takes_only_debug_files() {
+        let dir = std::env::temp_dir().join("replay-vault-prune-test");
+        let _ = fs::remove_dir_all(&dir);
+        let kept = [r"bin\64bit\obs64.exe", r"core\obs-browser\libcef.dll", r"core\aja\aja.dll", r"core\win-capture\win-capture.dll", r"data\obs-studio\x.pdb"];
+        let gone = [r"bin\64bit\obs64.pdb", r"core\win-capture\win-capture.PDB"];
+        for f in kept.iter().chain(&gone) {
+            fs::create_dir_all(dir.join(f).parent().unwrap()).unwrap();
+            fs::write(dir.join(f), b"x").unwrap();
+        }
+        prune(&dir);
+        assert!(kept.iter().all(|f| dir.join(f).exists()), "plugins and data stay");
+        assert!(gone.iter().all(|f| !dir.join(f).exists()), "debug files go");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Real download into the private folder: `cargo test -- --ignored download`.
     #[test]

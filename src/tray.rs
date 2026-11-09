@@ -29,14 +29,15 @@ pub(crate) fn make_tray(ctx: &egui::Context, cmds: Sender<Cmd>) -> anyhow::Resul
     let folder = MenuItem::new("Open clips folder", true, None);
     let play_last = MenuItem::new("Play last clip", true, None);
     let copy_last = MenuItem::new("Copy last clip", true, None);
+    let count_game = MenuItem::new("Count last window as a game", true, None);
     let startup = CheckMenuItem::new("Start with Windows", true, startup::is_enabled(), None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
-    menu.append_items(&[&status, &PredefinedMenuItem::separator(), &save, &pause, &open, &folder, &play_last, &copy_last, &startup, &PredefinedMenuItem::separator(), &quit])?;
+    menu.append_items(&[&status, &PredefinedMenuItem::separator(), &save, &pause, &open, &folder, &play_last, &copy_last, &count_game, &startup, &PredefinedMenuItem::separator(), &quit])?;
     let (save_id, pause_id, open_id, folder_id, startup_id, quit_id) =
         (save.id().clone(), pause.id().clone(), open.id().clone(), folder.id().clone(), startup.id().clone(), quit.id().clone());
 
-    let (play_id, copy_id) = (play_last.id().clone(), copy_last.id().clone());
+    let (play_id, copy_id, count_id) = (play_last.id().clone(), copy_last.id().clone(), count_game.id().clone());
 
     let c = ctx.clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
@@ -58,6 +59,15 @@ pub(crate) fn make_tray(ctx: &egui::Context, cmds: Sender<Cmd>) -> anyhow::Resul
                     }
                 }
                 None => log::write("No clip to play or copy yet."),
+            }
+        } else if e.id == count_id {
+            // For auto-pause: a game in a window that isn't full screen.
+            match autopause::count_last_window(std::path::Path::new(&Config::load().folder)) {
+                Ok(name) => {
+                    log::write(&format!("{name} now counts as a game."));
+                    toast::show("Counts as a game now", format!("{name}: replay stays on while it's in front"));
+                }
+                Err(e) => toast::show("Couldn't count it as a game", format!("{e:#}")),
             }
         } else if e.id == startup_id {
             if let Err(e) = startup::set_enabled(!startup::is_enabled()) {

@@ -72,7 +72,7 @@ pub fn game_folder_name() -> String {
 }
 
 /// "VALORANT  " -> "VALORANT", "Elden Ring - v1.2" -> "Elden Ring"; nothing usable -> "Desktop".
-fn folder_name_from_title(title: &str) -> String {
+pub(crate) fn folder_name_from_title(title: &str) -> String {
     let title = [" - ", " | ", " \u{2014} ", ": "].iter().fold(title, |t, sep| t.split(sep).next().unwrap_or(t));
     let clean = windows_safe(title);
     let clean = clean.as_str();
@@ -612,8 +612,8 @@ pub fn copy_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Opens a file with its default app, or shows it selected in File Explorer, in front of the
-/// always-on-top overlay (which is hidden so it isn't in the way).
+/// Opens a file with its default app (the always-on-top window hides so it isn't in the way), or
+/// shows it selected in File Explorer (the window stays open behind Explorer).
 pub fn open(path: &Path, reveal: bool) {
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(u32::MAX);
@@ -627,7 +627,11 @@ pub fn open(path: &Path, reveal: bool) {
         cmd.arg(path);
     }
     let _ = cmd.spawn();
-    crate::overlay::hide();
+    if reveal {
+        crate::overlay::drop_to_normal();
+    } else {
+        crate::overlay::hide();
+    }
 }
 
 /// Free bytes on the drive holding `folder` (for this user).

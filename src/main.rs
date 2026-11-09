@@ -60,14 +60,10 @@ use pages::clips::*;
 use pages::player::*;
 use pages::audio::*;
 use pages::keybinds::*;
+use pages::general::GeneralPart;
 
 /// Built from a work branch rather than master or a release (see build.rs).
 pub(crate) const DEV_BUILD: bool = option_env!("RV_DEV_BUILD").is_some();
-/// Keybinds' switches that turn off NVIDIA's overlay and AMD Software's Instant Replay: only in
-/// dev builds until they free those apps' keys (NVIDIA's helper keeps its shortcuts with the
-/// overlay off). Without them nothing is changed for NVIDIA or AMD, and a setting saved by a dev
-/// build is put back when the app closes.
-pub(crate) const OVERLAY_SWITCHES: bool = DEV_BUILD;
 /// The window's title, which a second launch also uses to find the running copy.
 pub(crate) const APP_TITLE: &str = if DEV_BUILD { "Replay Vault (Dev build)" } else { "Replay Vault" };
 
@@ -234,6 +230,8 @@ struct App {
     recommended: Option<String>,
     /// Custom is picked on the Audio page, so it stays open even while its tracks match a choice.
     audio_custom: bool,
+    /// Which of General's tabs is showing.
+    general_part: GeneralPart,
     /// Whether our firewall rule exists; checked once when the OBS setup step shows.
     firewall_ok: Option<bool>,
     /// Setup's install also adds the firewall rule (ticked by default).
@@ -438,8 +436,6 @@ impl App {
                     ctx.request_repaint();
                     return;
                 }
-                hotkey::Action::Save30 => Cmd::SaveLast(30),
-                hotkey::Action::Save60 => Cmd::SaveLast(60),
                 hotkey::Action::Record => Cmd::ToggleRecord,
                 hotkey::Action::Screenshot => Cmd::Screenshot,
                 hotkey::Action::Replay => Cmd::ToggleReplay,
@@ -482,6 +478,10 @@ impl App {
         overlay::restore_placement(&placement);
         if let Some(tab) = Tab::ALL.into_iter().find(|t| t.name() == placement.page) {
             app.tab = tab;
+        }
+        if updated_app(&placement.version, !needs_setup) {
+            app.tab = Tab::WhatsNew;
+            log::write(&format!("Updated to {}: What's new opens first.", env!("CARGO_PKG_VERSION")));
         }
         if let Some(v) = updated {
             app.status = format!("OBS was updated to {v}.");
@@ -551,6 +551,7 @@ impl App {
             hw,
             recommended: None,
             audio_custom: false,
+            general_part: GeneralPart::Clips,
             firewall_ok: None,
             setup_firewall: true,
             nvidia: None,
@@ -559,7 +560,7 @@ impl App {
             obs_settings_found: false,
             imported: None,
             clip_list: Vec::new(),
-            clips_checked: std::time::Instant::now() - std::time::Duration::from_secs(60),
+            clips_checked: std::time::Instant::now().checked_sub(std::time::Duration::from_secs(60)).unwrap_or_else(std::time::Instant::now),
             archive_list: None,
             archive_scan: None,
             archive_checked: std::time::Instant::now(),
@@ -707,7 +708,7 @@ impl App {
             }
         }
         // At every start too, in case an NVIDIA update switched it back on.
-        if OVERLAY_SWITCHES && s.nvidia_off != before.nvidia_off {
+        if s.nvidia_off != before.nvidia_off {
             match tweaks::set_nvidia_overlay_off(s.nvidia_off) {
                 // At start, closing it waits on another thread, so the window isn't held up.
                 Ok(()) if s.nvidia_off && start => {
@@ -735,7 +736,7 @@ impl App {
         // AMD Software's Instant Replay and hotkeys (untested), at every start too. Only switched
         // off on a PC that has AMD Software, so nothing is written for it anywhere else.
         let amd_off = self.saved.amd_off;
-        if OVERLAY_SWITCHES && amd_off != before.amd_off && (!amd_off || amd::detect().is_some()) {
+        if amd_off != before.amd_off && (!amd_off || amd::detect().is_some()) {
             match tweaks::set_amd_off(amd_off) {
                 Ok(()) if start => {}
                 Ok(()) if amd_off => log::write("Turned AMD Software's Instant Replay and hotkeys off (untested); it picks this up when it next starts."),
@@ -954,6 +955,19 @@ impl App {
                 ui.add(egui::Label::new(why).wrap()).on_hover_text(&self.status);
             }
         });
+        // A key another program took since the keys were set (Keybinds says who and what to do),
+        // so it isn't first noticed when a save does nothing.
+        self.check_conflicts();
+        if let Some((target, text)) = self.conflicts.first().cloned() {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                let more = if self.conflicts.len() > 1 { format!(" (+{} more)", self.conflicts.len() - 1) } else { String::new() };
+                let line = egui::Label::new(RichText::new(format!("Key clash: {}{more}", target.name())).small().color(pal().amber)).truncate().sense(egui::Sense::click());
+                if ui.add(line).on_hover_text(format!("{}: {text}\nClick to open Keybinds.", target.name())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.tab = Tab::Keybinds;
+                }
+            });
+        }
         ui.add_space(14.0);
     }
 
@@ -1219,7 +1233,7 @@ impl App {
                 for w in &warnings {
                     ui.label(RichText::new(format!("Check this: {w}")).color(pal().amber));
                 }
-                ui.label(RichText::new("Nothing is changed until you click Import; the settings then apply when you Save. Passwords and the Discord webhook stay as they are here.").small().color(pal().muted));
+                note(ui, "Nothing is changed until you click Import; the settings then apply when you Save. Passwords and the Discord webhook stay as they are here.");
                 (true, false)
             }) {
                 Some(true) => {
@@ -1365,7 +1379,9 @@ impl App {
                 } else {
                     "Save keeps them for next time. Discard goes back to what was saved."
                 };
-                ui.label(RichText::new(note).small().color(pal().muted));
+                if tips_on() {
+                    ui.label(RichText::new(note).small().color(pal().muted));
+                }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if primary(ui, true, strong("Save", 14.0), egui::Vec2::ZERO).on_hover_text("Keeps your changes").clicked() {
@@ -1391,6 +1407,13 @@ fn archive_rule(cfg: &Config) -> Option<clips::Archive> {
     let dir = cfg.archive_folder.trim();
     let ok = cfg.archive_days > 0 && !dir.is_empty() && !clips::inside(dir, &cfg.folder);
     ok.then(|| clips::Archive { dir: dir.into(), after: std::time::Duration::from_secs(cfg.archive_days as u64 * 86_400) })
+}
+
+/// Whether this start is the first one after an update, so What's new opens: the version that last
+/// ran differs. Versions before 0.2.0 didn't keep it, so an empty one counts once setup was done
+/// (a new user has nothing to compare with and starts in setup).
+fn updated_app(last_version: &str, set_up: bool) -> bool {
+    if last_version.is_empty() { set_up } else { last_version != env!("CARGO_PKG_VERSION") }
 }
 
 /// How often a hotkey another app held is tried again.
@@ -1442,9 +1465,10 @@ impl eframe::App for App {
             overlay::save_placement(self.tab.name());
         }
         // A new version comes to the user: from the tray the window opens with its popup, once per
-        // find, but never over a game (it waits until none is in front).
+        // find, but never over a game or mid-typing (it waits until none is in front and the PC
+        // has had no input for a minute, which also covers a windowed game it can't tell apart).
         if self.update_due() && self.update_job.is_none() && self.update_pushed != app_update::finds() && overlay::is_hidden() {
-            if autopause::game_in_front(std::path::Path::new(&self.saved.folder)) {
+            if autopause::game_in_front(std::path::Path::new(&self.saved.folder)) || autopause::idle() < std::time::Duration::from_secs(60) {
                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(60));
             } else {
                 self.update_pushed = app_update::finds();
@@ -1626,7 +1650,9 @@ impl eframe::App for App {
                             }
                         });
                     });
-                    ui.label(RichText::new(self.tab.info().2).color(pal().muted));
+                    if tips_on() {
+                        ui.label(RichText::new(self.tab.info().2).color(pal().muted));
+                    }
                     ui.add_space(14.0);
                 });
             }
@@ -1661,6 +1687,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod demos;
 
     impl App {
         /// The app with the saved settings and nothing running (no recorder, tray, hotkeys or
@@ -1725,7 +1752,7 @@ mod tests {
             .chain(tabs.map(|(t, n)| (t, None, format!("{n}-tip"))))
             .chain([(Tab::General, None, "general-accent".to_string()), (Tab::General, None, "general-no-tips".to_string()), (Tab::Clips, None, "clips-selected-accent".to_string())])
             .chain([(Tab::Video, None, "video-hint".to_string())])
-            .chain(["keybinds-nvidia", "keybinds-nvidia-off", "keybinds-amd", "keybinds-amd-off"].map(|n| (Tab::Keybinds, None, n.to_string())).into_iter().filter(|_| OVERLAY_SWITCHES))
+            .chain(["keybinds-nvidia", "keybinds-nvidia-off", "keybinds-amd", "keybinds-amd-off", "keybinds-both"].map(|n| (Tab::Keybinds, None, n.to_string())))
             .chain(["feedback-draft", "feedback-sent", "feedback-error", "feedback-limit"].map(|n| (Tab::Feedback, None, n.to_string())))
             .chain([(Tab::Audio, None, "audio-apps".to_string()), (Tab::Video, None, "video-follow".to_string())])
             .chain([(Tab::Video, None, "video-hdr".to_string())])
@@ -1755,9 +1782,31 @@ mod tests {
                 if std::env::var_os("SCREENS_FOLDER").is_some() {
                     let d = Config::default();
                     for c in [&mut app.cfg, &mut app.saved] {
-                        (c.hotkey, c.overlay_hotkey, c.hotkey_30, c.hotkey_60) = (d.hotkey.clone(), d.overlay_hotkey.clone(), d.hotkey_30.clone(), d.hotkey_60.clone());
+                        (c.hotkey, c.overlay_hotkey) = (d.hotkey.clone(), d.overlay_hotkey.clone());
                         (c.hotkey_record, c.hotkey_screenshot, c.hotkey_replay, c.hotkey_mic) = (d.hotkey_record.clone(), d.hotkey_screenshot.clone(), d.hotkey_replay.clone(), d.hotkey_mic.clone());
                     }
+                    // And a made-up PC, not this one's GPU, monitors, sound devices or user folder.
+                    (app.hw.gpu_name, app.hw.vram_mb, app.hw.ram_mb) = ("NVIDIA GeForce RTX 4070".into(), 12288, 32768);
+                    app.monitors.iter_mut().for_each(|m| {
+                        (m.id, m.name) = (String::new(), "Monitor".into());
+                        (m.width, m.height, m.hz) = (2560, 1440, 165);
+                    });
+                    let (mut mics, mut outs) = (0, 0);
+                    for dev in app.devices.iter_mut().filter(|d| !d.key.ends_with(":default")) {
+                        let n = if dev.key.starts_with("in:") { mics += 1; mics } else { outs += 1; outs };
+                        dev.name = match (dev.key.starts_with("in:"), n) {
+                            (true, 1) => "Microphone (USB Audio)".into(),
+                            (true, n) => format!("Microphone {n} (USB Audio)"),
+                            (false, 1) => "Speakers (Realtek Audio)".into(),
+                            (false, n) => format!("Headphones {n} (USB Audio)"),
+                        };
+                        for c in [&mut app.cfg, &mut app.saved] {
+                            if let Some(e) = c.devices.get_mut(&dev.key) {
+                                e.name = dev.name.clone();
+                            }
+                        }
+                    }
+                    obs_install::set_install_root(r"C:\Users\You\AppData\Local\replay-vault");
                 }
                 app.applied = recorder_settings(&app.cfg);
                 app.tab = tab;
@@ -1814,12 +1863,20 @@ mod tests {
                     app.cfg.show_tips = false;
                     app.saved.show_tips = false;
                 }
+                // General opens on the tab the render is about.
+                app.general_part = match name.as_str() {
+                    n if n.starts_with("general-discord") => GeneralPart::Sharing,
+                    "general-archive" | "general-cleanup" => GeneralPart::Storage,
+                    n if n == "general-move" || n.starts_with("general-import") => GeneralPart::Backup,
+                    n if n == "general-accent" || n == "general-no-tips" || n.starts_with("general-custom-color") => GeneralPart::Appearance,
+                    _ => GeneralPart::Clips,
+                };
                 // NVIDIA's overlay on, then switched off but still running (only shown; nothing changed).
                 if name == "keybinds-nvidia" {
-                    app.nvidia = Some((true, true));
+                    (app.nvidia, app.amd) = (Some((true, true)), Some(None));
                 }
                 if name == "keybinds-nvidia-off" {
-                    (app.cfg.nvidia_off, app.saved.nvidia_off, app.nvidia) = (true, true, Some((false, true)));
+                    (app.cfg.nvidia_off, app.saved.nvidia_off, app.nvidia, app.amd) = (true, true, Some((false, true)), Some(None));
                 }
                 // Send feedback with a draft, then sent, then refused by the server (only shown;
                 // nothing is posted).
@@ -1851,6 +1908,11 @@ mod tests {
                     app.nvidia = Some((false, false));
                     (app.cfg.amd_off, app.saved.amd_off) = (true, true);
                     app.amd = Some(Some(amd::Amd { replay_on: false, hotkeys_off: true, hotkeys: vec![] }));
+                }
+                // NVIDIA's overlay and AMD Software both on: one switch for both (made up; nothing read).
+                if name == "keybinds-both" {
+                    app.nvidia = Some((true, true));
+                    app.amd = Some(Some(amd::Amd { replay_on: true, hotkeys_off: false, hotkeys: vec![] }));
                 }
                 // Setup's welcome with an OBS of their own found (the question only; nothing read).
                 if name == "setup1" {
@@ -2283,7 +2345,7 @@ mod tests {
                         let (idx, hexv) = (*idx, hexv.to_string());
                         audit_shot(&out, base, &name, |a| {
                             set_look(a, theme, light);
-                            (a.cfg.accent, a.tab) = (idx, tab);
+                            (a.cfg.accent, a.tab, a.general_part) = (idx, tab, GeneralPart::Appearance);
                             open_all(a);
                             if !hexv.is_empty() {
                                 a.cfg.custom_accent = hexv.clone();
@@ -2374,7 +2436,7 @@ mod tests {
                 if theme == "retro" {
                     audit_shot(&out, base, &format!("state/{ln}-reduced"), |a| {
                         set_look(a, theme, light);
-                        (a.tab, a.cfg.reduce_effects) = (Tab::General, true);
+                        (a.tab, a.cfg.reduce_effects, a.general_part) = (Tab::General, true, GeneralPart::Appearance);
                         open_all(a);
                     }, |h, i| {
                         if i == 20 {
@@ -2412,6 +2474,15 @@ mod tests {
                 }, |_, _| {});
             }
         }
+    }
+
+    /// What's new opens on the first start of a new version, never for a new user.
+    #[test]
+    fn whats_new_after_an_update() {
+        assert!(updated_app("0.1.0", true), "another version ran last");
+        assert!(!updated_app(env!("CARGO_PKG_VERSION"), true), "same version");
+        assert!(updated_app("", true), "from 0.1.3, which didn't keep it");
+        assert!(!updated_app("", false), "new user, in setup");
     }
 
     /// Custom accent colors: "#RRGGBB" (the # optional, any case) and nothing else.
@@ -2604,7 +2675,7 @@ mod tests {
             app
         });
         h.run();
-        let item = "The tray menu has Play last clip and Copy last clip (pastes into Discord or a folder as the file).";
+        let item = "The app reopens maximized if you left it maximized.";
         assert!(h.query_by_label(item).is_some());
         h.get_by_label_contains("(this version)").click();
         // Past the closing animation.
@@ -3049,6 +3120,30 @@ mod tests {
         assert!(text.starts_with(&format!("Another program (or Windows) also uses {c}, so pressing it does both.")), "{text}");
     }
 
+    /// A key another program registered first still works here: it's shared (heard through Raw
+    /// Input), and freed keys go back to being the app's own. Ctrl+Alt+Shift+F21, held by
+    /// another thread, stands in for NVIDIA's overlay.
+    #[test]
+    fn a_held_key_is_shared_not_dead() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, UnregisterHotKey};
+        let c = hotkey::Combo { vk: 0x84, ctrl: true, alt: true, shift: true, win: false };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || unsafe {
+            RegisterHotKey(None, 0xA3, MOD_CONTROL | MOD_ALT | MOD_SHIFT, 0x84).unwrap();
+            held_tx.send(()).unwrap();
+            let _ = done_rx.recv();
+            let _ = UnregisterHotKey(None, 0xA3);
+        });
+        held_rx.recv().unwrap();
+        let _ = hotkey::install(|_| {});
+        assert_eq!(hotkey::set_combo(hotkey::Action::Mic, Some(c)), Ok(hotkey::Held::Shared));
+        done_tx.send(()).unwrap();
+        other.join().unwrap();
+        assert_eq!(hotkey::set_combo(hotkey::Action::Mic, Some(c)), Ok(hotkey::Held::Ours), "free now");
+        assert_eq!(hotkey::set_combo(hotkey::Action::Mic, None), Ok(hotkey::Held::Ours));
+    }
+
     /// Picking a key another action already has moves it, rather than refusing; the save key's
     /// own key isn't taken from it.
     #[test]
@@ -3085,6 +3180,8 @@ mod tests {
             app
         });
         h.run_steps(2);
+        // Just ended (the first frames can take longer than the 500 ms it allows on a busy PC).
+        h.state_mut().capture_ended = Some(std::time::Instant::now());
         h.key_press(egui::Key::Escape);
         h.run_steps(2);
         assert_eq!(h.state().picked.len(), 1, "swallowed");

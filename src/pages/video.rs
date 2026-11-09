@@ -4,10 +4,12 @@ use crate::*;
 
 /// The monitor to record. Following the mouse (under More options) shows here too, and picking a
 /// monitor turns it off.
-pub(crate) fn monitor_combo(ui: &mut egui::Ui, cfg: &mut Config, monitors: &[display::Monitor], salt: &str, mon: &display::Monitor) {
+/// `name` only tells this list apart from the other monitor list in the UI (egui's widget id);
+/// it isn't cryptographic.
+pub(crate) fn monitor_combo(ui: &mut egui::Ui, cfg: &mut Config, monitors: &[display::Monitor], name: &str, mon: &display::Monitor) {
     let follow = cfg.follows_mouse();
     let text = if follow { "Follow the mouse".to_string() } else { mon.label() };
-    egui::ComboBox::from_id_salt(salt).selected_text(text).width(ui.available_width().min(420.0)).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(egui::Id::NULL.with(name)).selected_text(text).width(ui.available_width().min(420.0)).show_ui(ui, |ui| {
         for m in monitors {
             if ui.selectable_label(!follow && m.id == mon.id, m.label()).clicked() {
                 (cfg.monitor_id, cfg.follow_mouse) = (m.id.clone(), false);
@@ -223,6 +225,13 @@ impl App {
                     ui.end_row();
                 }
             });
+            if let Some(secs) = p.fits_secs {
+                let want = self.cfg.buffer_secs;
+                ui.label(RichText::new(format!(
+                    "A {}:{:02} replay at this quality needs more than a quarter of this PC's {} GB of RAM, so the replay keeps the last {}:{:02}. Lower the quality or the replay length to keep all of it.",
+                    want / 60, want % 60, (profile::ram_mb() + 512) / 1024, secs / 60, secs % 60,
+                )).color(pal().amber));
+            }
         });
         self.obs_import_card(ui, mon, false);
     }

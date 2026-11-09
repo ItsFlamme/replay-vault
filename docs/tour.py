@@ -13,7 +13,7 @@ SHOTS, VT, BODY, OUT = sys.argv[1:5]
 
 # (render, keys, heading, line). Keys are the app's defaults.
 SCENES = [
-    ("clips.png", "Alt+F10", "Press a key, keep the play", "The last minute of your game is saved as a clip, sorted by game."),
+    ("clips.png", "Alt+F10", "Press a key, keep the play", "The last 3 minutes of your game are saved as a clip, sorted by game."),
     ("clips-scrub.png", "", "Scrub without opening", "Hover a clip to scrub through it, or play it in the built-in player."),
     (["waveform.png", "trim-parts.png"], "", "Trim the boring part", "A waveform marks the loud moments. Keep one part or join several."),
     ("clips-export.png", "", "Sized to send", "A copy that fits Discord, 720p or 9:16 for Shorts, or a share link."),

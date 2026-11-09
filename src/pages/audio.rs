@@ -156,11 +156,15 @@ impl App {
             egui::Grid::new("sound_presets").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 for (i, (name, hint)) in SOUND_PRESETS.into_iter().enumerate() {
                     chip(ui, &mut pick, i, name).on_hover_text(hint);
-                    ui.label(RichText::new(hint).color(pal().muted));
+                    if tips_on() {
+                        ui.label(RichText::new(hint).color(pal().muted));
+                    }
                     ui.end_row();
                 }
                 chip(ui, &mut pick, custom_at, "Custom").on_hover_text("Pick how many tracks, and what goes on each");
-                ui.label(RichText::new("Choose 1 to 6 tracks and what goes on each.").color(pal().muted));
+                if tips_on() {
+                    ui.label(RichText::new("Choose 1 to 6 tracks and what goes on each.").color(pal().muted));
+                }
                 ui.end_row();
             });
             if pick != current.unwrap_or(custom_at) {

@@ -26,18 +26,20 @@
 
 | 1. It keeps rolling | 2. You press the key | 3. It's a clip |
 |---|---|---|
-| Your screen and sound are recorded into memory, round and round. Nothing is written to disk yet. | Right after the moment, from inside the game: <kbd>Alt</kbd> + <kbd>F10</kbd>, or your own key. | The last minute (or up to 20) lands in your clips folder, ready to watch, trim or share. |
+| Your screen and sound are recorded into memory, round and round. Nothing is written to disk yet. | Right after the moment, from inside the game: <kbd>Alt</kbd> + <kbd>F10</kbd>, or your own key. | The last 3 minutes (or however long you set, up to 20) land in your clips folder, ready to watch, trim or share. |
 
 Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.com) that the app downloads and manages, so you get OBS's GPU encoding without setting up OBS. If you already use OBS, your own install and its settings are not changed.
 
 ## What's on the tapes
 
 **Recording**
-- Instant replay from 10 seconds to 20 minutes, or keys that save just the last 30 or 60 seconds
+- Instant replay from 10 seconds to 20 minutes, 3 minutes to start with. It never takes more than a quarter of your RAM; a long replay at high quality keeps its newest part.
 - Full recording and screenshots on their own keys
 - Desktop capture by default, which is safe with anti-cheat. Game capture is there if you want it.
 - Game and mic on separate tracks, noise suppression, or record only the apps you pick
-- Optional pause when no game is open, back on by itself when one is
+- Even sound on both sides: a clip that comes out louder on one side (your balance in Windows or another app) is evened after saving, still in stereo
+- Optional pause when no game is open, back on by itself when one is. A game in a window counts too, once you pick it from the tray.
+- If instant replay stops by itself, you're told and it's turned back on. Every saved clip is checked, and you're told if it came out empty or without sound.
 
 **Clips and trim**
 - A clips page with folders per game, search, stars and tags
@@ -73,13 +75,13 @@ Each release includes `SHA256SUMS.txt`. To verify a download, compare it with th
 
 | Action | Key |
 |---|---|
-| Save the replay | <kbd>Alt</kbd> + <kbd>F10</kbd> |
+| Save clip | <kbd>Alt</kbd> + <kbd>F10</kbd> |
 | Show or hide the window | <kbd>Alt</kbd> + <kbd>X</kbd> |
 | Start or stop a recording | <kbd>Alt</kbd> + <kbd>F11</kbd> |
 | Screenshot | <kbd>Alt</kbd> + <kbd>F12</kbd> |
 | Turn instant replay on or off | <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>F11</kbd> |
 
-All keys can be changed on the Keybinds page. Save is <kbd>Alt</kbd> + <kbd>F10</kbd> on purpose, the same key as NVIDIA's instant replay, so ShadowPlay players keep the habit; if NVIDIA's own instant replay is also on, it saves a clip too. The other keys avoid NVIDIA's and AMD's default shortcuts, which those apps keep even with their overlays off. If another app already uses a key you pick, the Keybinds page says which one.
+All keys can be changed on the Keybinds page. Save is <kbd>Alt</kbd> + <kbd>F10</kbd> on purpose, the same key as NVIDIA's instant replay, so ShadowPlay players keep the habit; if NVIDIA's own instant replay is also on, it saves a clip too (the Keybinds page can turn NVIDIA's overlay off while the app runs). The other keys avoid NVIDIA's and AMD's default shortcuts, which those apps keep even with their overlays off. A key NVIDIA's overlay holds still works for Replay Vault too, and both apps react to it. If another app already uses a key you pick, the Keybinds page says which one.
 
 ## Privacy
 

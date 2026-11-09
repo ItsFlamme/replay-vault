@@ -18,9 +18,15 @@ pub(crate) fn folder_field(ui: &mut egui::Ui, value: &mut String, hint: &str) {
 /// "Show tips and explanations" (General), for `note`.
 pub(crate) static NOTES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// Whether explanations show ("Show tips and explanations" under General). Grey text that only
+/// explains goes through this or `note`; data, statuses and warnings always show.
+pub(crate) fn tips_on() -> bool {
+    NOTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The small grey explanation under a setting; left out when tips and explanations are off.
 pub(crate) fn note(ui: &mut egui::Ui, text: impl Into<String>) {
-    if NOTES.load(std::sync::atomic::Ordering::Relaxed) {
+    if tips_on() {
         ui.label(RichText::new(text.into()).small().color(pal().muted));
     }
 }

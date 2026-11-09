@@ -81,7 +81,7 @@ pub(crate) fn appearance(ui: &mut egui::Ui, cfg: &mut Config) {
                     {
                         let how = if luminance(fit_accent(c, pal())) > luminance(c) { "lighter" } else { "darker" };
                         let mode = if pal().light { "light" } else { "dark" };
-                        ui.label(RichText::new(format!("Shown a little {how} in {mode} mode so it stays readable")).small().color(pal().muted));
+                        note(ui, format!("Shown a little {how} in {mode} mode so it stays readable"));
                     }
                     if !r.has_focus() {
                         typed = cfg.custom_accent.clone();
@@ -94,10 +94,65 @@ pub(crate) fn appearance(ui: &mut egui::Ui, cfg: &mut Config) {
     });
 }
 
+/// General's tabs, so its settings aren't one long scroll.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GeneralPart {
+    Clips,
+    Storage,
+    Appearance,
+    Startup,
+    Sharing,
+    Backup,
+}
+
+impl GeneralPart {
+    const ALL: [(GeneralPart, &str, &str); 6] = [
+        (GeneralPart::Clips, "Clips", "Clip length, the clips folder, what a save does and clip names"),
+        (GeneralPart::Storage, "Storage", "Auto-cleanup and the archive drive"),
+        (GeneralPart::Appearance, "Appearance", "Theme, light or dark, accent color and tips"),
+        (GeneralPart::Startup, "Startup", "Starting with Windows, updates and Windows settings"),
+        (GeneralPart::Sharing, "Sharing", "Your Discord webhook"),
+        (GeneralPart::Backup, "Backup", "Move your settings to a new PC, or remove the app"),
+    ];
+}
+
 impl App {
-    /// General: clip length, the folder and its game folders, what a save does, startup and the
-    /// look; the rest (names, cleanup, archive, Discord, Windows tweaks, moving PCs) under More options.
+    /// General, in tabs: Clips (length, folder, game folders, what a save does, names and covers),
+    /// Storage (cleanup, archive), Appearance (look, tips), Startup (startup, updates, Windows),
+    /// Sharing (Discord) and Backup (moving PCs, Remove).
     pub(crate) fn general_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for (part, name, about) in GeneralPart::ALL {
+                // Backup is hidden during setup, along with its cards.
+                if part == GeneralPart::Backup && self.wizard.is_some() {
+                    continue;
+                }
+                chip(ui, &mut self.general_part, part, name).on_hover_text(about);
+            }
+        });
+        ui.add_space(12.0);
+        match self.general_part {
+            GeneralPart::Clips => {
+                self.general_clips(ui);
+                self.names_card(ui);
+            }
+            GeneralPart::Storage => self.storage_cards(ui),
+            GeneralPart::Appearance => {
+                appearance(ui, &mut self.cfg);
+                card(ui, "Tips", |ui| {
+                    ui.checkbox(&mut self.cfg.show_tips, "Show tips and explanations").on_hover_text("Untick to turn off the tip boxes at the top of every page, for good, and the small grey text under settings");
+                });
+            }
+            GeneralPart::Startup => {
+                self.startup_cards(ui);
+                self.windows_card(ui);
+            }
+            GeneralPart::Sharing => self.discord_card(ui),
+            GeneralPart::Backup => self.backup_cards(ui),
+        }
+    }
+
+    fn general_clips(&mut self, ui: &mut egui::Ui) {
         card(ui, "Clips", |ui| {
             form(ui, "clips", |ui| {
                 ui.label("Clip length");
@@ -111,14 +166,16 @@ impl App {
             ui.checkbox(&mut self.cfg.sort_by_game, "Sort clips into a folder per game")
                 .on_hover_text("Named after the title of the window in front when you save. Only the title is read; the game itself is never opened or touched.");
             ui.checkbox(&mut self.cfg.pause_without_game, "Pause instant replay when no game is open").on_hover_text(
-                "After 2 minutes with no game in front, replay stops to save memory and power, and starts again when a game is in front. A game is something full screen, or a window you've saved clips from before. Leave this off to clip anything on your desktop.",
+                "After 2 minutes with no game in front, replay stops to save memory and power, and starts again when a game is in front. A game is something full screen, or a window you've saved clips from before. For a game in a smaller window, play it, then pick Count last window as a game in the tray menu. Leave this off to clip anything on your desktop.",
             );
         });
-        appearance(ui, &mut self.cfg);
         card(ui, "When a clip is saved", |ui| {
             ui.checkbox(&mut self.cfg.save_popup, "Show a popup").on_hover_text("A small note in the corner of the screen when a clip is saved");
             ui.checkbox(&mut self.cfg.save_sound, "Play a soft sound (screenshots too)").on_hover_text("A quiet sound, so you know it worked without looking");
         });
+    }
+
+    fn startup_cards(&mut self, ui: &mut egui::Ui) {
         card(ui, "Startup", |ui| {
             self.startup_checkbox(ui);
             ui.checkbox(&mut self.cfg.check_updates, "Tell me when a new version is out")
@@ -134,14 +191,9 @@ impl App {
             });
             note(ui, format!("{}, Esc or X hides this window. The app keeps running in the tray.", self.cfg.overlay_hotkey));
         });
-        card(ui, "Tips", |ui| {
-            ui.checkbox(&mut self.cfg.show_tips, "Show tips and explanations").on_hover_text("Untick to turn off the tip boxes at the top of every page, for good, and the small grey text under settings");
-        });
-        self.more_options(ui, Tab::General, Self::general_more);
     }
 
-    /// General's More options.
-    pub(crate) fn general_more(&mut self, ui: &mut egui::Ui) {
+    fn names_card(&mut self, ui: &mut egui::Ui) {
         card(ui, "Clip names and covers", |ui| {
             form(ui, "names", |ui| {
                 ui.label("Date style");
@@ -157,6 +209,9 @@ impl App {
                 "Sends each game folder's name (like \"Elden Ring\"), and your IP address as with any web request, to Steam's store search, then downloads the cover picture. Each name is asked once (one with no match again after a week). Names that look like a web page, a file, an email address or a non-game app (browser, Explorer, Discord, editors) are never sent.",
             );
         });
+    }
+
+    fn storage_cards(&mut self, ui: &mut egui::Ui) {
         card(ui, "Auto-cleanup", |ui| {
             limit(ui, &mut self.cfg.keep_under_gb, "Keep clips under", "GB", 100, 10_000);
             limit(ui, &mut self.cfg.keep_days, "Remove clips older than", "days", 30, 3650);
@@ -205,6 +260,9 @@ impl App {
                 ui.label(RichText::new(text).small().color(color));
             }
         });
+    }
+
+    fn discord_card(&mut self, ui: &mut egui::Ui) {
         card(ui, "Discord", |ui| {
             form(ui, "discord", |ui| {
                 ui.label("Webhook");
@@ -217,12 +275,18 @@ impl App {
                 _ => _ = ui.label(RichText::new("That doesn't look like a Discord webhook link (https://discord.com/api/webhooks/...).").small().color(pal().red)),
             }
         });
+    }
+
+    fn windows_card(&mut self, ui: &mut egui::Ui) {
         card(ui, "Windows", |ui| {
             ui.checkbox(&mut self.cfg.game_bar_off, "Turn off Xbox Game Bar capture").on_hover_text("Stops Windows' own Game Bar from also recording in the background");
             note(ui, "Game Bar records in the background too, which costs some FPS and competes for the GPU encoder. Unticking puts your own setting back.");
             ui.checkbox(&mut self.cfg.gpu_high, "Run the recorder on the high-performance GPU").on_hover_text("On PCs with two graphics chips, records with the faster one");
             note(ui, "For PCs with two GPUs (like a laptop or a CPU with graphics). Only applies to the app's private OBS copy. Takes effect after Save.");
         });
+    }
+
+    fn backup_cards(&mut self, ui: &mut egui::Ui) {
         if self.wizard.is_none() {
             card(ui, "Move to a new PC", |ui| {
                 note(ui, "One file with your saved settings, stars and tags, for a new PC or a reinstall. Passwords and the Discord webhook are left out.");
@@ -244,26 +308,36 @@ impl App {
         }
     }
 
-    /// The clip length as a few chips and Custom, which shows a slider (10 s to 20 minutes). A
-    /// length that isn't one of the chips is Custom.
+    /// The clip length as a few chips and Custom, which shows a slider (10 s to 20 minutes, or
+    /// less: as long as fits in a quarter of this PC's RAM at the video settings). A length that
+    /// isn't one of the chips is Custom.
     pub(crate) fn length_chips(&mut self, ui: &mut egui::Ui) {
-        const LENGTHS: [u32; 4] = [30, 60, 120, 300];
+        const LENGTHS: [u32; 4] = [60, 120, 180, 300];
+        let max = recorder::pick_monitor(&self.monitors, &self.cfg).map_or(1200, |m| recorder::max_secs(&self.cfg, &m));
+        // Settings changed elsewhere (higher quality) can leave the length past what fits.
+        self.cfg.buffer_secs = self.cfg.buffer_secs.min(max);
         let id = egui::Id::NULL.with("custom clip length");
         let mut custom = ui.ctx().data(|d| d.get_temp::<bool>(id)).unwrap_or(false) || !LENGTHS.contains(&self.cfg.buffer_secs);
+        let too_long = format!("Longer than fits at your video settings ({}) in a quarter of this PC's {} GB of RAM", mmss(max), (profile::ram_mb() + 512) / 1024);
         ui.vertical(|ui| {
             ui.horizontal_wrapped(|ui| {
                 for secs in LENGTHS {
                     let mut shown = if custom { None } else { Some(self.cfg.buffer_secs) };
-                    if chip(ui, &mut shown, Some(secs), mmss(secs)).on_hover_text("How much a saved clip keeps: the last this long").clicked() {
+                    let fits = secs <= max;
+                    let r = ui.add_enabled_ui(fits, |ui| chip(ui, &mut shown, Some(secs), mmss(secs))).inner;
+                    if r.on_hover_text("How much a saved clip keeps: the last this long").on_disabled_hover_text(&too_long).clicked() {
                         (self.cfg.buffer_secs, custom) = (secs, false);
                     }
                 }
-                if chip(ui, &mut custom, true, "Custom").on_hover_text("Any length from 0:10 to 20:00").clicked() {
+                if chip(ui, &mut custom, true, "Custom").on_hover_text(format!("Any length from 0:10 to {}", mmss(max))).clicked() {
                     custom = true;
                 }
             });
             if custom {
-                ui.add(egui::Slider::new(&mut self.cfg.buffer_secs, 10..=1200).custom_formatter(|v, _| mmss(v as u32))).on_hover_text("How much a saved clip keeps: the last this long");
+                ui.add(egui::Slider::new(&mut self.cfg.buffer_secs, 10..=max).custom_formatter(|v, _| mmss(v as u32))).on_hover_text("How much a saved clip keeps: the last this long");
+            }
+            if max < 1200 {
+                note(ui, format!("Up to {} at your video settings: the replay is kept in RAM and takes at most a quarter of this PC's {} GB. Lower the quality on the Video page for longer.", mmss(max), (profile::ram_mb() + 512) / 1024));
             }
         });
         ui.ctx().data_mut(|d| d.insert_temp(id, custom));

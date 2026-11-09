@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,7 @@ pub fn start(cmds: Sender<Cmd>, replay_on: &'static AtomicBool, folder: impl Fn(
         let mut no_game_since: Option<Instant> = None;
         loop {
             std::thread::sleep(TICK);
+            remember_front();
             let enabled = ENABLED.load(Ordering::Relaxed);
             let game = enabled && game_in_front(Path::new(&folder()));
             let running = replay_on.load(Ordering::Relaxed);
@@ -45,6 +47,50 @@ pub fn start(cmds: Sender<Cmd>, replay_on: &'static AtomicBool, folder: impl Fn(
     });
 }
 
+/// The title of the last window in front that wasn't Windows' own (taskbar, tray, desktop, Start)
+/// or this app's, for the tray's "Count last window as a game": opening the tray puts the
+/// taskbar in front, so the game is the one before it.
+static LAST_WINDOW: Mutex<String> = Mutex::new(String::new());
+
+fn remember_front() {
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowTextW, GetWindowThreadProcessId};
+    let window = crate::overlay::window_in_front();
+    if window.is_invalid() {
+        return;
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+    if pid == std::process::id() {
+        return;
+    }
+    let mut class = [0u16; 64];
+    let n = unsafe { GetClassNameW(window, &mut class) };
+    let class = String::from_utf16_lossy(&class[..n.max(0) as usize]);
+    if SHELL.contains(&class.as_str()) {
+        return;
+    }
+    let mut title = [0u16; 256];
+    let n = unsafe { GetWindowTextW(window, &mut title) };
+    let title = String::from_utf16_lossy(&title[..n.max(0) as usize]);
+    if !title.trim().is_empty() {
+        *LAST_WINDOW.lock().unwrap_or_else(|e| e.into_inner()) = title;
+    }
+}
+
+/// Windows' own windows that come to the front on the way to the tray menu.
+const SHELL: [&str; 7] =
+    ["Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland", "Progman", "WorkerW", "Windows.UI.Core.CoreWindow"];
+
+/// Makes the last window in front count as a game from now on: its game folder is made in the
+/// clips folder (where its clips go anyway), which `game_in_front` already counts. Returns its name.
+pub fn count_last_window(folder: &Path) -> anyhow::Result<String> {
+    let title = LAST_WINDOW.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let name = crate::clips::folder_name_from_title(&title);
+    anyhow::ensure!(name != "Desktop", "no game window has been in front yet");
+    std::fs::create_dir_all(folder.join(&name))?;
+    Ok(name)
+}
+
 /// What to do now: Some(true) turn replay back on, Some(false) pause it, None leave it.
 fn decide(enabled: bool, game: bool, replay_on: bool, paused: bool, no_game_since: &mut Option<Instant>, now: Instant) -> Option<bool> {
     if !enabled || game {
@@ -58,6 +104,17 @@ fn decide(enabled: bool, game: bool, replay_on: bool, paused: bool, no_game_sinc
     }
     let since = *no_game_since.get_or_insert(now);
     (now.duration_since(since) >= GRACE).then_some(false)
+}
+
+/// How long since the last key press or mouse move anywhere on the PC.
+pub fn idle() -> Duration {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(unsafe { GetTickCount() }.wrapping_sub(info.dwTime) as u64)
 }
 
 /// Whether the window in front looks like a game: Windows calls it full screen (a game, or

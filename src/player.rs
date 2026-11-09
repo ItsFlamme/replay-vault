@@ -488,6 +488,11 @@ impl Player {
         }
     }
 
+    /// The clip's own width and height in pixels; (0, 0) if unknown.
+    pub fn video_size(&self) -> (u32, u32) {
+        self.video
+    }
+
     /// Clip length in seconds; None until the engine knows it.
     pub fn duration(&self) -> Option<f64> {
         let d = unsafe { self.engine.GetDuration() };

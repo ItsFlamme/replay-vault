@@ -294,7 +294,7 @@ mod tests {
             p.swap(0, 2);
             p[3] = 255;
         });
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(r"target\screens\toast.png");
+        let out = std::env::var("SCREENS_OUT").map(std::path::PathBuf::from).unwrap_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(r"target\screens")).join("toast.png");
         std::fs::create_dir_all(out.parent().unwrap()).unwrap();
         image::save_buffer(&out, &rgba, W as u32, H as u32, image::ColorType::Rgba8).unwrap();
     }

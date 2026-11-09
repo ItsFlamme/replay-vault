@@ -1,7 +1,7 @@
 //! Background worker that runs the hidden recorder OBS and talks to it over its WebSocket.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,8 +21,8 @@ pub static SAVE_SOUND: AtomicBool = AtomicBool::new(false);
 /// Clips OBS has reported saved, to spot a save request that never lands.
 static SAVED: AtomicU32 = AtomicU32::new(0);
 
-/// A "save only the last N seconds" request, cut down once OBS reports the clip saved.
-static SHORTEN: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
+/// Audio tracks the recorder writes into each clip (1 to 6), to check saved clips against.
+static TRACKS: AtomicU8 = AtomicU8::new(1);
 
 /// The clips folder of the running config; saved-clip paths from the recorder must be inside it.
 static FOLDER: Mutex<String> = Mutex::new(String::new());
@@ -219,8 +219,6 @@ pub enum Cmd {
     Start(Box<Config>),
     /// Save the replay into the clips folder.
     Save,
-    /// Save, then keep only the last this many seconds.
-    SaveLast(u32),
     /// Turn instant replay on or off.
     SetReplay(bool),
     /// Flip instant replay, start/stop a full recording, mute/unmute the mic (hotkeys).
@@ -253,11 +251,16 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
     let mut want_buffer = false;
     let mut connected_at = Instant::now();
     let mut reported_stuck = false;
+    // Watchdog: tries at turning a buffer back on that went off by itself, when the last one was,
+    // and whether the user was told it stopped (so they hear when it's back).
+    // `seen_on`: the buffer ran since replay was last turned on, so it going off is news (a first
+    // start that's just slow isn't).
+    let (mut revive_tries, mut revived_at, mut told_stopped, mut seen_on) = (0u32, ago(60), false, false);
     let mut last_checkin = Instant::now();
     // A save we asked for: when, and how many clips had landed before it.
     let mut save_pending: Option<(Instant, u32)> = None;
     let mut reported_no_connect = false;
-    let (mut disk_checked, mut disk_low) = (Instant::now() - Duration::from_secs(60), false);
+    let (mut disk_checked, mut disk_low) = (ago(60), false);
     let (mut sampler, mut sampled) = (perf::Sampler::new(), Instant::now());
     let last_state = Cell::new((false, false));
     // Follow the mouse: checked every second, while the health check stays at every 2 s.
@@ -301,12 +304,7 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
             std::thread::spawn(move || watch_saves(password, events, repaint));
             watching = true;
         }
-        // A short save is a normal save that gets cut down once it lands.
         let cmd = match cmd {
-            Some(Cmd::SaveLast(secs)) => {
-                *SHORTEN.lock().unwrap() = Some((secs, Instant::now()));
-                Some(Cmd::Save)
-            }
             Some(Cmd::ToggleReplay) => Some(Cmd::SetReplay(!last_state.get().1)),
             c => c,
         };
@@ -318,10 +316,11 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                     begin_session();
                     with_session(recorder_restarted);
                     *FOLDER.lock().unwrap() = new_cfg.folder.clone();
+                    TRACKS.store(new_cfg.track_count.clamp(1, 6), Ordering::Relaxed);
                     recorder::restart(&new_cfg)?;
                     last_launch = Instant::now();
                     cfg = Some(*new_cfg);
-                    (want_buffer, reported_stuck, reported_no_connect) = (true, false, false);
+                    (want_buffer, reported_stuck, reported_no_connect, revive_tries, told_stopped, seen_on) = (true, false, false, 0, false, false);
                     Ok(Some("Starting the recorder...".into()))
                 }
                 Some(Cmd::Save) => {
@@ -337,7 +336,7 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                 Some(Cmd::SetReplay(on)) => {
                     let c = client.as_ref().ok_or_else(|| anyhow::anyhow!("The recorder is still starting"))?;
                     if on { c.replay_buffer().start().await? } else { c.replay_buffer().stop().await? }
-                    (want_buffer, reported_stuck, connected_at) = (on, false, Instant::now());
+                    (want_buffer, reported_stuck, connected_at, revive_tries, told_stopped, seen_on) = (on, false, Instant::now(), 0, false, false);
                     if on {
                         begin_session();
                     } else {
@@ -407,8 +406,8 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                     toast::show(if mute { "Mic muted" } else { "Mic on" }, "In clips and recordings".into());
                     Ok(Some(if mute { "Mic muted." } else { "Mic unmuted." }.into()))
                 }
-                // Turned into Save / SetReplay above.
-                Some(Cmd::SaveLast(_) | Cmd::ToggleReplay) => Ok(None),
+                // Turned into SetReplay above.
+                Some(Cmd::ToggleReplay) => Ok(None),
                 // Health check: keep the connection alive and the recorder running.
                 None => {
                     let Some(cfg) = &cfg else { return Ok(None) };
@@ -468,20 +467,41 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                                 last_checkin = Instant::now();
                                 with_session(|s| log::write(&format!("Hourly check: {}", summary(s))));
                             }
-                            // OBS sometimes refuses to start the buffer (bad folder, encoder error) and
-                            // only says why in its own log; bring that up once.
-                            if want_buffer && !buffer && !reported_stuck && connected_at.elapsed() > Duration::from_secs(10) {
-                                reported_stuck = true;
-                                anyhow::bail!(match recorder::last_obs_error() {
-                                    Some(line) => format!("Instant replay didn't start. OBS says: {line}"),
-                                    None => "Instant replay didn't start. Check the OBS log.".into(),
-                                });
+                            // Watchdog: replay should be on but isn't (it never started, or stopped
+                            // by itself). Turn it back on, up to 3 times 20 s apart, and say so.
+                            if want_buffer && buffer {
+                                if told_stopped {
+                                    toast::show("Instant replay is back on", "Clips are being kept again".into());
+                                }
+                                (revive_tries, told_stopped, reported_stuck, seen_on) = (0, false, false, true);
+                            } else if want_buffer && connected_at.elapsed() > Duration::from_secs(10) {
+                                if revive_tries < 3 && revived_at.elapsed() > Duration::from_secs(20) {
+                                    if seen_on && !told_stopped {
+                                        told_stopped = true;
+                                        toast::show("Instant replay stopped", "Turning it back on".into());
+                                    }
+                                    revive_tries += 1;
+                                    revived_at = Instant::now();
+                                    log::write(&format!("Instant replay is off but should be on; turning it back on (try {revive_tries} of 3)."));
+                                    if let Err(e) = c.replay_buffer().start().await {
+                                        log::write(&format!("Couldn't turn instant replay back on: {e}"));
+                                    }
+                                } else if revive_tries >= 3 && !reported_stuck {
+                                    // OBS refuses (bad folder, encoder error) and only says why in its own log.
+                                    reported_stuck = true;
+                                    toast::show("Instant replay is off", "It didn't start again. Open Replay Vault to see why.".into());
+                                    anyhow::bail!(match recorder::last_obs_error() {
+                                        Some(line) => format!("Instant replay is off and didn't start again. OBS says: {line}"),
+                                        None => "Instant replay is off and didn't start again. Check the OBS log.".into(),
+                                    });
+                                }
                             }
                             if let Some((asked, before)) = save_pending {
                                 if SAVED.load(Ordering::Relaxed) > before {
                                     save_pending = None;
                                 } else if asked.elapsed() > Duration::from_secs(10) {
                                     save_pending = None;
+                                    toast::show("Clip not saved", "Open Replay Vault to see why".into());
                                     anyhow::bail!(match recorder::last_obs_error() {
                                         Some(line) => format!("The clip wasn't saved. OBS says: {line}"),
                                         None => "The clip wasn't saved. Check the clips folder and the OBS log.".into(),
@@ -512,7 +532,7 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                             let buffer = c.replay_buffer().status().await.unwrap_or(false);
                             send(Event::State { connected: true, buffer });
                             client = Some(c);
-                            connected_at = Instant::now();
+                            (connected_at, revive_tries) = (Instant::now(), 0);
                             // A (re)started recorder shows the chosen monitor again.
                             follow = cfg.follows_mouse().then(|| recorder::chosen_monitor(cfg)).flatten().map(|m| Follow::new(m.id));
                             reported_no_connect = false;
@@ -525,6 +545,10 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                                 s.restarts += 1;
                                 recorder_restarted(s);
                             });
+                            if want_buffer && !told_stopped {
+                                told_stopped = true;
+                                toast::show("Instant replay stopped", "The recorder closed. Restarting it".into());
+                            }
                             recorder::restart(cfg)?;
                             last_launch = Instant::now();
                             Ok(Some("Recorder stopped, restarting it...".into()))
@@ -551,39 +575,72 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
     }
 }
 
-/// Cuts a just-saved clip down to its last `secs` seconds, in place. Returns a note for the popup,
-/// or None when the clip was short enough already. On failure the full clip is kept.
-fn shorten(path: &std::path::Path, secs: u32) -> Option<String> {
-    let len = media::duration(path).ok()?;
-    if len <= secs as f64 + 1.0 {
-        return None;
-    }
-    let tmp = path.with_extension("cutting.mp4");
+/// Brings a just-saved clip's sound back to the middle if a track is louder on one side all the
+/// way through (a balance setting in Windows or another app, a one-sided mic), so it plays even
+/// for whoever it's shared with. Stays stereo. On any failure the clip is kept as it was.
+/// `energy` is the clip's channel_energy.
+fn center_clip(path: &std::path::Path, energy: &[(f64, f64)]) {
+    let tmp = path.with_extension("centering.mp4");
     // rename replaces the original in one step on Windows, so there's never a moment with neither.
-    let result = media::trim(path, &tmp, len - secs as f64, len).and_then(|()| Ok(std::fs::rename(&tmp, path)?));
-    match result {
-        Ok(()) => Some(format!("last {}:{:02}", secs / 60, secs % 60)),
+    // Something can hold the new clip for a moment (antivirus, Explorer's thumbnails), so retry.
+    let swap = || {
+        let mut tries = 0;
+        loop {
+            match std::fs::rename(&tmp, path) {
+                Err(e) if tries < 10 && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                r => return r,
+            }
+        }
+    };
+    match media::center(path, &tmp, energy).and_then(|fixed| if fixed { Ok(swap().map(|()| true)?) } else { Ok(false) }) {
+        Ok(true) => log::write(&format!("Centered a clip's sound (one side was louder): {}", path.display())),
+        Ok(false) => {}
         Err(e) => {
-            // The cut copy is the only one left if the original somehow went missing.
             if path.exists() {
                 let _ = std::fs::remove_file(&tmp);
             }
-            log::write(&format!("Couldn't cut the clip to the last {secs} s, kept the full clip: {e:#}"));
-            Some("full length, couldn't cut it".into())
+            log::write(&format!("Couldn't center a clip's sound, kept it as saved: {e:#} ({})", path.display()));
         }
     }
 }
 
-fn clip_saved(path: &std::path::Path, note: Option<String>, events: &Sender<Event>, repaint: &Repaint) {
+/// `secs` before now, or now if the PC hasn't been on that long (Instant can't go before boot).
+fn ago(secs: u64) -> Instant {
+    Instant::now().checked_sub(Duration::from_secs(secs)).unwrap_or_else(Instant::now)
+}
+
+fn clip_saved(path: &std::path::Path, events: &Sender<Event>, repaint: &Repaint) {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    feedback("Clip saved", match &note { Some(n) => format!("{name} ({n})"), None => name }, Some(path));
-    let msg = match note {
-        Some(n) => format!("Clip saved ({n}): {}", path.display()),
-        None => format!("Clip saved: {}", path.display()),
-    };
+    feedback("Clip saved", name, Some(path));
+    let msg = format!("Clip saved: {}", path.display());
     log::write(&msg);
     let _ = events.send(Event::Status(msg));
     repaint();
+}
+
+/// What's wrong with a just-saved clip, if anything: missing or empty, unreadable, under a second,
+/// fewer sound tracks than the recorder writes, or track 1 (the full mix) silent from start to
+/// end (no sound at all reached the recorder; quiet sound still counts). `energy` is the clip's
+/// channel_energy, when it could be read.
+fn check_clip(path: &std::path::Path, tracks: usize, energy: Option<&[(f64, f64)]>) -> Option<String> {
+    if std::fs::metadata(path).map_or(0, |m| m.len()) == 0 {
+        return Some("the file is missing or empty.".into());
+    }
+    let Ok(len) = media::duration(path) else { return Some("it can't be opened.".into()) };
+    if len < 1.0 {
+        return Some("it's under a second long.".into());
+    }
+    let got = media::audio_tracks(path).unwrap_or(0);
+    if got < tracks {
+        return Some(format!("it has {got} of {tracks} sound tracks."));
+    }
+    if energy.is_some_and(|e| e.first().is_none_or(|&(l, r)| l + r == 0.0)) {
+        return Some("it has no sound at all. If something was playing, check the Audio page.".into());
+    }
+    None
 }
 
 /// Listens for saved clips, whether from OBS's own hotkey or the Save button, and shows the popup.
@@ -607,13 +664,29 @@ fn watch_saves(password: String, events: Sender<Event>, repaint: Repaint) {
                                     continue;
                                 }
                                 with_session(|s| s.clips += 1);
-                                let short = SHORTEN.lock().unwrap().take().filter(|(_, at)| at.elapsed() < Duration::from_secs(20));
                                 let (events, repaint) = (events.clone(), repaint.clone());
-                                // Cutting takes a moment; don't hold up the event stream.
+                                // Moving and checking take a moment; don't hold up the event stream.
                                 std::thread::spawn(move || {
-                                    let note = short.map(|(secs, _)| shorten(&path, secs));
                                     let path = place(&path);
-                                    clip_saved(&path, note.flatten(), &events, &repaint);
+                                    clip_saved(&path, &events, &repaint);
+                                    // After the popup, so a long clip doesn't hold it up. One pass over
+                                    // the sound serves both centering and the check, at background
+                                    // priority (CPU and disk) so a game in front keeps its frames.
+                                    unsafe {
+                                        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+                                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+                                    }
+                                    let energy = media::channel_energy(&path).inspect_err(|e| log::write(&format!("Couldn't read a clip's sound: {e:#} ({})", path.display()))).ok();
+                                    if let Some(e) = &energy {
+                                        center_clip(&path, e);
+                                    }
+                                    if let Some(problem) = check_clip(&path, TRACKS.load(Ordering::Relaxed) as usize, energy.as_deref()) {
+                                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                        toast::show("Check this clip", format!("{name}: {problem}"));
+                                        let _ = events.send(Event::Status(format!("Check this clip: {problem} ({})", path.display())));
+                                        log::write(&format!("Saved clip problem: {problem} ({})", path.display()));
+                                        repaint();
+                                    }
                                 });
                             }
                             Some(_) => {}
@@ -664,25 +737,25 @@ mod tests {
         assert!(!f(100, 29).encoder_struggling());
     }
 
-    /// A short save on a copy of a real clip: cut in place to about its last 30 s.
+    /// Real clips pass the saved-clip check (read only); an empty file and a missing one don't.
     #[test]
-    fn short_save_cuts_in_place() {
+    fn saved_clip_check() {
+        let dir = std::env::temp_dir().join("rv-check-clip");
+        let _ = std::fs::create_dir_all(&dir);
+        let empty = dir.join("empty.mp4");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(super::check_clip(&empty, 1, None).is_some());
+        assert!(super::check_clip(&dir.join("gone.mp4"), 1, None).is_some());
+        let junk = dir.join("junk.mp4");
+        std::fs::write(&junk, b"not a video").unwrap();
+        assert!(super::check_clip(&junk, 1, None).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
         let folder = crate::config::Config::load().folder;
-        let Some(src) = crate::clips::list(&folder, 20).into_iter().map(|c| c.path).find(|p| !p.to_string_lossy().contains("(trim")) else { return };
-        let len = crate::media::duration(&src).unwrap();
-        if len < 45.0 {
-            return;
+        for c in crate::clips::list(&folder, 5) {
+            let energy = crate::media::channel_energy(&c.path).ok();
+            let got = super::check_clip(&c.path, 1, energy.as_deref());
+            assert!(got.is_none() || got.as_deref().is_some_and(|p| p.contains("no sound")), "{}: {got:?}", c.path.display());
+            println!("{}: {got:?}", c.path.display());
         }
-        // A 40 s copy to work on, so the real clip is never touched.
-        let copy = std::env::temp_dir().join("instant-replay-short-test.mp4");
-        let _ = std::fs::remove_file(&copy);
-        crate::media::trim(&src, &copy, len - 40.0, len).unwrap();
-        assert_eq!(super::shorten(&copy, 30).as_deref(), Some("last 0:30"));
-        let got = crate::media::duration(&copy).unwrap();
-        assert!((29.5..=32.5).contains(&got), "cut clip is {got} s");
-        assert!(!copy.with_extension("cutting.mp4").exists());
-        // Already short enough: left alone.
-        assert_eq!(super::shorten(&copy, 60), None);
-        let _ = std::fs::remove_file(&copy);
     }
 }

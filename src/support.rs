@@ -99,7 +99,7 @@ mod tests {
         let secrets = [cfg.recorder_password.as_str(), cfg.discord_webhook.as_str(), "hook-token-secret"];
         let raw = std::fs::read(&out).unwrap();
         for s in secrets {
-            assert!(!raw.windows(s.len()).any(|w| w == s.as_bytes()), "the zip has {s}");
+            assert!(!raw.windows(s.len()).any(|w| w == s.as_bytes()), "the zip has a secret in it");
         }
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&raw)).unwrap();
         let mut names = Vec::new();
@@ -108,8 +108,9 @@ mod tests {
             let name = f.name().unwrap().to_string();
             let mut text = String::new();
             f.read_to_string(&mut text).unwrap();
-            for s in secrets {
-                assert!(!text.contains(s), "{name} has {s}");
+            // The message names the file, never the secret (a failed test shouldn't print it).
+            for (i, s) in secrets.iter().enumerate() {
+                assert!(!text.contains(s), "{name} has secret #{i}");
             }
             if name == "app.log" {
                 assert!(text.contains("Uploaded ~\\Videos\\a.mp4 to (link removed) ok") && text.contains("from ~/Videos"), "{text}");

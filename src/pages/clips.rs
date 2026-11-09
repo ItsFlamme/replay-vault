@@ -1035,7 +1035,16 @@ impl App {
             };
             match tex {
                 Some(Some(tex)) => {
-                    egui::Image::new(&tex).corner_radius(rounding).paint_at(ui, rect);
+                    // A clip that isn't 16:9 (ultrawide, 4:3, tall) keeps its shape, with black bars.
+                    let size = tex.size_vec2();
+                    let fit = size.x / size.y / (rect.width() / rect.height());
+                    if size.min_elem() > 0.0 && (fit - 1.0).abs() > 0.02 {
+                        ui.painter().rect_filled(rect, rounding, Color32::BLACK);
+                        let picture = egui::Rect::from_center_size(rect.center(), size * (rect.width() / size.x).min(rect.height() / size.y));
+                        egui::Image::new(&tex).paint_at(ui, picture);
+                    } else {
+                        egui::Image::new(&tex).corner_radius(rounding).paint_at(ui, rect);
+                    }
                 }
                 other => {
                     ui.painter().rect_filled(rect, rounding, pal().raised);

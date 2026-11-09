@@ -6,8 +6,6 @@ use crate::*;
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Target {
     Save,
-    Save30,
-    Save60,
     Overlay,
     Record,
     Screenshot,
@@ -16,15 +14,12 @@ pub(crate) enum Target {
 }
 
 impl Target {
-    pub(crate) const ALL: [Target; 8] =
-        [Target::Save, Target::Save30, Target::Save60, Target::Overlay, Target::Record, Target::Screenshot, Target::Replay, Target::Mic];
+    pub(crate) const ALL: [Target; 6] = [Target::Save, Target::Overlay, Target::Record, Target::Screenshot, Target::Replay, Target::Mic];
 
     /// The app's own RegisterHotKey id; None for the save key, which belongs to OBS.
     pub(crate) fn action(self) -> Option<hotkey::Action> {
         Some(match self {
             Target::Save => return None,
-            Target::Save30 => hotkey::Action::Save30,
-            Target::Save60 => hotkey::Action::Save60,
             Target::Overlay => hotkey::Action::Overlay,
             Target::Record => hotkey::Action::Record,
             Target::Screenshot => hotkey::Action::Screenshot,
@@ -35,9 +30,7 @@ impl Target {
 
     pub(crate) fn name(self) -> &'static str {
         match self {
-            Target::Save => "Save key",
-            Target::Save30 => "Save the last 0:30",
-            Target::Save60 => "Save the last 1:00",
+            Target::Save => "Save clip",
             Target::Overlay => "Show / hide this window",
             Target::Record => "Start / stop recording",
             Target::Screenshot => "Screenshot",
@@ -56,17 +49,18 @@ pub(crate) enum Holder {
     Unknown,
 }
 
-/// What a clash means, in a sentence or two. `works`: the key still reaches this app (the save
-/// key always does, since OBS listens for it itself), so both react; otherwise the other
-/// program has it and here it does nothing.
-pub(crate) fn clash_text(key: &str, holder: &Holder, works: bool) -> String {
+/// What a clash means, in a sentence or two. The key still reaches this app (the save key
+/// through OBS, which listens for it itself, the others read from the key state), so both react.
+pub(crate) fn clash_text(key: &str, holder: &Holder) -> String {
     let (who, fix) = match holder {
-        Holder::Nvidia(s) => (format!("NVIDIA's \"{s}\" shortcut"), "Pick another key, or change it in NVIDIA's overlay (Settings > Keyboard shortcuts)."),
-        Holder::Amd => ("AMD Software".to_string(), "Pick another key, or change it in AMD Software > Settings > Hotkeys."),
+        Holder::Nvidia(s) => (
+            format!("NVIDIA's \"{s}\" shortcut"),
+            "If you don't use it there, that's fine. Otherwise pick another key, or change it in NVIDIA's overlay (Settings > Keyboard shortcuts).",
+        ),
+        Holder::Amd => ("AMD Software".to_string(), "If you don't use it there, that's fine. Otherwise pick another key, or change it in AMD Software > Settings > Hotkeys."),
         Holder::Unknown => ("Another program (or Windows)".to_string(), "Pick another key, or change it in the program that uses it."),
     };
-    let what = if works { format!("{who} also uses {key}, so pressing it does both.") } else { format!("{who} already has {key}, so here it does nothing until that changes.") };
-    format!("{what} {fix}")
+    format!("{who} also uses {key}, so pressing it does both. {fix}")
 }
 
 /// How often the Keybinds page looks again for keys other programs took.
@@ -82,8 +76,6 @@ impl App {
     pub(crate) fn hotkey_of(&mut self, target: Target) -> &mut String {
         match target {
             Target::Save => &mut self.cfg.hotkey,
-            Target::Save30 => &mut self.cfg.hotkey_30,
-            Target::Save60 => &mut self.cfg.hotkey_60,
             Target::Overlay => &mut self.cfg.overlay_hotkey,
             Target::Record => &mut self.cfg.hotkey_record,
             Target::Screenshot => &mut self.cfg.hotkey_screenshot,
@@ -118,10 +110,26 @@ impl App {
             if !changed && !self.hotkey_failed.contains(&target) {
                 continue;
             }
-            // Another app (NVIDIA, Discord, ...) may hold the combo already. The key stays set,
-            // `check_conflicts` says who has it, and it's tried again until it's free.
-            if hotkey::set_combo(action, combo).is_err() {
-                failed.push(target);
+            // Another app (NVIDIA, Discord, ...) may hold the combo already. Then the key is shared
+            // (it still works here, and there too), `check_conflicts` says who has it, and it's
+            // tried again until it's free to be this app's alone.
+            match hotkey::set_combo(action, combo) {
+                Ok(hotkey::Held::Ours) => {
+                    if combo.is_some() && (changed || self.hotkey_failed.contains(&target)) {
+                        crate::log::write(&format!("Key {text} for {}: registered, this app's own.", target.name()));
+                    }
+                }
+                Ok(hotkey::Held::Shared) => {
+                    if changed {
+                        crate::log::write(&format!("Key {text} for {}: another program holds it, shared (read from the key state).", target.name()));
+                    }
+                    failed.push(target)
+                }
+                Err(e) => {
+                    crate::log::write(&format!("Key {text} for {}: {e}", target.name()));
+                    errors.push(e);
+                    failed.push(target);
+                }
             }
         }
         self.hotkey_failed = failed;
@@ -152,7 +160,7 @@ impl App {
                 (true, None) => Holder::Unknown,
                 (false, _) => continue,
             };
-            found.push((target, clash_text(key, &holder, target == Target::Save || !held)));
+            found.push((target, clash_text(key, &holder)));
         }
         self.conflicts = found;
         self.conflicts_keys = keys;
@@ -198,7 +206,7 @@ impl App {
         let error = if target == Target::Save && c.obs_binding().is_none() {
             Some(format!("OBS can't use {c} as a key. Pick another."))
         } else if taken == Some(Target::Save) {
-            Some(format!("{name} is the save key. Give the save key another key first."))
+            Some(format!("{name} is the Save clip key. Give Save clip another key first."))
         } else {
             if let Some(other) = taken {
                 self.hotkey_of(other).clear();
@@ -263,7 +271,7 @@ impl App {
         let width = Target::ALL.into_iter().filter_map(|t| Some(keycaps(&measure, egui::Pos2::ZERO, Some(self.hotkey_of(t).as_str()).filter(|k| !k.is_empty())?) + 24.0)).fold(150.0, f32::max);
         card(ui, "Keys", |ui| {
             form(ui, "keybinds", |ui| {
-                ui.label("Save key");
+                ui.label(Target::Save.name());
                 self.hotkey_button(ui, Target::Save, &format!("Saves the last {}. Click, then press the keys. OBS listens for it; takes effect after Save.", mmss(self.cfg.buffer_secs)), width);
                 ui.end_row();
 
@@ -272,8 +280,6 @@ impl App {
                 ui.end_row();
 
                 let optional = [
-                    (Target::Save30, "Saves a clip of only the last 0:30."),
-                    (Target::Save60, "Saves a clip of only the last 1:00."),
                     (Target::Record, "Starts a full recording; press again to stop. Recordings go in the Recordings folder."),
                     (Target::Screenshot, "Saves a picture of the screen next to your clips."),
                     (Target::Replay, "Turns instant replay on or off."),
@@ -296,92 +302,98 @@ impl App {
             self.check_conflicts();
             self.conflict_notes(ui, None);
             ui.add_space(4.0);
-            note(ui, format!("The save key keeps the last {}, even in a game. Click a key, then press the combination you want; Esc cancels.", mmss(self.cfg.buffer_secs)));
+            note(ui, format!("Save clip keeps the last {}, even in a game. Click a key, then press the combination you want; Esc cancels.", mmss(self.cfg.buffer_secs)));
             note(ui, "Use Ctrl, Alt, Shift or Win with a letter or number; F-keys, Pause, Insert, Home, End, Page Up/Down, Print Screen and Scroll Lock also work on their own.");
         });
-        if crate::OVERLAY_SWITCHES {
-            self.nvidia_card(ui);
-            self.amd_card(ui);
-        }
+        self.overlay_card(ui);
     }
 
-    /// AMD Software's Instant Replay records alongside this app, and its hotkeys may be ours too.
-    /// Shown when one of those clashes, or while this app has them switched off (untested).
-    pub(crate) fn amd_card(&mut self, ui: &mut egui::Ui) {
-        let Some(amd) = self.amd.get_or_insert_with(amd::detect).clone() else { return };
-        let ours: Vec<(&str, hotkey::Combo)> = Target::ALL.into_iter().filter_map(|t| Some((t.name(), hotkey::Combo::parse(self.hotkey_of(t))?))).collect();
-        let clashes = amd.clashes(&ours);
-        let ours_off = self.cfg.amd_off || self.saved.amd_off;
-        if !amd.replay_on && clashes.is_empty() && !ours_off {
+    /// One switch for the graphics card's own recorder: NVIDIA's overlay (its Instant Replay and
+    /// keys like Alt+F10, Alt+R) and AMD Software's Instant Replay and hotkeys (untested), for
+    /// whichever of them this PC has. Shown when either is found, or while this app has one off.
+    pub(crate) fn overlay_card(&mut self, ui: &mut egui::Ui) {
+        let (on, running) = *self.nvidia.get_or_insert_with(|| (tweaks::nvidia_overlay_on(), tweaks::nvidia_overlay_running()));
+        let amd = self.amd.get_or_insert_with(amd::detect).clone();
+        let has_nvidia = on || running || self.cfg.nvidia_off || self.saved.nvidia_off;
+        let has_amd = amd.is_some() || self.cfg.amd_off || self.saved.amd_off;
+        if !has_nvidia && !has_amd {
             return;
         }
-        card(ui, "AMD Software", |ui| {
+        let ours: Vec<(&str, hotkey::Combo)> = Target::ALL.into_iter().filter_map(|t| Some((t.name(), hotkey::Combo::parse(self.hotkey_of(t))?))).collect();
+        let clashes = amd.as_ref().map_or_else(Vec::new, |a| a.clashes(&ours));
+        let amd_replay = amd.as_ref().is_some_and(|a| a.replay_on);
+        let mut off = (has_nvidia && self.cfg.nvidia_off) || (has_amd && self.cfg.amd_off);
+        let label = match (has_nvidia, has_amd) {
+            (true, true) => "Turn off NVIDIA's and AMD's overlays (AMD untested)",
+            (true, false) => "Turn off NVIDIA's overlay",
+            _ => "Turn off AMD's overlay (untested)",
+        };
+        card(ui, "Graphics card overlay", |ui| {
             let step = |ui: &mut egui::Ui, text: String| {
-                ui.label(RichText::new(format!("•  {text}")).color(pal().text)).on_hover_text("Change it in AMD Software yourself, or tick the box above.");
+                ui.label(RichText::new(format!("•  {text}")).color(pal().text)).on_hover_text("Change it there yourself, or tick the box above.");
             };
-            if amd.replay_on && !self.cfg.amd_off {
-                ui.label(RichText::new("AMD Software's Instant Replay is on. It records in the background too, using the same video encoder.").small().color(pal().amber))
-                    .on_hover_text("Two recorders on one GPU can drop frames in clips and cost FPS in games.");
-            }
-            if !self.cfg.amd_off {
+            if !off {
+                if on {
+                    ui.label(RichText::new("NVIDIA's overlay is on. Its Instant Replay records alongside ours, and its keys (Alt+F10, Alt+R and more) work in both apps.").small().color(pal().amber));
+                }
+                if amd_replay {
+                    ui.label(RichText::new("AMD Software's Instant Replay is on. It records in the background too, using the same video encoder.").small().color(pal().amber))
+                        .on_hover_text("Two recorders on one GPU can drop frames in clips and cost FPS in games.");
+                }
                 for (combo, name) in &clashes {
                     ui.label(RichText::new(format!("AMD Software also uses {combo}, set here for \"{name}\", so both apps would react to it.")).small().color(pal().amber))
                         .on_hover_text("Pick another key here, or change AMD's.");
                 }
             }
-            ui.checkbox(&mut self.cfg.amd_off, "Turn off AMD's Instant Replay and hotkeys (untested)").on_hover_text(
-                "Sets the values AMD Software keeps for its Instant Replay and Use Hotkeys switches. Not tried on a PC with AMD Software yet, so check AMD Software afterwards. Unticking it, or Remove, puts your own settings back.",
-            );
-            if self.saved.amd_off {
+            let mut hover = Vec::new();
+            if has_nvidia {
+                hover.push("NVIDIA: the same switch as in the NVIDIA app. Its Instant Replay stops recording alongside ours.");
+            }
+            if has_amd {
+                hover.push("AMD: sets the values AMD Software keeps for its Instant Replay and Use Hotkeys switches. Not tried on a PC with AMD Software yet, so check AMD Software afterwards.");
+            }
+            hover.push("Unticking it, or Remove, puts your own settings back.");
+            if ui.checkbox(&mut off, label).on_hover_text(hover.join("\n")).changed() {
+                if has_nvidia {
+                    self.cfg.nvidia_off = off;
+                }
+                if has_amd {
+                    self.cfg.amd_off = off;
+                }
+            }
+            if has_nvidia {
+                if self.saved.nvidia_off && !on && running {
+                    ui.label(RichText::new("Switched off, but NVIDIA's overlay is still running. Restart the PC to finish.").small().color(pal().muted));
+                } else if !on && !running {
+                    status(ui, true, RichText::new("NVIDIA's overlay is off").small(), accent_light(), 12.0);
+                }
+            }
+            if has_amd && self.saved.amd_off {
                 note(ui, "AMD Software reads this when it starts: restart the PC, then check that Record & Stream > Instant Replay and Hotkeys > Use Hotkeys are off. If they aren't, switch them off there and tell us.");
             }
-            if !self.cfg.amd_off {
-                note(ui, "Or switch them off yourself:");
-                if amd.replay_on {
+            if !off {
+                note(ui, "Or switch it off yourself:");
+                if has_nvidia {
+                    step(ui, "NVIDIA app > Settings > Features > NVIDIA Overlay > Off".into());
+                }
+                if amd_replay {
                     step(ui, "AMD Software > Settings > Record & Stream: turn off Instant Replay".into());
                 }
                 for (combo, _) in &clashes {
                     step(ui, format!("AMD Software > Settings > Hotkeys: change or turn off {combo}"));
                 }
             }
-            ui.add_space(2.0);
-            if button(ui, "Check again").on_hover_text("Looks again at AMD Software's settings").clicked() {
-                self.amd = None;
-            }
-        });
-    }
-
-    /// NVIDIA's overlay has its own Instant Replay and Save key (Alt+F10), so both apps would react.
-    /// Shown when it's on, or when this app turned it off.
-    pub(crate) fn nvidia_card(&mut self, ui: &mut egui::Ui) {
-        let (on, running) = *self.nvidia.get_or_insert_with(|| (tweaks::nvidia_overlay_on(), tweaks::nvidia_overlay_running()));
-        if !on && !running && !self.cfg.nvidia_off && !self.saved.nvidia_off {
-            return;
-        }
-        card(ui, "NVIDIA overlay", |ui| {
-            if on && !self.cfg.nvidia_off {
-                ui.label(RichText::new("NVIDIA's overlay is on. Its Instant Replay records alongside ours, and its Save key (Alt+F10 unless you changed it) would save in both apps.").small().color(pal().amber));
-            }
-            ui.checkbox(&mut self.cfg.nvidia_off, "Turn off NVIDIA's overlay and Instant Replay")
-                .on_hover_text("The same switch as in the NVIDIA app. Unticking it, or Remove, puts your own setting back.");
-            if self.saved.nvidia_off && !on && running {
-                ui.label(RichText::new("Switched off, but NVIDIA's overlay is still running. Restart the PC to finish.").small().color(pal().muted));
-            } else if !on && !running {
-                status(ui, true, RichText::new("NVIDIA's overlay is off").small(), accent_light(), 12.0);
-            }
-            if !self.cfg.nvidia_off {
-                note(ui, "Or switch it off yourself: NVIDIA app > Settings > Features > NVIDIA Overlay > Off.");
-            }
             ui.horizontal(|ui| {
-                if !self.cfg.nvidia_off
+                if has_nvidia
+                    && !off
                     && let Some(exe) = nvidia_app()
                     && button(ui, "Open NVIDIA app").on_hover_text("Opens the NVIDIA app, to change its overlay yourself").clicked()
                     && let Err(e) = std::process::Command::new(&exe).spawn()
                 {
                     self.status = format!("Couldn't open the NVIDIA app: {e}");
                 }
-                if button(ui, "Check again").on_hover_text("Looks again whether NVIDIA's overlay is on").clicked() {
-                    self.nvidia = None;
+                if button(ui, "Check again").on_hover_text("Looks again for NVIDIA's overlay and AMD Software").clicked() {
+                    (self.nvidia, self.amd) = (None, None);
                 }
             });
         });

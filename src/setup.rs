@@ -16,7 +16,7 @@ impl App {
     pub(crate) fn setup_clips_card(&mut self, ui: &mut egui::Ui) {
         card(ui, "Your clips", |ui| {
             form(ui, "setup_clips", |ui| {
-                ui.label("Save key");
+                ui.label("Save clip");
                 self.hotkey_button(ui, Target::Save, "Click, then press the keys you want. Works even in a game.", 0.0);
                 ui.end_row();
 

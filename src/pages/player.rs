@@ -447,7 +447,7 @@ impl App {
                 p.step(on);
             }
         }
-        let (mut close, mut begin_trim) = (false, false);
+        let (mut close, mut begin_trim, mut drag_at, mut copy_error) = (false, false, None, None);
         let trimming = self.trim.is_some();
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         ui.horizontal(|ui| {
@@ -463,14 +463,36 @@ impl App {
                 if cap(ui, true, icon_button(icon::FOLDER, "Show in folder")).on_hover_text("Opens its folder with the file picked").clicked() {
                     clips::open(&path, true);
                 }
+                // The clip's card isn't on screen here, so this is what drags it out.
+                let id = egui::Id::NULL.with("player copied");
+                let copied = ui.ctx().data(|d| d.get_temp::<std::time::Instant>(id)).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
+                let out = cap(ui, true, icon_button(icon::SHARE, if copied { "Copied" } else { "Drag out" }).sense(egui::Sense::click_and_drag()))
+                    .on_hover_text("Drag this into Discord, a browser or a folder to share or copy the clip. Click to copy it, then paste.");
+                if out.drag_started() {
+                    drag_at = Some(out.interact_pointer_pos().unwrap_or(out.rect.center()));
+                } else if out.clicked() {
+                    match clips::copy_file(&path) {
+                        Ok(()) => {
+                            ui.ctx().data_mut(|d| d.insert_temp(id, std::time::Instant::now()));
+                            ui.ctx().request_repaint_after(std::time::Duration::from_secs(2));
+                        }
+                        Err(e) => copy_error = Some(format!("Couldn't copy it: {e:#}")),
+                    }
+                }
             });
         });
         ui.add_space(12.0);
         // The video gets what the controls under it leave.
         let reserve = if trimming { 330.0 } else { 90.0 };
+        // Shaped like the clip itself (ultrawide, 4:3, tall), not always 16:9, and centered.
+        let aspect = match p.video_size() {
+            (vw, vh) if vw > 0 && vh > 0 => vw as f32 / vh as f32,
+            _ => 16.0 / 9.0,
+        };
         let w = ui.available_width();
-        let h = (w * 9.0 / 16.0).min(ui.available_height() - reserve).max(160.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+        let h = (w / aspect).min(ui.available_height() - reserve).max(160.0);
+        let (row, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+        let rect = egui::Rect::from_center_size(row.center(), egui::vec2((h * aspect).min(w), h));
         ui.painter().rect_filled(rect, R_CARD, Color32::BLACK);
         let ppp = ui.ctx().pixels_per_point();
         p.set_rect((rect.left() * ppp) as i32, (rect.top() * ppp) as i32, (rect.width() * ppp) as i32, (rect.height() * ppp) as i32);
@@ -503,6 +525,16 @@ impl App {
         if trimming {
             ui.add_space(8.0);
             egui::ScrollArea::vertical().id_salt("trim").auto_shrink(false).show(ui, |ui| self.trim_panel(ui));
+        }
+        if let Some(at) = drag_at {
+            if let Err(e) = crate::drag_out::start(std::slice::from_ref(&path)) {
+                self.clips_msg = Some(format!("Couldn't drag it out: {e:#}"));
+            }
+            // Windows took the button's release; egui still thinks it's down until it's told.
+            self.drag_out_ended = Some(at);
+        }
+        if copy_error.is_some() {
+            self.clips_msg = copy_error;
         }
         if begin_trim {
             self.begin_trim(&path);

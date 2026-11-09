@@ -23,8 +23,6 @@ pub struct Config {
     /// Shows or hides the overlay.
     pub overlay_hotkey: String,
     /// Save only the last 30 seconds / 1 minute; empty means not set.
-    pub hotkey_30: String,
-    pub hotkey_60: String,
     /// Start/stop a full recording, take a screenshot, turn instant replay on/off, mute the mic.
     pub hotkey_record: String,
     pub hotkey_screenshot: String,
@@ -152,15 +150,15 @@ pub struct AppSel {
 
 impl Default for Config {
     fn default() -> Self {
-        // Clips need sound out of the box: default playback device on track 1.
+        // Clips need sound out of the box: the default playback device and Windows' default mic,
+        // both on track 1.
         let mut devices = BTreeMap::new();
-        devices.insert(
-            "out:default".to_string(),
-            DeviceSel { name: "Default playback device".into(), tracks: [true, false, false, false, false, false] },
-        );
+        for (key, name) in [("out:default", "Default playback device"), ("in:default", "Default microphone")] {
+            devices.insert(key.to_string(), DeviceSel { name: name.into(), tracks: [true, false, false, false, false, false] });
+        }
         Self {
             folder: dirs::video_dir().unwrap_or_default().join("Replay Vault Clips").display().to_string(),
-            buffer_secs: 60,
+            buffer_secs: 180,
             track_count: 1,
             track_names: Default::default(),
             chat_tracks: [false; 6],
@@ -170,8 +168,6 @@ impl Default for Config {
             // overlay off, so ours couldn't be registered.
             hotkey: "Alt+F10".into(),
             overlay_hotkey: "Alt+X".into(),
-            hotkey_30: String::new(),
-            hotkey_60: String::new(),
             hotkey_record: "Alt+F11".into(),
             hotkey_screenshot: "Alt+F12".into(),
             hotkey_replay: "Alt+Shift+F11".into(),
@@ -295,8 +291,6 @@ impl Config {
         }
         for k in [
             &mut self.overlay_hotkey,
-            &mut self.hotkey_30,
-            &mut self.hotkey_60,
             &mut self.hotkey_record,
             &mut self.hotkey_screenshot,
             &mut self.hotkey_replay,
@@ -383,8 +377,6 @@ pub const FIELDS: &[(&str, Option<Page>, bool, Kind)] = {
         ("chat_tracks", Some(Audio), true, Setting),
         ("hotkey", Some(Keybinds), true, Setting),
         ("overlay_hotkey", Some(Keybinds), false, Setting),
-        ("hotkey_30", Some(Keybinds), false, Setting),
-        ("hotkey_60", Some(Keybinds), false, Setting),
         ("hotkey_record", Some(Keybinds), false, Setting),
         ("hotkey_screenshot", Some(Keybinds), false, Setting),
         ("hotkey_replay", Some(Keybinds), false, Setting),
@@ -653,7 +645,7 @@ mod tests {
         assert_eq!((c.track_count, c.buffer_secs, c.quality, c.name_style, c.encoder_effort), (6, 1200, 3, 1, 2));
         assert_eq!((c.fps, c.out_height, c.keep_days), (240, 0, 3650));
         assert_eq!((c.codec.as_str(), c.capture.as_str(), c.noise.as_str(), c.theme.as_str()), ("h264", "desktop", "off", "minimalist"));
-        assert_eq!((c.hotkey.as_str(), c.hotkey_30.as_str(), c.overlay_hotkey.as_str()), ("Alt+F10", "", "Alt+Z"));
+        assert_eq!((c.hotkey.as_str(), c.overlay_hotkey.as_str()), ("Alt+F10", "Alt+Z"));
         assert_eq!(c.track_names[0].chars().count(), 24);
         assert_eq!((c.folder.as_str(), c.archive_folder.as_str(), c.track_names[1].as_str()), (r"D:\Clips[Hotkeys]ReplayBuffer=x", r"E:\Old", "Mic"));
         let zero: Config = serde_json::from_str(r#"{"track_count": 0, "buffer_secs": 0, "out_height": 2}"#).unwrap();
@@ -683,9 +675,9 @@ mod tests {
         Export::new(&cfg, &favs, &tags).write(&file).unwrap();
 
         let raw = fs::read_to_string(&file).unwrap();
-        for secret in ["pw-secret-1", "hook-secret-3"] {
-            assert!(!raw.contains(secret), "{secret} was exported");
-        }
+        // The message never prints the secret itself.
+        assert!(!raw.contains("pw-secret-1"), "the recorder password was exported");
+        assert!(!raw.contains("hook-secret-3"), "the Discord webhook was exported");
         let back = Export::read(&file).unwrap();
         assert!(back.favorites == favs && back.tags == tags);
 

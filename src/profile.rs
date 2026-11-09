@@ -9,24 +9,37 @@ pub struct Hardware {
     pub gpu_name: String,
     pub vram_mb: u64,
     pub ram_mb: u64,
+    /// Built into the processor, sharing the PC's RAM (most laptops without a gaming GPU).
+    pub integrated: bool,
 }
 
 pub fn detect() -> Hardware {
     let gpu = recorder::gpu();
     // The encoding GPU; with two of the same make, the one with more memory.
     let adapter = recorder::adapters().into_iter().filter(|a| a.vendor == gpu.vendor()).max_by_key(|a| a.vram_mb);
+    // Little graphics memory of its own means built in. AMD's built-in graphics report the RAM set
+    // aside for them, so for AMD it's asked of Direct3D 12 (a device made just for that, which
+    // costs a moment at start, so only when needed).
+    let integrated = adapter.as_ref().is_some_and(|a| {
+        let small = a.vram_mb < 2048;
+        if gpu == recorder::Gpu::Amd { recorder::shares_ram(a.index).unwrap_or(small) } else { small }
+    });
     Hardware {
         gpu,
         gpu_name: adapter.as_ref().map_or("No supported GPU".into(), |a| a.name.clone()),
         vram_mb: adapter.map_or(0, |a| a.vram_mb),
         ram_mb: ram_mb(),
+        integrated,
     }
 }
 
-fn ram_mb() -> u64 {
+pub(crate) fn ram_mb() -> u64 {
     use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    let mut m = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
-    if unsafe { GlobalMemoryStatusEx(&mut m) }.is_ok() { m.ullTotalPhys / (1024 * 1024) } else { 8 * 1024 }
+    static RAM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RAM.get_or_init(|| {
+        let mut m = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        if unsafe { GlobalMemoryStatusEx(&mut m) }.is_ok() { m.ullTotalPhys / (1024 * 1024) } else { 8 * 1024 }
+    })
 }
 
 impl Hardware {
@@ -38,7 +51,7 @@ impl Hardware {
     fn tier(&self) -> &'static str {
         match (self.gpu, self.vram_mb) {
             (Gpu::None, _) => "CPU only",
-            (_, v) if v < 2048 => "Integrated GPU",
+            _ if self.integrated => "Integrated GPU",
             (_, v) if v < 6144 => "Entry GPU",
             _ => "Gaming GPU",
         }
@@ -54,7 +67,9 @@ pub const PRESETS: [&str; 3] = ["Light", "Balanced", "High"];
 fn preset_values(hw: &Hardware, mon: &Monitor, level: usize) -> (u32, u32, u8) {
     let (max_h, fps, quality) = match hw.tier() {
         "CPU only" => (720, 30, 2),
-        "Integrated GPU" => (1080, 60, 2),
+        // The game and the recorder share one small chip: 30 fps halves what capture and the
+        // encoder take from it (720p at 30 is what Medal suggests for weak PCs; Light gives that).
+        "Integrated GPU" => (1080, 30, 2),
         "Entry GPU" => (1080, 60, 1),
         _ if hw.vram_mb >= 12 * 1024 => (2160, 60, 1),
         _ => (1440, 60, 1),
@@ -83,9 +98,9 @@ pub fn apply(cfg: &mut Config, hw: &Hardware, mon: &Monitor) -> String {
     set_preset(cfg, hw, mon, PRESETS.len() - 1);
     // H.264 plays everywhere: Discord, phones, editors.
     cfg.codec = "h264".into();
-    // Longest clip whose replay buffer fits in an eighth of the RAM.
+    // 3:00 clips, or the longest shorter one whose replay fits in an eighth of the RAM.
     let budget = hw.ram_mb / 8;
-    for secs in [300, 180, 120, 60, 30] {
+    for secs in [180, 120, 60, 30] {
         cfg.buffer_secs = secs;
         if recorder::plan(cfg, mon).mb <= budget {
             break;
@@ -120,7 +135,33 @@ mod tests {
     }
 
     fn hw(gpu: Gpu, vram_gb: u64, ram_gb: u64) -> Hardware {
-        Hardware { gpu, gpu_name: String::new(), vram_mb: vram_gb * 1024, ram_mb: ram_gb * 1024 }
+        Hardware { gpu, gpu_name: String::new(), vram_mb: vram_gb * 1024, ram_mb: ram_gb * 1024, integrated: gpu != Gpu::None && vram_gb < 2 }
+    }
+
+    /// On this PC, read only: each adapter and whether Direct3D 12 says it shares RAM, and the
+    /// tier picked. Run by hand with `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_adapters() {
+        for a in recorder::adapters() {
+            println!("{} (vendor {:04X}, {} MB): shares RAM {:?}", a.name, a.vendor, a.vram_mb, recorder::shares_ram(a.index));
+        }
+        let h = detect();
+        println!("picked: {}, tier {}", h.summary(), h.tier());
+    }
+
+    /// Built-in graphics get 30 fps, whatever graphics memory they report: an AMD laptop chip
+    /// with 2 GB of RAM set aside isn't a gaming GPU.
+    #[test]
+    fn built_in_graphics_stay_light() {
+        let mut c = Config::default();
+        let amd_laptop = Hardware { integrated: true, ..hw(Gpu::Amd, 2, 16) };
+        apply(&mut c, &amd_laptop, &mon(1920, 1080));
+        assert_eq!((c.out_height, c.fps, c.quality), (0, 30, 2), "native 1080p at 30 fps");
+        apply(&mut c, &hw(Gpu::Amd, 2, 16), &mon(1920, 1080));
+        assert_eq!(c.fps, 60, "the same memory on a real graphics card is an entry GPU");
+        apply(&mut c, &Hardware { integrated: true, ..hw(Gpu::Intel, 0, 8) }, &mon(2560, 1440));
+        assert_eq!((c.out_height, c.fps), (1080, 30));
     }
 
     #[test]
@@ -130,11 +171,11 @@ mod tests {
         assert_eq!((c.out_height, c.fps, c.quality), (720, 30, 2));
 
         apply(&mut c, &hw(Gpu::Intel, 0, 16), &mon(1920, 1080));
-        assert_eq!((c.out_height, c.fps), (0, 60)); // native 1080p
+        assert_eq!((c.out_height, c.fps), (0, 30)); // native 1080p, at 30 fps on built-in graphics
 
         apply(&mut c, &hw(Gpu::Nvidia, 8, 32), &mon(3840, 2160));
         assert_eq!(c.out_height, 1440);
-        assert_eq!(c.buffer_secs, 300);
+        assert_eq!(c.buffer_secs, 180);
 
         apply(&mut c, &hw(Gpu::Amd, 16, 32), &mon(3840, 2160));
         assert_eq!(c.out_height, 0); // native 4K
@@ -164,6 +205,6 @@ mod tests {
         let m = mon(2560, 1440);
         apply(&mut c, &hw(Gpu::Nvidia, 8, 4), &m);
         assert!(recorder::plan(&c, &m).mb <= 512 || c.buffer_secs == 30);
-        assert!(c.buffer_secs < 300);
+        assert!(c.buffer_secs < 180);
     }
 }

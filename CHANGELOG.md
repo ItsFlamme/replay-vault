@@ -2,6 +2,46 @@
 
 Notable changes in each release. The app's What's new page is built from this file.
 
+## 0.2.0
+
+### New
+
+- The tray menu has Count last window as a game: for a game in a window that isn't full screen, so Pause instant replay when no game is open keeps recording while you play it.
+- After an update, the app opens on What's new once, so you can see what changed.
+- A key another program has taken shows in the sidebar (Key clash), wherever you are in the app. Click it for Keybinds, which says who has it.
+- The app reopens maximized if you left it maximized.
+- Drag out in the player and while trimming: drag it into Discord, a browser or a folder, or click it to copy the clip.
+- If instant replay stops by itself (the recorder closed or OBS turned it off), the app tells you and turns it back on, up to 3 tries, then says why if it can't. A clip that didn't save says so too.
+- Every saved clip is checked: if the file is empty, can't be opened, is missing sound tracks or has no sound at all, a popup says so.
+- A key NVIDIA's overlay holds can still be a Replay Vault key: both apps react to it.
+- Keybinds has a Graphics card overlay switch: turn off NVIDIA's overlay (so its own Instant Replay doesn't save a second clip on Alt+F10), or AMD Software's Instant Replay and hotkeys (untested). NVIDIA's overlay comes back on whenever the app closes; Remove from this PC puts both back.
+- General's settings are split into tabs: Clips, Storage, Appearance, Startup, Sharing and Backup.
+
+### Changed
+
+- Laptops and PCs with graphics built into the processor get lighter recommended settings: 30 fps instead of 60, since the game and the recorder share one small chip. Built-in AMD graphics are now recognized as built in (they used to count as a gaming card). Only setup's recommendation and the quality choices change; settings you already have stay.
+- The replay never takes more than a quarter of the PC's RAM. A long replay at high quality that needs more keeps its newest part, and the Video page says how much of it fits. The replay length choices under General stop at the longest that fits on your PC at your video settings.
+- The grey explanations under settings show only while Show tips and explanations is on (General, Appearance).
+- Show in folder keeps the app open behind File Explorer instead of closing it.
+- New installs record your Windows default microphone on track 1 along with game and PC sound. Settings you already have stay.
+- Clips have even sound on both sides, whatever your own balance is. If a saved clip comes out louder on one side all the way through (a balance setting in Windows or another app), its quiet side is raised to match, so it plays centered for whoever you share it with. It stays stereo. Mics are recorded in mono, since a voice is one channel and some audio interfaces put it on the left only.
+- Clip length choices are 1:00, 2:00, 3:00 and 5:00 (Custom still goes from 0:10 to 20:00). New installs start at 3:00. Your current length stays.
+- The save key is called Save clip on Keybinds and in setup.
+- Clips recorded at a shape other than 16:9 (ultrawide, 4:3, tall) play and trim in a player shaped like the clip, and their thumbnails keep their shape instead of being stretched.
+- The recorder's copy of OBS takes about 80 MB less disk: its debug files, which OBS never loads, are left out.
+- The popup for a new version waits until the PC has had a minute without keyboard or mouse input, so it can't open over a game in a window or while you're typing.
+- Lighter on low-end PCs: checking and centering a saved clip's sound runs at background priority (one pass over the sound instead of up to three), and the start-up check for built-in graphics only runs where it's needed.
+
+### Removed
+
+- The Save the last 0:30 and Save the last 1:00 keys. Save clip and a shorter clip length do the same job.
+
+### Fixed
+
+- Starting with Windows could crash the app, or stop instant replay, when it opened within a minute of the PC turning on.
+- A key pressed while you set a new key on Keybinds no longer also does what it's set to.
+- Updated the app's libraries to their latest fixes.
+
 ## 0.1.3
 
 ### New

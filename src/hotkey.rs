@@ -1,7 +1,12 @@
 //! Hotkeys without a keyboard hook. The save-clip hotkey lives inside the hidden OBS (see
-//! `Combo::obs_binding`), so this app never watches the keyboard for it. The overlay hotkey uses
-//! Windows' standard RegisterHotKey. Setting a combo by pressing it reads the key state only while
-//! the user is doing that in our own window. The save-the-last-30-s / 1-min keys use RegisterHotKey too.
+//! `Combo::obs_binding`), so this app never watches the keyboard for it. The app's other keys use
+//! Windows' standard RegisterHotKey. A key another program already registered (NVIDIA's overlay
+//! keeps Alt+F1, Alt+F9, Alt+R and more even when their features aren't used) is read from the
+//! key state instead, every 15 ms, the way OBS reads its own keys; both programs react to it. Not
+//! a hook, and nothing touches the game. (Raw Input was tried first: on Vlad's PC Windows sent it
+//! nothing for NVIDIA's keys.) The polling only runs while such a shared key exists.
+//! Setting a combo by pressing it reads the key state only while the user is doing that in our
+//! own window.
 
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -14,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     UnregisterHotKey,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WM_APP, WM_HOTKEY,
+    GetMessageW, KillTimer, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetTimer, WM_APP, WM_HOTKEY, WM_TIMER,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -27,14 +32,12 @@ pub struct Combo {
 }
 
 type Callback = Box<dyn Fn() + Send>;
-type Reply = Sender<Result<(), String>>;
+type Reply = Sender<Result<Held, String>>;
 
 /// The app's own hotkeys (the full save key belongs to OBS).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Overlay = 1,
-    Save30 = 2,
-    Save60 = 3,
     Record = 4,
     Screenshot = 5,
     Replay = 6,
@@ -42,8 +45,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 7] =
-        [Action::Overlay, Action::Save30, Action::Save60, Action::Record, Action::Screenshot, Action::Replay, Action::Mic];
+    pub const ALL: [Action; 5] = [Action::Overlay, Action::Record, Action::Screenshot, Action::Replay, Action::Mic];
 
     fn from_id(id: usize) -> Option<Action> {
         Action::ALL.into_iter().find(|a| *a as usize == id)
@@ -59,33 +61,68 @@ struct Capture {
     active: bool,
     result: Option<Combo>,
     on_done: Option<Callback>,
+    /// When the last capture ended: the key that ended it is likely still down.
+    ended: Option<std::time::Instant>,
 }
 
-static CAPTURE: Mutex<Capture> = Mutex::new(Capture { active: false, result: None, on_done: None });
+static CAPTURE: Mutex<Capture> = Mutex::new(Capture { active: false, result: None, on_done: None, ended: None });
+
+/// While a key is being set, and just after: a press then is the new key, not a command.
+fn setting_key() -> bool {
+    let c = CAPTURE.lock().unwrap();
+    c.active || c.ended.is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+}
+
+/// How a key was set: registered by this app alone, or shared with the program that holds it
+/// (read from the key state; that program reacts to it too).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Held {
+    Ours,
+    Shared,
+}
 
 /// Starts the thread that owns the app's hotkeys and calls `on_press` when one fires.
 pub fn install(on_press: impl Fn(Action) + Send + 'static) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut msg = MSG::default();
+        let mut shared = Shared::default();
         unsafe {
             // Creates this thread's message queue before anyone posts to it.
             let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
             let _ = tx.send(GetCurrentThreadId());
             while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                 if msg.message == WM_HOTKEY {
-                    if let Some(a) = Action::from_id(msg.wParam.0) {
+                    if let Some(a) = Action::from_id(msg.wParam.0)
+                        && !setting_key() {
+                        crate::log::write(&format!("Key pressed: {a:?}."));
+                        on_press(a);
+                    }
+                } else if msg.message == WM_TIMER && msg.hwnd.is_invalid() && msg.wParam.0 == shared.timer {
+                    // Polled even while a key is being set, so a key held then doesn't count later.
+                    let pressed = shared.poll();
+                    for a in pressed.into_iter().filter(|_| !setting_key()) {
+                        crate::log::write(&format!("Key pressed: {a:?} (shared key)."));
                         on_press(a);
                     }
                 } else if msg.message == WM_APP
                     && let Some((action, combo, reply)) = REQUEST.lock().unwrap().take() {
                     let id = action as i32;
                     let _ = UnregisterHotKey(None, id);
+                    shared.keys.retain(|(a, _)| *a != action);
                     let result = match combo {
-                        None => Ok(()),
-                        Some(c) => RegisterHotKey(None, id, c.modifiers() | MOD_NOREPEAT, c.vk as u32)
-                            .map_err(|_| format!("{c} is already used by another app. Pick another.")),
+                        None => Ok(Held::Ours),
+                        Some(c) if RegisterHotKey(None, id, c.modifiers() | MOD_NOREPEAT, c.vk as u32).is_ok() => Ok(Held::Ours),
+                        Some(c) => {
+                            shared.keys.push((action, c));
+                            // Still held from setting it (or anything else): that press doesn't count.
+                            if down(c.vk) && !shared.down.contains(&c.vk) {
+                                shared.down.push(c.vk);
+                            }
+                            Ok(Held::Shared)
+                        }
                     };
+                    let result = result.and_then(|h| shared.listen().map(|()| h));
                     let _ = reply.send(result);
                 }
             }
@@ -96,8 +133,69 @@ pub fn install(on_press: impl Fn(Action) + Send + 'static) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Registers one of the app's hotkeys (or none). Fails if another app already owns the combo.
-pub fn set_combo(action: Action, combo: Option<Combo>) -> Result<(), String> {
+/// The keys another program registered first, read from the key state on a timer of the hotkey
+/// thread, and which of their keys are down right now (to fire once per press, not on repeat).
+#[derive(Default)]
+struct Shared {
+    keys: Vec<(Action, Combo)>,
+    /// The thread timer's id, 0 while there's no shared key.
+    timer: usize,
+    down: Vec<u16>,
+}
+
+/// How often shared keys are read. A real key press lasts 50 ms or more.
+const POLL_MS: u32 = 15;
+
+impl Shared {
+    /// Runs the timer while there's a shared key, and stops it when there's none.
+    fn listen(&mut self) -> Result<(), String> {
+        let want = !self.keys.is_empty();
+        if want && self.timer == 0 {
+            self.timer = unsafe { SetTimer(None, 0, POLL_MS, None) };
+            if self.timer == 0 {
+                return Err("Couldn't start reading keys other programs also use.".into());
+            }
+        } else if !want && self.timer != 0 {
+            let _ = unsafe { KillTimer(None, self.timer) };
+            self.timer = 0;
+            self.down.clear();
+        }
+        Ok(())
+    }
+
+    /// The shared keys pressed since the last look (fresh presses only).
+    fn poll(&mut self) -> Vec<Action> {
+        let mods = (down(0x11), down(0x12), down(0x10), down(0x5B) || down(0x5C));
+        let mut vks: Vec<u16> = self.keys.iter().map(|(_, c)| c.vk).collect();
+        vks.sort_unstable();
+        vks.dedup();
+        vks.into_iter()
+            .filter_map(|vk| {
+                let now = down(vk);
+                (now != self.down.contains(&vk)).then(|| on_key(&mut self.down, &self.keys, vk, !now, mods)).flatten()
+            })
+            .collect()
+    }
+}
+
+/// One key going down or up: the action whose combo it completes on a fresh press. `mods` is
+/// Ctrl, Alt, Shift, Win as they are now.
+fn on_key(down: &mut Vec<u16>, keys: &[(Action, Combo)], vk: u16, up: bool, mods: (bool, bool, bool, bool)) -> Option<Action> {
+    if up {
+        down.retain(|&k| k != vk);
+        return None;
+    }
+    if down.contains(&vk) {
+        return None;
+    }
+    down.push(vk);
+    let (ctrl, alt, shift, win) = mods;
+    keys.iter().find(|(_, c)| c.vk == vk && c.ctrl == ctrl && c.alt == alt && c.shift == shift && c.win == win).map(|(a, _)| *a)
+}
+
+/// Sets one of the app's hotkeys (or none): registered if it's free, otherwise shared with the
+/// program that has it. Fails only if the listener isn't working.
+pub fn set_combo(action: Action, combo: Option<Combo>) -> Result<Held, String> {
     let id = *THREAD_ID.get().ok_or("The hotkey listener isn't running.")?;
     let (tx, rx) = mpsc::channel();
     *REQUEST.lock().unwrap() = Some((action, combo, tx));
@@ -176,6 +274,7 @@ fn poll_capture(held: &[u16]) {
         let combo = Combo { vk, ctrl: down(0x11), alt: down(0x12), shift: down(0x10), win: down(0x5B) || down(0x5C) };
         if vk == VK_ESCAPE || combo.has_modifier() || allowed_bare(vk) {
             c.active = false;
+            c.ended = Some(std::time::Instant::now());
             c.result = (vk != VK_ESCAPE).then_some(combo);
             if let Some(f) = &c.on_done {
                 f();
@@ -315,6 +414,41 @@ mod tests {
         done_tx.send(()).unwrap();
         other.join().unwrap();
         assert!(!super::held_elsewhere(c), "free again");
+    }
+
+    /// By hand on a PC with NVIDIA's overlay: shares Alt+R (NVIDIA's performance overlay) and
+    /// Alt+F1 (its screenshot) and prints each press heard here for 30 s. Run with
+    /// `cargo test --release live_shared_keys -- --ignored --nocapture` and press them.
+    #[test]
+    #[ignore]
+    fn live_shared_keys() {
+        use super::{Action, Held, install, set_combo};
+        install(|a| println!("heard {a:?}")).unwrap();
+        for (a, k) in [(Action::Record, "Alt+R"), (Action::Screenshot, "Alt+F1")] {
+            let held = set_combo(a, Combo::parse(k)).unwrap();
+            println!("{k}: {}", if held == Held::Shared { "shared with the program that holds it" } else { "free, this app's alone" });
+        }
+        println!("Press Alt+R and Alt+F1 now (30 s)...");
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    /// A shared key fires once when it's pressed with exactly its modifiers, not while it repeats,
+    /// and again after it's let go.
+    #[test]
+    fn shared_key_fires_once_per_press() {
+        use super::{Action, on_key};
+        let alt_f9 = Combo { vk: 0x78, ctrl: false, alt: true, shift: false, win: false };
+        let keys = [(Action::Record, alt_f9)];
+        let alt = (false, true, false, false);
+        let mut down = Vec::new();
+        assert_eq!(on_key(&mut down, &keys, 0x78, false, (false, false, false, false)), None, "F9 alone");
+        assert_eq!(on_key(&mut down, &keys, 0x78, true, alt), None);
+        assert_eq!(on_key(&mut down, &keys, 0x78, false, alt), Some(Action::Record));
+        assert_eq!(on_key(&mut down, &keys, 0x78, false, alt), None, "held down, repeating");
+        assert_eq!(on_key(&mut down, &keys, 0x78, true, alt), None);
+        assert_eq!(on_key(&mut down, &keys, 0x78, false, (true, true, false, false)), None, "Ctrl+Alt+F9 is another key");
+        on_key(&mut down, &keys, 0x78, true, alt);
+        assert_eq!(on_key(&mut down, &keys, 0x78, false, alt), Some(Action::Record), "pressed again");
     }
 
     #[test]

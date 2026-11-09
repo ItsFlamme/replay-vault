@@ -292,6 +292,173 @@ pub fn trim_mixed(src: &Path, dst: &Path, start: f64, end: f64, gains: &[f32]) -
     remix(src, dst, start, end, gains, None, &|_| {})
 }
 
+/// How a lopsided sound track gets back to the middle, keeping it stereo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Center {
+    /// Multiply left and right by these, so both sides are about as loud.
+    Gains(f32, f32),
+    /// One side is (nearly) silent: it gets a copy of the other. true = left is the one with sound.
+    Copy(bool),
+}
+
+/// From the total energy of a track's left and right channels over a clip: None when it's
+/// already about even (within 4 dB; a game's own panning evens out over a clip), otherwise how
+/// to even it. The quiet side is raised (at most 20 dB), never the loud side lowered, so the clip
+/// keeps its loudness; a side more than 20 dB down has nothing worth raising and is replaced.
+pub(crate) fn centering(left: f64, right: f64) -> Option<Center> {
+    let (loud, quiet) = (left.max(right), left.min(right));
+    if loud <= 1e-6 || quiet * 10f64.powf(0.4) >= loud {
+        return None;
+    }
+    if quiet * 100.0 < loud {
+        return Some(Center::Copy(left > right));
+    }
+    let g = (loud / quiet).sqrt() as f32;
+    Some(if left > right { Center::Gains(1.0, g) } else { Center::Gains(g, 1.0) })
+}
+
+/// Total energy of the left and right channels of each sound track, in track order. One pass
+/// over the sound, shared by centering and the saved-clip check.
+pub fn channel_energy(path: &Path) -> anyhow::Result<Vec<(f64, f64)>> {
+    let r = reader(path, false)?;
+    let audio = audio_streams(&r);
+    let mut out = vec![(0.0, 0.0); audio.len()];
+    let mut done = vec![false; audio.len()];
+    unsafe {
+        r.SetStreamSelection(ALL_STREAMS, false)?;
+        for &s in &audio {
+            r.SetStreamSelection(s, true)?;
+            decode_to_float(&r, s)?;
+        }
+        while done.contains(&false) {
+            let (mut idx, mut flags, mut sample) = (0u32, 0u32, None);
+            r.ReadSample(ANY_STREAM, 0, Some(&mut idx), Some(&mut flags), None, Some(&mut sample))?;
+            let Some(t) = audio.iter().position(|&a| a == idx) else { continue };
+            if done[t] {
+                continue;
+            }
+            if let Some(s) = sample {
+                for [l, r] in floats(&s)?.as_chunks::<2>().0 {
+                    out[t].0 += (*l as f64).powi(2);
+                    out[t].1 += (*r as f64).powi(2);
+                }
+            }
+            if flags & END_OF_STREAM != 0 {
+                done[t] = true;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Writes `src` to `dst` with every sound track that's louder on one side brought back to the
+/// middle (see centering), from its `energy` (channel_energy); other tracks and the video are
+/// copied as they are. Returns false, writing nothing, when every track is already even.
+pub fn center(src: &Path, dst: &Path, energy: &[(f64, f64)]) -> anyhow::Result<bool> {
+    let fixes: Vec<Option<Center>> = energy.iter().map(|&(l, r)| centering(l, r)).collect();
+    if fixes.iter().all(Option::is_none) {
+        return Ok(false);
+    }
+    rewrite(src, dst, &fixes)?;
+    Ok(true)
+}
+
+/// Copies `src` to `dst`, with each sound track whose `fixes` entry is Some changed as it says
+/// (re-encoded); the video and the other tracks are copied as they are.
+fn rewrite(src: &Path, dst: &Path, fixes: &[Option<Center>]) -> anyhow::Result<()> {
+    let r = reader(src, false)?;
+    let audio = audio_streams(&r);
+    unsafe {
+        let w = sink_writer(dst, false)?;
+        // Video first, then the sound tracks in track order, as trim writes them.
+        let mut types = Vec::new();
+        while let Ok(t) = r.GetNativeMediaType(types.len() as u32, 0) {
+            types.push(t);
+        }
+        let order: Vec<usize> = (0..types.len()).filter(|i| !audio.contains(&(*i as u32))).chain(audio.iter().map(|&i| i as usize)).collect();
+        let mut out = vec![0u32; types.len()];
+        let mut fix = vec![None; types.len()];
+        let mut video = None;
+        for i in order {
+            r.SetStreamSelection(i as u32, true)?;
+            fix[i] = audio.iter().position(|&a| a as usize == i).and_then(|t| fixes[t]);
+            if fix[i].is_some() {
+                decode_to_float(&r, i as u32)?;
+                out[i] = w.AddStream(&audio_type(true)?)?;
+                w.SetInputMediaType(out[i], &audio_type(false)?, None)?;
+            } else {
+                r.SetCurrentMediaType(i as u32, None, &types[i])?;
+                out[i] = w.AddStream(&types[i])?;
+                w.SetInputMediaType(out[i], &types[i], None)?;
+                if video.is_none() && types[i].GetGUID(&MF_MT_MAJOR_TYPE)? == MFMediaType_Video {
+                    video = Some(i);
+                }
+            }
+        }
+        let video = video.ok_or_else(|| anyhow::anyhow!("the clip has no video"))?;
+        w.BeginWriting()?;
+        // As in trim: the clip starts at its first video frame, and times shift by its decode time.
+        let mut start: Option<(i64, i64)> = None; // (first video frame's time, base)
+        let mut held: Vec<(usize, i64, IMFSample)> = Vec::new();
+        let mut done = vec![false; types.len()];
+        let put = |s: usize, ts: i64, base: i64, sample: &IMFSample| -> anyhow::Result<()> {
+            match fix[s] {
+                None => {
+                    rebase(sample, ts, base)?;
+                    Ok(w.WriteSample(out[s], sample)?)
+                }
+                Some(how) => {
+                    let mut pcm = floats(sample)?;
+                    for [l, r] in pcm.as_chunks_mut::<2>().0 {
+                        (*l, *r) = match how {
+                            // Only a raised side goes through the limiter; a side at 1.0 stays as it was.
+                            Center::Gains(gl, gr) => {
+                                let side = |x: f32, g: f32| if g > 1.0 { limit(x * g) } else { x * g };
+                                (side(*l, gl), side(*r, gr))
+                            }
+                            Center::Copy(true) => (*l, *l),
+                            Center::Copy(false) => (*r, *r),
+                        };
+                    }
+                    let at = ((ts - base).max(0) as f64 * RATE as f64 / SEC).round() as u64;
+                    write_pcm(&w, out[s], at, &pcm)
+                }
+            }
+        };
+        while done.iter().any(|d| !d) {
+            let (mut idx, mut flags, mut ts, mut sample) = (0u32, 0u32, 0i64, None);
+            r.ReadSample(ANY_STREAM, 0, Some(&mut idx), Some(&mut flags), Some(&mut ts), Some(&mut sample))?;
+            let s = idx as usize;
+            if s >= types.len() {
+                continue;
+            }
+            if let Some(sample) = sample {
+                match start {
+                    Some((first, b)) if ts >= first => put(s, ts, b, &sample)?,
+                    Some(_) => {}
+                    None if s == video => {
+                        let b = timeline_start(&sample, ts);
+                        start = Some((ts, b));
+                        for (hs, hts, hsample) in held.drain(..) {
+                            if hts >= ts {
+                                put(hs, hts, b, &hsample)?;
+                            }
+                        }
+                        put(s, ts, b, &sample)?;
+                    }
+                    None => held.push((s, ts, sample)),
+                }
+            }
+            if flags & END_OF_STREAM != 0 {
+                done[s] = true;
+            }
+        }
+        anyhow::ensure!(start.is_some(), "the clip has no video frames");
+        w.Finalize()?;
+    }
+    Ok(())
+}
+
 /// trim_mixed, or with `enc` the video re-encoded to H.264 as it says. `progress` hears how far
 /// along it is (0 to 1) as video frames are encoded.
 fn remix(src: &Path, dst: &Path, start: f64, end: f64, gains: &[f32], enc: Option<&Encode>, progress: &dyn Fn(f32)) -> anyhow::Result<()> {
@@ -1265,6 +1432,39 @@ impl AudioSource {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Even enough tracks are left alone; a lopsided one has its quiet side raised (never the loud
+    /// side lowered); a dead side gets a copy of the other.
+    #[test]
+    fn centering_rules() {
+        assert_eq!(centering(0.0, 0.0), None);
+        assert_eq!(centering(100.0, 50.0), None); // 3 dB: a game's own panning
+        assert_eq!(centering(100.0, 25.0), Some(Center::Gains(1.0, 2.0))); // 6 dB down on the right
+        assert_eq!(centering(4.0, 100.0), Some(Center::Gains(5.0, 1.0)));
+        assert_eq!(centering(100.0, 0.5), Some(Center::Copy(true))); // right is silent
+        assert_eq!(centering(0.0, 100.0), Some(Center::Copy(false)));
+    }
+
+    /// A clip whose right side is down to a quarter (-12 dB) comes back even (raised, not made
+    /// mono), keeping its length and sound tracks; an even clip isn't rewritten.
+    #[test]
+    fn center_evens_a_lopsided_clip() {
+        let dir = std::env::temp_dir();
+        let (even, lopsided, fixed) = (dir.join("rv-center-even.mp4"), dir.join("rv-center-lopsided.mp4"), dir.join("rv-center-fixed.mp4"));
+        synth_clip(&even, 3, [40, 90, 160]);
+        assert!(!center(&even, &fixed, &channel_energy(&even).unwrap()).unwrap());
+        rewrite(&even, &lopsided, &[Some(Center::Gains(1.0, 0.25))]).unwrap();
+        let (l, r) = channel_energy(&lopsided).unwrap()[0];
+        assert!(matches!(centering(l, r), Some(Center::Gains(g, _)) if g == 1.0), "{l} vs {r}");
+        assert!(center(&lopsided, &fixed, &channel_energy(&lopsided).unwrap()).unwrap());
+        let (l, r) = channel_energy(&fixed).unwrap()[0];
+        assert!(centering(l, r).is_none() && (l / r - 1.0).abs() < 0.1, "{l} vs {r}");
+        assert_eq!(audio_tracks(&fixed).unwrap(), 1);
+        assert!((duration(&fixed).unwrap() - duration(&even).unwrap()).abs() < 0.2);
+        for f in [&even, &lopsided, &fixed] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
 
     /// A made-up clip (no real clip read): `secs` of a colored scene with a moving bar, H.264
     /// 640x360 30 fps and one quiet AAC track.

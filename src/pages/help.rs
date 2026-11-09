@@ -133,7 +133,10 @@ impl App {
             } else {
                 "Live, while this page is open. CPU is a share of all cores. The video encoder is a separate chip on the GPU that games don't use. The recorder's memory is mostly the last few minutes it keeps for the next clip."
             };
-            ui.label(RichText::new(note).small().color(pal().muted));
+            // The explanation is a tip; "isn't running" is a status and always shows.
+            if rec.is_none() || tips_on() {
+                ui.label(RichText::new(note).small().color(pal().muted));
+            }
         });
 
         let report = self.health_report();

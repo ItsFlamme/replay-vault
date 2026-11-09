@@ -111,8 +111,27 @@ impl Gpu {
 pub struct Adapter {
     pub vendor: u32,
     pub name: String,
-    /// Dedicated video memory; integrated GPUs report little or none.
+    /// Dedicated video memory; integrated GPUs report little or none, except AMD's, which report
+    /// the slice of RAM set aside for them (often 1 to 4 GB).
     pub vram_mb: u64,
+    /// Its place in Windows' list, for `shares_ram`.
+    pub index: u32,
+}
+
+/// Whether adapter `index` is built into the processor and shares the PC's RAM (Direct3D 12's
+/// "UMA" answer), which graphics memory alone can't tell for AMD's. None if Direct3D 12 can't say.
+pub fn shares_ram(index: u32) -> Option<bool> {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_DATA_ARCHITECTURE, D3D12CreateDevice, ID3D12Device};
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    unsafe {
+        let adapter = CreateDXGIFactory1::<IDXGIFactory1>().ok()?.EnumAdapters1(index).ok()?;
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
+        let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE::default();
+        device?.CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, (&mut arch as *mut D3D12_FEATURE_DATA_ARCHITECTURE).cast(), size_of::<D3D12_FEATURE_DATA_ARCHITECTURE>() as u32).ok()?;
+        Some(arch.UMA.as_bool())
+    }
 }
 
 /// Hardware graphics adapters (software renderers left out).
@@ -129,6 +148,7 @@ pub fn adapters() -> Vec<Adapter> {
                 vendor: desc.VendorId,
                 name: String::from_utf16_lossy(&desc.Description[..end]).trim().to_string(),
                 vram_mb: desc.DedicatedVideoMemory as u64 / (1024 * 1024),
+                index: i,
             });
         }
         i += 1;
@@ -172,6 +192,14 @@ pub struct Plan {
     pub kbps: u64,
     /// Replay buffer size cap in MB; OBS holds the buffer in RAM.
     pub mb: u64,
+    /// When the chosen clip length needs more than a quarter of the PC's RAM: the seconds that
+    /// fit in `mb` instead (OBS drops the oldest part of the replay past its size cap).
+    pub fits_secs: Option<u32>,
+}
+
+/// The most of the PC's RAM the replay buffer may take: a quarter, leaving the rest to the game.
+pub fn buffer_cap_mb() -> u64 {
+    (crate::profile::ram_mb() / 4).max(512)
 }
 
 pub fn plan(cfg: &Config, mon: &Monitor) -> Plan {
@@ -190,8 +218,18 @@ pub fn plan(cfg: &Config, mon: &Monitor) -> Plan {
     let base = out_w as f64 * out_h as f64 * fps as f64 / 6_000.0;
     let kbps = ((base * quality * codec) as u64).clamp(8_000, 150_000);
     // Video + each audio track (192 kbps) for the whole clip, with headroom for VBR peaks.
-    let mb = (kbps + 192 * cfg.track_count.clamp(1, 6) as u64) * cfg.buffer_secs as u64 / 8 / 1000 * 5 / 4 + 64;
-    Plan { base_w, base_h, out_w, out_h, fps, kbps, mb }
+    let per_sec = kbps + 192 * cfg.track_count.clamp(1, 6) as u64;
+    let need = per_sec * cfg.buffer_secs as u64 / 8 / 1000 * 5 / 4 + 64;
+    let cap = buffer_cap_mb();
+    let fits_secs = (need > cap).then(|| ((cap - 64) * 4 / 5 * 1000 * 8 / per_sec) as u32);
+    Plan { base_w, base_h, out_w, out_h, fps, kbps, mb: need.min(cap), fits_secs }
+}
+
+/// The longest replay (10 s to 20 min) that fits under `buffer_cap_mb` at these settings, rounded
+/// down to 10 s.
+pub fn max_secs(cfg: &Config, mon: &Monitor) -> u32 {
+    let longest = Config { buffer_secs: 1200, ..cfg.clone() };
+    plan(&longest, mon).fits_secs.map_or(1200, |s| (s / 10 * 10).clamp(10, 1200))
 }
 
 /// OBS's RecTracks: one bit per recorded audio track, tracks 1 to `count` (1 to 6).
@@ -265,7 +303,7 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
     });
     fs::write(root.join(r"plugin_config\obs-websocket\config.json"), ws.to_string())?;
 
-    let Plan { base_w, base_h, out_w, out_h, fps, kbps, mb } = plan(cfg, mon);
+    let Plan { base_w, base_h, out_w, out_h, fps, kbps, mb, .. } = plan(cfg, mon);
     // Encoder IDs and setting names are OBS's own (obs-nvenc, obs-ffmpeg's AMF, obs-qsv11).
     let max = kbps * 3 / 2;
     let enc_profile = if cfg.codec == "h264" { "high" } else { "main" };
@@ -387,9 +425,14 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
             None => continue,
         };
         let name = unique(&items, dev.name.clone());
+        // Mics get OBS's "Downmix to mono" (flag 2, OBS_SOURCE_FLAG_FORCE_MONO): a voice is one
+        // channel, and audio interfaces often put it on the left only. Playback stays stereo; a
+        // clip that comes out louder on one side is evened after saving (obs::center_clip).
+        let mono = kind == "wasapi_input_capture";
         let mut source = json!({
             "name": name, "id": kind, "versioned_id": kind, "mixers": mixers,
             "settings": { "device_id": id },
+            "flags": if mono { 2 } else { 0 },
         });
         if kind == "wasapi_input_capture" && cfg.noise != "off" {
             source["filters"] = json!([{
@@ -568,6 +611,72 @@ pub fn lighter_effort(effort: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::config::{AppSel, DeviceSel};
+    use std::time::Duration;
+
+    /// A trimmed OBS (`obs_install::prune`) really records: a copy of OBS at `RV_OBS_COPY` (its
+    /// obs-studio folder, a throwaway copy) is trimmed, started on port 4477 with this app's settings, saves a clip
+    /// from the replay buffer, and its log shows no module that failed to load. Runs beside the
+    /// user's own recorder without touching it. By hand:
+    /// `$env:RV_OBS_COPY='...'; cargo test --release live_pruned_obs -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_pruned_obs() {
+        let copy = PathBuf::from(std::env::var("RV_OBS_COPY").expect("RV_OBS_COPY"));
+        obs_install::prune(&copy);
+        assert!(!copy.join(r"bin\64bit\obs64.pdb").exists() && copy.join(r"core\obs-browser").exists());
+        let clips = std::env::temp_dir().join("replay-vault-pruned-obs-clips");
+        let _ = fs::remove_dir_all(&clips);
+        let cfg = Config { folder: clips.to_string_lossy().into(), recorder_password: "pruned-test".into(), buffer_secs: 20, ..Config::default() };
+        let root = copy.join(r"config\obs-studio");
+        let _ = fs::remove_dir_all(root.join("logs"));
+        let mon = chosen_monitor(&cfg).expect("a monitor");
+        println!("{}", write_files(&cfg, &root, &mon, &copy.join("no-main-obs"), obs_install::last_version_stamp("33.0.1")).unwrap());
+        let ws = root.join(r"plugin_config\obs-websocket\config.json");
+        let mut json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&ws).unwrap()).unwrap();
+        json["server_port"] = serde_json::json!(4477);
+        fs::write(&ws, json.to_string()).unwrap();
+        let bin = copy.join(r"bin\64bit");
+        let mut obs = Command::new(bin.join("obs64.exe"))
+            .args(["--portable", "--multi", "--minimize-to-tray", "--startreplaybuffer", "--disable-updater"])
+            .current_dir(&bin)
+            .spawn()
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let saved = rt.block_on(async {
+            let mut client = None;
+            for _ in 0..40 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Ok(c) = obws::Client::connect("127.0.0.1", 4477, Some("pruned-test")).await {
+                    client = Some(c);
+                    break;
+                }
+            }
+            // Killed below either way, so a failed run leaves no OBS (or its popups) behind.
+            let Some(c) = client else { return Err("the trimmed OBS never answered".to_string()) };
+            for _ in 0..20 {
+                if c.replay_buffer().status().await.unwrap_or(false) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            c.replay_buffer().save().await.map_err(|e| e.to_string())
+        });
+        std::thread::sleep(Duration::from_secs(4));
+        let _ = obs.kill();
+        let _ = obs.wait();
+        saved.expect("replay buffer saved");
+        let clip = fs::read_dir(&clips).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "mp4")).expect("a clip");
+        let size = fs::metadata(&clip).unwrap().len();
+        println!("clip: {} ({} KB)", clip.display(), size / 1024);
+        assert!(size > 100_000);
+        let log = fs::read_dir(root.join("logs")).unwrap().flatten().map(|e| fs::read_to_string(e.path()).unwrap_or_default()).collect::<String>();
+        // A plugin that didn't load (a missing translation or NVIDIA's optional denoiser is fine).
+        let bad: Vec<&str> = log.lines().filter(|l| l.contains("Failed to load core module") || l.contains("plugin_not_loaded") || l.contains("Failed to load module")).collect();
+        println!("log problems: {bad:#?}");
+        assert!(bad.is_empty());
+        fs::remove_dir_all(&clips).unwrap();
+    }
 
     fn test_monitor() -> Monitor {
         Monitor { id: r"\\?\DISPLAY#TEST#1".into(), width: 2560, height: 1440, hz: 144, x: 0, y: 0, primary: true, hdr: None, name: String::new() }
@@ -661,6 +770,16 @@ mod tests {
         assert!(items.iter().any(|i| i["name"] == "VALORANT-Win64-Shipping"));
     }
 
+    /// A new config records the default mic too, in mono; playback stays stereo.
+    #[test]
+    fn default_mic_in_mono() {
+        let mut cfg = Config::default();
+        assert!(cfg.devices["in:default"].tracks[0]);
+        let (_, scene) = written("mono", &mut cfg, &test_monitor());
+        assert_eq!(source(&scene, "wasapi_output_capture")[0]["flags"], 0);
+        assert_eq!(source(&scene, "wasapi_input_capture")[0]["flags"], 2);
+    }
+
     /// RecTracks has one bit per track, 1 to 6, and a hand-edited count can't overflow it.
     #[test]
     fn track_bitmask() {
@@ -695,8 +814,29 @@ mod tests {
         cfg.chat_tracks = [false, false, false, true, false, false];
         let (_, scene) = written("three-nochat", &mut cfg, &test_monitor());
         assert!(source(&scene, "wasapi_process_output_capture").is_empty());
-        let mb = |t: u8| plan(&Config { track_count: t, buffer_secs: 300, ..Config::default() }, &test_monitor()).mb;
-        assert!((7..=10).contains(&(mb(2) - mb(1))), "about 7 MB per track for 5 minutes, with headroom: {}", mb(2) - mb(1));
+        // A minute stays under the RAM cap even on a 4 GB PC.
+        let mb = |t: u8| plan(&Config { track_count: t, buffer_secs: 60, ..Config::default() }, &test_monitor()).mb;
+        assert!((1..=3).contains(&(mb(2) - mb(1))), "about 1.8 MB per track for a minute, with headroom: {}", mb(2) - mb(1));
+        // 20 minutes at about 130 Mbps needs about 24 GB: capped to a quarter of the RAM, and it
+        // says how long fits (OBS keeps the newest part).
+        let big = plan(&Config { buffer_secs: 1200, quality: 0, ..Config::default() }, &test_monitor());
+        if buffer_cap_mb() < 20_000 {
+            let secs = big.fits_secs.expect("capped");
+            assert_eq!(big.mb, buffer_cap_mb());
+            let per_mb = (big.kbps + 192 * Config::default().track_count as u64) as f64 / 8000.0 * 1.25;
+            assert!((secs as f64 * per_mb + 64.0 - big.mb as f64).abs() < 10.0, "{secs} s should fill {} MB", big.mb);
+            // The length slider's top: fits whole, and 10 s more wouldn't.
+            let top = Config { quality: 0, ..Config::default() };
+            let max = max_secs(&top, &test_monitor());
+            assert!(max < 1200 && max.is_multiple_of(10));
+            assert!(plan(&Config { buffer_secs: max, ..top.clone() }, &test_monitor()).fits_secs.is_none());
+            assert!(plan(&Config { buffer_secs: max + 10, ..top.clone() }, &test_monitor()).fits_secs.is_some());
+        }
+        // Light settings (720p30, the 8 Mbps floor) fit the full 20 minutes on 8 GB or more.
+        if buffer_cap_mb() >= 2048 {
+            let light = Config { quality: 3, out_height: 720, fps: 30, ..Config::default() };
+            assert_eq!(max_secs(&light, &test_monitor()), 1200);
+        }
     }
 
     #[test]

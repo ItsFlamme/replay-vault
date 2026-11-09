@@ -7,14 +7,16 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetForegroundWindow, GetWindowRect, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, SW_HIDE, SW_RESTORE,
-    SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    FindWindowW, GetForegroundWindow, GetWindowRect, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_HIDE, SW_RESTORE,
+    SW_SHOWMAXIMIZED, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
 };
 use windows::core::PCWSTR;
 
 static WINDOW: OnceLock<isize> = OnceLock::new();
 /// Centered once on first show; after that it stays wherever the user moved it.
 static PLACED: AtomicBool = AtomicBool::new(false);
+/// It was maximized when the app last ran: maximize it again the first time it's shown.
+static MAXIMIZE: AtomicBool = AtomicBool::new(false);
 /// The window that had focus when the overlay came up (usually the game), to hand focus back to.
 static PREVIOUS: AtomicIsize = AtomicIsize::new(0);
 
@@ -115,7 +117,21 @@ fn bring_up(window: HWND, center: bool) {
             flags |= windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE;
         }
         let _ = SetWindowPos(window, Some(HWND_TOPMOST), x, y, 0, 0, flags);
+        if MAXIMIZE.swap(false, Ordering::Relaxed) {
+            let _ = ShowWindow(window, SW_SHOWMAXIMIZED);
+        }
         let _ = SetForegroundWindow(window);
+    }
+}
+
+/// Keeps the window open but no longer above everything, so a window opened from it (File
+/// Explorer) comes up in front. The next time it's brought up it's on top again.
+pub fn drop_to_normal() {
+    if let Some(window) = hwnd() {
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE};
+            let _ = SetWindowPos(window, Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
 }
 
@@ -143,12 +159,16 @@ pub fn toggle() {
     if is_visible() { close() } else { show() }
 }
 
-/// Where the window was (left, top, right, bottom, in screen pixels) and the page that was open,
-/// kept across starts in window.json. Not a setting: it's never part of Save / Discard.
+/// Where the window was (left, top, right, bottom, in screen pixels), whether it was maximized, the
+/// page that was open and the version that last ran (to open What's new after an update), kept
+/// across starts in window.json. Not a setting: it's never part of Save / Discard.
 #[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
+#[serde(default)]
 pub struct Placement {
     pub rect: Option<[i32; 4]>,
+    pub maximized: bool,
     pub page: String,
+    pub version: String,
 }
 
 fn placement_file() -> std::path::PathBuf {
@@ -159,22 +179,23 @@ pub fn load_placement() -> Placement {
     std::fs::read_to_string(placement_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
-/// Remembers where the window is now (unless it's minimized or hidden) and `page`, writing only
-/// when either changed.
+/// Remembers where the window is now (unless it's minimized or hidden), whether it's maximized,
+/// `page` and this version, writing only when any of them changed.
 pub fn save_placement(page: &str) {
     static LAST: std::sync::Mutex<Option<Placement>> = std::sync::Mutex::new(None);
     let Some(window) = hwnd() else { return };
-    let mut r = RECT::default();
-    let rect = unsafe { (is_visible() && GetWindowRect(window, &mut r).is_ok()).then_some([r.left, r.top, r.right, r.bottom]) };
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    // Minimized or in the tray: keep the place it had before.
-    let rect = rect.or_else(|| last.as_ref().and_then(|p| p.rect)).or_else(|| load_placement().rect);
-    let now = Placement { rect, page: page.into() };
-    if last.as_ref() == Some(&now) {
-        return;
+    let before = last.take().unwrap_or_else(load_placement);
+    let shown = is_visible();
+    let maximized = if shown { unsafe { IsZoomed(window).as_bool() } } else { before.maximized };
+    let mut r = RECT::default();
+    // Minimized, in the tray or maximized: keep the size and place it had before.
+    let rect = unsafe { (shown && !maximized && GetWindowRect(window, &mut r).is_ok()).then_some([r.left, r.top, r.right, r.bottom]) };
+    let now = Placement { rect: rect.or(before.rect), maximized, page: page.into(), version: env!("CARGO_PKG_VERSION").into() };
+    if before != now {
+        let _ = std::fs::create_dir_all(crate::config::dir());
+        let _ = std::fs::write(placement_file(), serde_json::to_string(&now).unwrap_or_default());
     }
-    let _ = std::fs::create_dir_all(crate::config::dir());
-    let _ = std::fs::write(placement_file(), serde_json::to_string(&now).unwrap_or_default());
     *last = Some(now);
 }
 
@@ -183,6 +204,8 @@ pub fn save_placement(page: &str) {
 pub fn restore_placement(p: &Placement) {
     use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
     use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOZORDER};
+    // Maximized when it's first shown (it may start in the tray).
+    MAXIMIZE.store(p.maximized, Ordering::Relaxed);
     let (Some(window), Some([left, top, right, bottom])) = (hwnd(), p.rect) else { return };
     // The title bar's middle has to be on a screen, so the window can be grabbed.
     let grab = RECT { left: (left + right) / 2 - 20, top: top + 4, right: (left + right) / 2 + 20, bottom: top + 24 };
@@ -205,9 +228,12 @@ mod tests {
     fn placement_reads_back() {
         std::fs::write(placement_file(), "not json").unwrap();
         assert_eq!(load_placement(), Placement::default());
-        let p = Placement { rect: Some([100, 80, 1200, 780]), page: "Clips".into() };
+        let p = Placement { rect: Some([100, 80, 1200, 780]), maximized: true, page: "Clips".into(), version: "0.1.3".into() };
         std::fs::write(placement_file(), serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(load_placement(), p);
+        // A file from 0.1.3 (no maximized, no version) still reads.
+        std::fs::write(placement_file(), r#"{"rect":[1,2,300,400],"page":"Video"}"#).unwrap();
+        assert_eq!(load_placement(), Placement { rect: Some([1, 2, 300, 400]), page: "Video".into(), ..Default::default() });
         let _ = std::fs::remove_file(placement_file());
     }
 }
