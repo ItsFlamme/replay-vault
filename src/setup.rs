@@ -30,6 +30,8 @@ impl App {
                 }
                 ui.end_row();
             });
+            self.check_conflicts();
+            self.conflict_notes(ui, Some(Target::Save));
         });
     }
 

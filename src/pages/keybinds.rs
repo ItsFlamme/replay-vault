@@ -47,6 +47,31 @@ impl Target {
     }
 }
 
+/// Who else uses a key, as far as can be told.
+pub(crate) enum Holder {
+    /// One of NVIDIA's overlay shortcuts, by name.
+    Nvidia(&'static str),
+    Amd,
+    /// Something holds it, but not one of the apps whose keys can be read.
+    Unknown,
+}
+
+/// What a clash means, in a sentence or two. `works`: the key still reaches this app (the save
+/// key always does, since OBS listens for it itself), so both react; otherwise the other
+/// program has it and here it does nothing.
+pub(crate) fn clash_text(key: &str, holder: &Holder, works: bool) -> String {
+    let (who, fix) = match holder {
+        Holder::Nvidia(s) => (format!("NVIDIA's \"{s}\" shortcut"), "Pick another key, or change it in NVIDIA's overlay (Settings > Keyboard shortcuts)."),
+        Holder::Amd => ("AMD Software".to_string(), "Pick another key, or change it in AMD Software > Settings > Hotkeys."),
+        Holder::Unknown => ("Another program (or Windows)".to_string(), "Pick another key, or change it in the program that uses it."),
+    };
+    let what = if works { format!("{who} also uses {key}, so pressing it does both.") } else { format!("{who} already has {key}, so here it does nothing until that changes.") };
+    format!("{what} {fix}")
+}
+
+/// How often the Keybinds page looks again for keys other programs took.
+const CONFLICT_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The NVIDIA app's program, if it's installed where NVIDIA puts it.
 pub(crate) fn nvidia_app() -> Option<std::path::PathBuf> {
     let exe = std::path::PathBuf::from(std::env::var_os("ProgramFiles")?).join(r"NVIDIA Corporation\NVIDIA app\CEF\NVIDIA App.exe");
@@ -93,27 +118,52 @@ impl App {
             if !changed && !self.hotkey_failed.contains(&target) {
                 continue;
             }
-            // Another app (NVIDIA, Discord, ...) may hold the combo already.
-            if let Err(e) = hotkey::set_combo(action, combo) {
+            // Another app (NVIDIA, Discord, ...) may hold the combo already. The key stays set,
+            // `check_conflicts` says who has it, and it's tried again until it's free.
+            if hotkey::set_combo(action, combo).is_err() {
                 failed.push(target);
-                let who = combo.map(|c| self.who_holds(c)).unwrap_or_default();
-                errors.push(format!("{}: {e}{who}", target.name()));
             }
         }
         self.hotkey_failed = failed;
         self.hotkey_error = (!errors.is_empty()).then(|| errors.join(" "));
     }
 
-    /// Which app likely holds `c`, said only when that app is there and uses it: NVIDIA (one of its
-    /// shortcuts, which it holds even with its overlay off) or AMD Software (its keys, while on).
-    fn who_holds(&mut self, c: hotkey::Combo) -> String {
-        if let Some(shortcut) = tweaks::nvidia_shortcut_for(c) {
-            return format!(" NVIDIA uses it for its \"{shortcut}\" shortcut: pick another key here, or change that one in NVIDIA's overlay (Settings > Keyboard shortcuts).");
+    /// Looks for keys another program or Windows also uses, every few seconds and whenever the
+    /// keys change, so a clash shows before the key is ever pressed. The app's own keys that
+    /// registered are fine as far as Windows goes; every other key (the save key, which OBS
+    /// listens for, and any that failed) is tried for a moment to see if something holds it.
+    /// NVIDIA's and AMD's shortcuts are named; anything else is "another program".
+    pub(crate) fn check_conflicts(&mut self) {
+        let keys: Vec<String> = Target::ALL.into_iter().map(|t| self.hotkey_of(t).clone()).collect();
+        let fresh = self.conflicts_checked.is_some_and(|t| t.elapsed() < CONFLICT_RECHECK) && self.conflicts_keys == keys;
+        if self.capturing.is_some() || fresh {
+            return;
         }
-        if self.amd.get_or_insert_with(amd::detect).as_ref().is_some_and(|a| !a.clashes(&[("", c)]).is_empty()) {
-            return " AMD Software uses it (AMD Software > Settings > Hotkeys).".into();
+        let amd = self.amd.get_or_insert_with(amd::detect).clone();
+        let mut found = Vec::new();
+        for (target, key) in Target::ALL.into_iter().zip(&keys) {
+            let Some(c) = hotkey::Combo::parse(key) else { continue };
+            let ours = target.action().is_some() && self.registered.is_some() && !self.hotkey_failed.contains(&target);
+            let held = !ours && hotkey::held_elsewhere(c);
+            let on_amd = amd.as_ref().is_some_and(|a| !a.clashes(&[("", c)]).is_empty());
+            let holder = match (held, tweaks::nvidia_shortcut_for(c)) {
+                (true, Some(s)) => Holder::Nvidia(s),
+                _ if on_amd => Holder::Amd,
+                (true, None) => Holder::Unknown,
+                (false, _) => continue,
+            };
+            found.push((target, clash_text(key, &holder, target == Target::Save || !held)));
         }
-        String::new()
+        self.conflicts = found;
+        self.conflicts_keys = keys;
+        self.conflicts_checked = Some(std::time::Instant::now());
+    }
+
+    /// The clashes `check_conflicts` found, for `only` one key or all of them.
+    pub(crate) fn conflict_notes(&self, ui: &mut egui::Ui, only: Option<Target>) {
+        for (target, text) in self.conflicts.iter().filter(|(t, _)| only.is_none_or(|o| o == *t)) {
+            ui.label(RichText::new(format!("{}: {text}", target.name())).small().color(pal().amber));
+        }
     }
 
     pub(crate) fn start_capture(&mut self, target: Target, ctx: &egui::Context) {
@@ -133,20 +183,27 @@ impl App {
             return;
         }
         self.capturing = None;
+        self.capture_ended = Some(std::time::Instant::now());
         let Some(c) = hotkey::take_captured() else {
             self.sync_hotkeys();
             return;
         };
         let name = c.to_string();
-        // One key, one job.
+        // One key, one job: a key set for another action moves here, except the save key's,
+        // which would leave clips with no way to be saved. Keys other programs use are kept
+        // (`check_conflicts` says so).
         let taken = Target::ALL
             .into_iter()
             .find(|&t| t != target && hotkey::Combo::parse(self.hotkey_of(t)) == Some(c));
-        let error = if let Some(other) = taken {
-            Some(format!("{name} is already set for \"{}\". Pick another.", other.name()))
-        } else if target == Target::Save && c.obs_binding().is_none() {
+        let error = if target == Target::Save && c.obs_binding().is_none() {
             Some(format!("OBS can't use {c} as a key. Pick another."))
+        } else if taken == Some(Target::Save) {
+            Some(format!("{name} is the save key. Give the save key another key first."))
         } else {
+            if let Some(other) = taken {
+                self.hotkey_of(other).clear();
+                self.status = format!("{name} moved from \"{}\" to \"{}\".", other.name(), target.name());
+            }
             *self.hotkey_of(target) = name;
             None
         };
@@ -236,6 +293,8 @@ impl App {
             if let Some(err) = &self.hotkey_error {
                 ui.colored_label(pal().red, err);
             }
+            self.check_conflicts();
+            self.conflict_notes(ui, None);
             ui.add_space(4.0);
             note(ui, format!("The save key keeps the last {}, even in a game. Click a key, then press the combination you want; Esc cancels.", mmss(self.cfg.buffer_secs)));
             note(ui, "Use Ctrl, Alt, Shift or Win with a letter or number; F-keys, Pause, Insert, Home, End, Page Up/Down, Print Screen and Scroll Lock also work on their own.");

@@ -189,6 +189,14 @@ struct App {
     applied: String,
     hotkey_error: Option<String>,
     capturing: Option<Target>,
+    /// When a key capture last ended. Esc cancels a capture on the hotkey thread a moment
+    /// before the window sees the same press, which must not then hide the app.
+    capture_ended: Option<std::time::Instant>,
+    /// Keys another program or Windows also uses, with what that means, found by
+    /// `check_conflicts` for the keys in `conflicts_keys`, at `conflicts_checked`.
+    conflicts: Vec<(Target, String)>,
+    conflicts_keys: Vec<String>,
+    conflicts_checked: Option<std::time::Instant>,
     /// Every key as last registered; None until then, and while one is being set.
     registered: Option<Vec<String>>,
     /// Keys another app held when last tried, and when that was: they're tried again every few
@@ -503,6 +511,10 @@ impl App {
             applied: String::new(),
             hotkey_error: None,
             capturing: None,
+            capture_ended: None,
+            conflicts: Vec::new(),
+            conflicts_keys: Vec::new(),
+            conflicts_checked: None,
             registered: None,
             hotkey_failed: Vec::new(),
             hotkeys_tried: std::time::Instant::now(),
@@ -1272,7 +1284,7 @@ fn uninstall_app() -> anyhow::Result<()> {
     if app_update::installed() {
         std::process::Command::new(dir.join("unins000.exe")).args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]).spawn()?;
     } else if !DEV_BUILD {
-        let files: Vec<String> = [exe.clone(), dir.join("LICENSE"), dir.join("NOTICE"), dir.join("THIRD-PARTY-NOTICES.md")]
+        let files: Vec<String> = [exe.clone(), dir.join("LICENSE"), dir.join("NOTICE"), dir.join("THIRD-PARTY-NOTICES.md"), dir.join("README.md"), dir.join("debug.log")]
             .iter()
             .map(|p| format!("\"{}\"", p.display()))
             .collect();
@@ -1471,6 +1483,8 @@ impl eframe::App for App {
         // Esc pressed in a text box just leaves the box (focus is still last frame's here).
         let typing = ui.ctx().text_edit_focused();
         let (close, esc) = ui.input(|i| (i.viewport().close_requested(), i.key_pressed(egui::Key::Escape)));
+        // The Esc that just cancelled a key capture.
+        let esc = esc && !self.capture_ended.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(500));
         let in_setup = self.wizard.is_some();
         if close && !in_setup {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -2545,7 +2559,7 @@ mod tests {
             app
         });
         h.run();
-        let item = "The app has its own icon, the Replay Vault cassette, in the taskbar, Start menu and on the desktop shortcut.";
+        let item = "Pressing Esc while setting a key cancels it without hiding the app.";
         assert!(h.query_by_label(item).is_some());
         h.get_by_label_contains("(this version)").click();
         // Past the closing animation.
@@ -2960,6 +2974,79 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "nothing recycled");
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save key another program holds is found without pressing it, and named "another
+    /// program" since it isn't NVIDIA's or AMD's. Ctrl+Alt+Shift+F22, held by another thread,
+    /// stands in for that program.
+    #[test]
+    fn finds_a_save_key_another_program_holds() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, UnregisterHotKey};
+        let c = hotkey::Combo { vk: 0x85, ctrl: true, alt: true, shift: true, win: false };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || unsafe {
+            RegisterHotKey(None, 0xA2, MOD_CONTROL | MOD_ALT | MOD_SHIFT, 0x85).unwrap();
+            held_tx.send(()).unwrap();
+            let _ = done_rx.recv();
+            let _ = UnregisterHotKey(None, 0xA2);
+        });
+        held_rx.recv().unwrap();
+        let mut h = egui_kittest::Harness::builder().with_max_steps(4).with_accessibility_check(false).build_eframe(|cc| App::preview(cc));
+        h.state_mut().cfg.hotkey = c.to_string();
+        h.state_mut().check_conflicts();
+        let found = h.state().conflicts.iter().find(|(t, _)| *t == Target::Save).map(|(_, s)| s.clone());
+        done_tx.send(()).unwrap();
+        other.join().unwrap();
+        let text = found.expect("the save key's clash");
+        assert!(text.starts_with(&format!("Another program (or Windows) also uses {c}, so pressing it does both.")), "{text}");
+    }
+
+    /// Picking a key another action already has moves it, rather than refusing; the save key's
+    /// own key isn't taken from it.
+    #[test]
+    fn a_picked_key_moves_from_another_action() {
+        let mut h = egui_kittest::Harness::builder().with_max_steps(4).with_accessibility_check(false).build_eframe(|cc| App::preview(cc));
+        let app = h.state_mut();
+        (app.cfg.hotkey, app.cfg.hotkey_screenshot, app.cfg.hotkey_record) = ("Alt+F10".into(), "Alt+F12".into(), String::new());
+        app.capturing = Some(Target::Record);
+        hotkey::fake_capture(hotkey::Combo::parse("Alt+F12").unwrap());
+        app.finish_capture();
+        assert_eq!((app.cfg.hotkey_record.as_str(), app.cfg.hotkey_screenshot.as_str()), ("Alt+F12", ""));
+        assert!(app.status.contains("moved"), "{}", app.status);
+        app.capturing = Some(Target::Record);
+        hotkey::fake_capture(hotkey::Combo::parse("Alt+F10").unwrap());
+        app.finish_capture();
+        assert_eq!((app.cfg.hotkey.as_str(), app.cfg.hotkey_record.as_str()), ("Alt+F10", "Alt+F12"), "the save key keeps its key");
+    }
+
+    /// The Esc that cancels a key capture does nothing else (it used to hide the app): here it
+    /// leaves the picked clips picked, and an Esc pressed later clears them as usual.
+    #[test]
+    fn esc_that_cancels_a_key_capture_is_swallowed() {
+        let dir = std::env::temp_dir().join("instant-replay-esc-capture");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.png"), b"not really a picture").unwrap();
+        let folder = dir.display().to_string();
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
+            let mut app = App::preview(cc);
+            (app.tab, app.view, app.cfg.folder) = (Tab::Clips, ClipsView::All, folder);
+            app.saved.folder = app.cfg.folder.clone();
+            app.picked = vec![dir.join("a.png")];
+            app.capture_ended = Some(std::time::Instant::now());
+            app
+        });
+        h.run_steps(2);
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert_eq!(h.state().picked.len(), 1, "swallowed");
+        h.state_mut().capture_ended = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().picked.is_empty(), "a later Esc works");
+        drop(h);
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("instant-replay-esc-capture"));
     }
 
     /// A renamed clip keeps its place in the montage, the picks, the selection and the export

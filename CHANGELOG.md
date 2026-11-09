@@ -2,6 +2,18 @@
 
 Notable changes in each release. The app's What's new page is built from this file.
 
+## 0.1.2
+
+### Changed
+
+- Keybinds now finds keys another program or Windows already uses, on its own, and says who (NVIDIA's and AMD's shortcuts by name) and what happens when you press it. You can still pick a key that clashes.
+- Picking a key that another action has moves it to the new one instead of refusing. The save key's key stays put.
+
+### Fixed
+
+- Pressing Esc while setting a key cancels it without hiding the app.
+- Remove from this PC also deletes the small debug.log that could keep the app's folder from going away, and a portable copy deletes its README too.
+
 ## 0.1.1
 
 ### Changed

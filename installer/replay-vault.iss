@@ -59,5 +59,10 @@ Filename: "{app}\replay-vault.exe"; Flags: nowait; Check: WizardSilent
 ; be removed. Only this copy: a portable one elsewhere keeps running.
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -Command ""Get-Process replay-vault -ErrorAction SilentlyContinue | Where-Object Path -eq '{app}\replay-vault.exe' | Stop-Process -Force"""; Flags: runhidden; RunOnceId: "StopApp"
 
+[UninstallDelete]
+; Chromium (in OBS's browser, or an overlay injected into the app) leaves a debug.log in the
+; app's folder; without this the folder stays behind with just that file in it.
+Type: files; Name: "{app}\debug.log"
+
 [Messages]
 ConfirmUninstall=Remove Replay Vault?%n%nYour clips and settings stay. To also undo what the app changed on this PC (its private OBS, firewall rule, GPU and Game Bar settings), cancel and use General > Remove from this PC instead (it uninstalls the app too).

@@ -123,6 +123,28 @@ pub fn start_capture(on_done: impl Fn() + Send + 'static) {
     });
 }
 
+/// Tests: as if the user had just pressed `c` while a key was being set.
+#[cfg(test)]
+pub fn fake_capture(c: Combo) {
+    let mut cap = CAPTURE.lock().unwrap();
+    (cap.active, cap.result) = (false, Some(c));
+}
+
+/// Whether another program (or Windows) already holds `c`: it's registered for a moment on the
+/// calling thread and let go at once. A key this app holds itself reads as held too, so ask
+/// only about keys the app hasn't registered.
+pub fn held_elsewhere(c: Combo) -> bool {
+    const PROBE: i32 = 0xB000;
+    unsafe {
+        if RegisterHotKey(None, PROBE, c.modifiers() | MOD_NOREPEAT, c.vk as u32).is_ok() {
+            let _ = UnregisterHotKey(None, PROBE);
+            false
+        } else {
+            true
+        }
+    }
+}
+
 /// Whether the thread that owns the app's hotkeys started.
 pub fn is_running() -> bool {
     THREAD_ID.get().is_some()
@@ -272,6 +294,28 @@ impl std::fmt::Display for Combo {
 #[cfg(test)]
 mod tests {
     use super::Combo;
+
+    /// A key someone holds reads as held, and free once they let go. Ctrl+Alt+Shift+F23, which
+    /// nothing uses, stands in for the other program.
+    #[test]
+    fn finds_a_held_key() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
+        let c = Combo { vk: 0x86, ctrl: true, alt: true, shift: true, win: false };
+        assert!(!super::held_elsewhere(c), "free to begin with");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || unsafe {
+            RegisterHotKey(None, 0xA1, c.modifiers(), c.vk as u32).unwrap();
+            held_tx.send(()).unwrap();
+            let _ = done_rx.recv();
+            let _ = UnregisterHotKey(None, 0xA1);
+        });
+        held_rx.recv().unwrap();
+        assert!(super::held_elsewhere(c), "held by the other thread");
+        done_tx.send(()).unwrap();
+        other.join().unwrap();
+        assert!(!super::held_elsewhere(c), "free again");
+    }
 
     #[test]
     fn round_trips() {
