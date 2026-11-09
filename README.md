@@ -1,96 +1,65 @@
 # Replay Vault
 
-**Free, open-source instant replay for Windows. Press a key, keep the last few minutes.**
+Free, open-source instant replay for Windows. It keeps the last few minutes of your game in memory, and one key press saves them as a clip.
 
-![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue) ![Windows 10 / 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6) ![Rust](https://img.shields.io/badge/made%20with-Rust-B7410E)
+![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue) ![Windows 10 and 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6)
 
-[Install](#install) · [Features](#features) · [Hotkeys](#hotkeys) · [Where your files go](#where-your-files-go) · [Building from source](#building-from-source)
+![The clips library, with clips sorted by game](docs/clips.png)
 
-## About
+## Overview
 
-Replay Vault keeps a rolling recording of your screen and sound in memory. Nothing touches the disk
-until you press the save hotkey, and then the last minute (or up to 20) is saved as a clip.
+Replay Vault records your screen and sound into a rolling buffer. Nothing is written to disk until you press the save key. Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.com) that the app downloads and manages, so you get OBS's GPU encoding without setting up OBS. If you already use OBS, your own install and its settings are not changed.
 
-It runs a private, hidden copy of [OBS Studio](https://obsproject.com) as the recorder, so you get
-OBS's GPU encoding and audio capture without ever opening OBS. If you already use OBS, your own copy
-and its settings are never touched. The app itself lives in the tray, and opens over your game when
-you want to watch, trim or share a clip.
+Main features:
 
-## Features
+- Instant replay from 10 seconds to 20 minutes, plus full recordings and screenshots
+- Separate audio tracks for game and microphone, or only the apps you choose
+- A clips library with per-game folders, search, stars and tags
+- Trimming, GIF export, and smaller copies sized for Discord or vertical video
+- Optional automatic cleanup by size or age, and archiving to another drive
 
-**Recording**
-- **Instant replay** from 10 seconds to 20 minutes, saved with one hotkey (or the last 30 / 60 seconds).
-- **Full recording** and **screenshots** on their own hotkeys.
-- **Desktop or game capture.** Desktop is the default and is safe with anti-cheat. Game capture is optional and comes with a warning.
-- **Separate audio tracks** for game and mic, mic mute hotkey, noise suppression, or **only the apps you pick** (game and Discord, not Spotify).
-- **Follow the mouse** across monitors, and HDR monitors recorded without a washed-out look.
-- **Encoder hint** when the recorder starts skipping frames.
+## Requirements
 
-**Clips**
-- **Clips page** with recent clips, per-game folders (with Steam cover art), search, stars and tags.
-- **Hover to scrub** through a clip's thumbnail, and a built-in player.
-- **Trim** with an audio waveform, loud-moment markers, frame stepping, and several parts joined into one clip.
-- **Export for sharing:** fit for Discord (up to 10 or 50 MB), 720p, or vertical 9:16 for TikTok / Shorts.
-- **Save as GIF**, and a **montage maker** with fades and optional music.
-
-**Sharing and storage**
-- **Post to Discord** through a webhook you set up, or upload for a **share link** (kappa.lol, with a delete link).
-- **Auto-cleanup** by size or age (stars are never cleaned up), and an **archive** drive or NAS for old clips.
-- **Move to a new PC:** export and import your settings in one file.
+- Windows 10 or 11, 64-bit
+- A graphics card with a hardware video encoder is recommended. Only NVIDIA cards have been tested so far. AMD and Intel graphics, and CPU-only recording, are untested.
 
 ## Install
 
-There's no installer yet.
+1. Download the latest installer (`ReplayVault-<version>-setup.exe`) or the portable zip from [Releases](../../releases). The installer does not need administrator rights.
+2. Run it. A short setup asks for your clips folder, save key, screen and sound devices.
+3. On first run the app downloads OBS Studio (about 225 MB) into its own folder and checks it against the published SHA-256 hash.
 
-1. Download `replay-vault.exe` from [Releases](../../releases), or build it yourself (see below).
-2. Run it. A short setup picks your clips folder, hotkey, and screen and sound.
-3. The first run downloads OBS Studio (about 225 MB) into the app's own folder. The download is checked against the published SHA-256.
+Each release includes `SHA256SUMS.txt`. To verify a download, compare it with the output of `Get-FileHash <file>`.
 
 > [!NOTE]
-> The exe isn't code-signed yet, so Windows SmartScreen may warn about it the first time. Signing is planned.
+> Releases are not code-signed yet, so Windows SmartScreen may show a warning the first time you run the app.
 
-## Hotkeys
+## Default keys
 
-| Action | Default |
+| Action | Key |
 |---|---|
 | Save the replay | `Alt+F10` |
-| Start or stop recording | `Alt+F9` |
-| Screenshot | `Alt+F1` |
-| Instant replay on or off | `Alt+Shift+F10` |
 | Show or hide the window | `Alt+Z` |
-| Save the last 30 s / 60 s, mic mute | Not set (pick them on the Keybinds page) |
+| Start or stop a recording | `Alt+F9` |
+| Screenshot | `Alt+F1` |
+| Turn instant replay on or off | `Alt+Shift+F10` |
 
-The defaults are the same keys NVIDIA's ShadowPlay uses, so they feel familiar. NVIDIA's overlay would react to them too, so on NVIDIA PCs a switch on the Keybinds page turns its overlay off while Replay Vault runs, and turns it back on when you quit. If AMD Software uses the same keys, the Keybinds page tells you how to change them. Every key can be changed on the Keybinds page.
+All keys can be changed on the Keybinds page.
 
-## Where your files go
+## Privacy
 
-| What | Where |
-|---|---|
-| Clips and screenshots | `Videos\Replay Vault` (you can change it), in a folder per game if you turn that on |
-| Settings, stars, tags, logs | `%APPDATA%\replay-vault` |
-| The private OBS copy | `%LOCALAPPDATA%\replay-vault` |
+Replay Vault has no accounts, tracking or analytics. It connects to the internet only to:
 
-## Sharing clips
+- download and update OBS Studio and the Microsoft Visual C++ runtime it needs
+- look up game cover art on Steam by the game's name (can be turned off)
+- check GitHub once a day for a newer version of Replay Vault (can be turned off)
+- send feedback, upload a share link or post to Discord, and only when you use those features
 
-- **Export for sharing** makes a smaller copy next to the original. The original is never changed.
-- **Share link** uploads one clip to kappa.lol only when you click and confirm. The app keeps the delete link, so you can take it down later. kappa.lol is a free third-party host; treat anything you upload there as public.
-- **Post to Discord** sends the clip to a channel through a webhook you paste in. The webhook stays on your PC and is never logged.
+Clips, settings and logs stay on your PC: clips in `Videos\Replay Vault Clips` by default, settings and logs in `%APPDATA%\replay-vault`, and the private OBS copy in `%LOCALAPPDATA%\replay-vault`.
 
-## What it changes on your PC
+## Uninstall
 
-- **Recorder:** OBS runs hidden, tied to the app, and is closed with it. Its WebSocket listens on port 4466, protected by a random password.
-- **Firewall:** a rule for the private OBS, only if you allow it.
-- **GPU preference:** the private OBS is set to run on the high-performance GPU (for laptops and PCs with two GPUs). On by default; untick it to put your setting back.
-- **Game Bar:** turning off Xbox Game Bar capture is optional and off by default. Unticking restores your own setting.
-- **Startup:** "Start with Windows" adds the app to your user's Run list.
-- **Removing it:** **General > Remove from this PC** undoes all of the above, moves the private OBS to the Recycle Bin, and keeps your clips.
-
-## Good to know
-
-- **Anti-cheat:** Desktop capture works with every game. Game capture hooks into the game, so anti-cheats like Vanguard, FACEIT or ESEA may block or flag it. Use Desktop for those.
-- **Protected video:** DRM-protected video (some streaming sites) records as black. That's Windows, not the app.
-- **GPUs: only NVIDIA is tested.** Recording on AMD and Intel graphics, and on the CPU (for PCs without a supported card), is **untested**. It goes through OBS, so it should work, but nobody has checked it yet. If you have one of those, please try it and tell us how it went in a GitHub issue or on Discord.
-- **Windows only.** OBS runs on Linux and macOS, but this app uses Windows APIs throughout.
+Use **General > Remove from this PC** in the app first. It undoes the changes the app made (startup entry, firewall rule, GPU preference and any Windows or NVIDIA settings you turned off) and moves the private OBS copy to the Recycle Bin. Your clips are kept. Then uninstall it from Windows Settings, or delete the portable folder.
 
 ## Building from source
 
@@ -98,15 +67,26 @@ You need [Rust](https://rustup.rs) (stable) on Windows 10 or 11.
 
 ```
 cargo build --release
+cargo test
 ```
 
-The exe is at `target\release\replay-vault.exe`. Run the tests with `cargo test`. The tests never play
-sound and never go online; a few slow or online ones are marked `#[ignore]`.
+The executable is written to `target\release\replay-vault.exe`. Release packages are built by `tools\release.ps1`, which also needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer. Pushing a `v*` tag builds a draft release with GitHub Actions.
+
+## Code signing policy
+
+Windows releases will be signed through the [SignPath Foundation](https://signpath.org) program, with a certificate issued to SignPath Foundation. Until then, releases are unsigned.
+
+- Only builds made by this repository's GitHub Actions release workflow from a tagged commit are signed.
+- Committer, reviewer and approver: [ItsFlamme](https://github.com/ItsFlamme). Every signing request is approved manually.
+
+## Support
+
+- Bugs and feature requests: [GitHub Issues](../../issues)
+- Help and community: [Discord](https://discord.gg/n2KYWUPqGY)
+- Security issues: see [SECURITY.md](SECURITY.md)
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). You can use, change and share the
-code, but anything built on it has to keep the NOTICE file, which credits ItsFlamme.
+Licensed under the [Apache License 2.0](LICENSE). Redistributions must keep the [NOTICE](NOTICE) file.
 
-OBS Studio is GPL-2.0-or-later and is downloaded and run unmodified, not bundled. See
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Not affiliated with the OBS Project or NVIDIA.
+OBS Studio is licensed under GPL-2.0-or-later. It is downloaded from the official release and run unmodified, not bundled. Other third-party components are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Replay Vault is not affiliated with the OBS Project, NVIDIA, AMD or Intel.

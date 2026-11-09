@@ -10,7 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetForegroundWindow, GetWindowRect, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, SW_HIDE, SW_RESTORE,
     SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
 };
-use windows::core::w;
+use windows::core::PCWSTR;
 
 static WINDOW: OnceLock<isize> = OnceLock::new();
 /// Centered once on first show; after that it stays wherever the user moved it.
@@ -35,6 +35,28 @@ pub fn raw() -> Option<isize> {
 
 pub fn hwnd() -> Option<HWND> {
     WINDOW.get().map(|&h| HWND(h as *mut _))
+}
+
+/// A file or folder picker owned by the app's window, so it opens in front of it even while the
+/// window is kept on top.
+pub fn file_dialog() -> rfd::FileDialog {
+    struct Owner(std::num::NonZeroIsize);
+    impl raw_window_handle::HasWindowHandle for Owner {
+        fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+            let raw = raw_window_handle::RawWindowHandle::Win32(raw_window_handle::Win32WindowHandle::new(self.0));
+            Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) })
+        }
+    }
+    impl raw_window_handle::HasDisplayHandle for Owner {
+        fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+            Ok(raw_window_handle::DisplayHandle::windows())
+        }
+    }
+    let dialog = rfd::FileDialog::new();
+    match WINDOW.get().and_then(|&h| std::num::NonZeroIsize::new(h)) {
+        Some(h) => dialog.set_parent(&Owner(h)),
+        None => dialog,
+    }
 }
 
 /// The window in front, as far as clips are concerned: while this app is in front, the one that
@@ -67,7 +89,8 @@ pub fn show() {
 
 /// Brings up the window of the copy that's already running (used by a second launch).
 pub fn show_existing() {
-    if let Ok(window) = unsafe { FindWindowW(None, w!("Replay Vault")) } {
+    let title: Vec<u16> = crate::APP_TITLE.encode_utf16().chain([0]).collect();
+    if let Ok(window) = unsafe { FindWindowW(None, PCWSTR(title.as_ptr())) } {
         bring_up(window, false);
     }
 }

@@ -1,5 +1,4 @@
 /target
-/PLAN*.md
-/UI-BRIEF.md
-CLAUDE.md
-.claude/
+/dist
+/sbom.json
+/.wrangler/

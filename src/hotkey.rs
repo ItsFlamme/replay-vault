@@ -77,17 +77,16 @@ pub fn install(on_press: impl Fn(Action) + Send + 'static) -> anyhow::Result<()>
                     if let Some(a) = Action::from_id(msg.wParam.0) {
                         on_press(a);
                     }
-                } else if msg.message == WM_APP {
-                    if let Some((action, combo, reply)) = REQUEST.lock().unwrap().take() {
-                        let id = action as i32;
-                        let _ = UnregisterHotKey(None, id);
-                        let result = match combo {
-                            None => Ok(()),
-                            Some(c) => RegisterHotKey(None, id, c.modifiers() | MOD_NOREPEAT, c.vk as u32)
-                                .map_err(|_| format!("{c} is already used by another app. Pick another.")),
-                        };
-                        let _ = reply.send(result);
-                    }
+                } else if msg.message == WM_APP
+                    && let Some((action, combo, reply)) = REQUEST.lock().unwrap().take() {
+                    let id = action as i32;
+                    let _ = UnregisterHotKey(None, id);
+                    let result = match combo {
+                        None => Ok(()),
+                        Some(c) => RegisterHotKey(None, id, c.modifiers() | MOD_NOREPEAT, c.vk as u32)
+                            .map_err(|_| format!("{c} is already used by another app. Pick another.")),
+                    };
+                    let _ = reply.send(result);
                 }
             }
         }
@@ -122,6 +121,11 @@ pub fn start_capture(on_done: impl Fn() + Send + 'static) {
             std::thread::sleep(Duration::from_millis(10));
         }
     });
+}
+
+/// Whether the thread that owns the app's hotkeys started.
+pub fn is_running() -> bool {
+    THREAD_ID.get().is_some()
 }
 
 pub fn is_capturing() -> bool {

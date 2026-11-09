@@ -237,7 +237,7 @@ pub fn trim(src: &Path, dst: &Path, start: f64, end: f64) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Moves a sample's presentation time, and its decode time if it has one, back by ase.
+/// Moves a sample's presentation time, and its decode time if it has one, back by `base`.
 /// (The MP4 writer uses the decode time for the file's length.)
 unsafe fn rebase(s: &IMFSample, ts: i64, base: i64) -> anyhow::Result<()> {
     unsafe {
@@ -1266,6 +1266,94 @@ impl AudioSource {
 pub(crate) mod tests {
     use super::*;
 
+    /// A made-up clip (no real clip read): `secs` of a colored scene with a moving bar, H.264
+    /// 640x360 30 fps and one quiet AAC track.
+    pub(crate) fn synth_clip(dst: &Path, secs: u32, rgb: [u8; 3]) {
+        init().unwrap();
+        let e = Encode { crop: [0, 0, 640, 360], width: 640, height: 360, fps: 30.0, kbps: 1500, hw: false };
+        let yuv = |r: f32, g: f32, b: f32| {
+            let y = 16.0 + 0.257 * r + 0.504 * g + 0.098 * b;
+            let u = 128.0 - 0.148 * r - 0.291 * g + 0.439 * b;
+            let v = 128.0 + 0.439 * r - 0.368 * g - 0.071 * b;
+            (y as u8, u as u8, v as u8)
+        };
+        unsafe {
+            let w = sink_writer(dst, false).unwrap();
+            let v = w.AddStream(&video_type(&e, true).unwrap()).unwrap();
+            w.SetInputMediaType(v, &video_type(&e, false).unwrap(), None).unwrap();
+            let a = w.AddStream(&audio_type(true).unwrap()).unwrap();
+            w.SetInputMediaType(a, &audio_type(false).unwrap(), None).unwrap();
+            w.BeginWriting().unwrap();
+            let (ww, hh) = (640usize, 360usize);
+            for f in 0..secs as usize * 30 {
+                let mut px = vec![0u8; ww * hh * 3 / 2];
+                let bar = (f * 8) % ww;
+                for y in 0..hh {
+                    for x in 0..ww {
+                        let shade = 0.55 + 0.45 * (y as f32 / hh as f32);
+                        let (mut r, mut g, mut b) = (rgb[0] as f32 * shade, rgb[1] as f32 * shade, rgb[2] as f32 * shade);
+                        if x >= bar && x < bar + 60 {
+                            (r, g, b) = (240.0, 240.0, 230.0);
+                        }
+                        if y > hh * 3 / 4 && (x / 40) % 2 == 0 {
+                            (r, g, b) = (r * 0.5, g * 0.5, b * 0.5);
+                        }
+                        let (yy, u, vv) = yuv(r, g, b);
+                        px[y * ww + x] = yy;
+                        if y % 2 == 0 && x % 2 == 0 {
+                            let i = ww * hh + (y / 2) * ww + x;
+                            px[i] = u;
+                            px[i + 1] = vv;
+                        }
+                    }
+                }
+                let t = (f as f64 * SEC / 30.0) as i64;
+                w.WriteSample(v, &nv12_sample(&px, &e, t, 1.0).unwrap()).unwrap();
+            }
+            let total = secs as u64 * RATE as u64;
+            let mut at = 0u64;
+            while at < total {
+                let k = (total - at).min(4800);
+                let pcm: Vec<f32> = (at..at + k).flat_map(|s| [0.05 * (s as f32 * 440.0 * std::f32::consts::TAU / RATE as f32).sin(); 2]).collect();
+                write_pcm(&w, a, at, &pcm).unwrap();
+                at += k;
+            }
+            w.Finalize().unwrap();
+        }
+    }
+
+    /// Six made-up clips in `dir` (written once, oldest first so their times sort), for rendering
+    /// the app's screens without reading anyone's real clips.
+    pub(crate) fn demo_clips(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let clips = [
+            ("VALORANT 2026-11-07 21-07-33.mp4", [200, 60, 70]),
+            ("VALORANT 2026-11-07 20-53-10.mp4", [60, 90, 200]),
+            ("Elden Ring 2026-11-06 23-41-10.mp4", [170, 130, 50]),
+            ("Desktop 2026-11-06 18-10-53.mp4", [50, 150, 120]),
+            ("Rocket League 2026-11-05 22-02-41.mp4", [40, 110, 220]),
+            ("Counter-Strike 2 2026-11-04 19-30-05.mp4", [150, 150, 90]),
+        ];
+        for (name, rgb) in clips.into_iter().rev() {
+            let p = dir.join(name);
+            if !p.exists() {
+                synth_clip(&p, 6, rgb);
+                std::thread::sleep(std::time::Duration::from_millis(1100));
+            }
+        }
+    }
+
+    /// Writes the demo clips folder to SYNTH_OUT. Run on demand.
+    #[test]
+    #[ignore]
+    fn synth_demo_clips() {
+        demo_clips(Path::new(&std::env::var("SYNTH_OUT").unwrap()));
+    }
+
+    // The two slowest tests encode video (exports_a_real_clip_for_sharing, joins_real_clips) and
+    // are #[ignore]d, so a debug `cargo test` stays quick. Run them with:
+    // cargo test --release -- --ignored exports_a_real_clip_for_sharing joins_real_clips
+
     /// Uses the newest real clip in the clips folder; skipped if there isn't one.
     fn sample_clip() -> Option<std::path::PathBuf> {
         let folder = crate::config::Config::load().folder;
@@ -1552,6 +1640,7 @@ pub(crate) mod tests {
 
     /// Each share preset on ~10 s of a real clip (a trimmed temp copy).
     #[test]
+    #[ignore = "slow: encodes every share preset (about 45 s in a debug build)"]
     fn exports_a_real_clip_for_sharing() {
         let Some(real) = sample_clip() else { return };
         let src = std::env::temp_dir().join("instant-replay-share-src.mp4");
@@ -1694,6 +1783,7 @@ pub(crate) mod tests {
     /// Two clips joined: as long as both, the first one's size and frame rate even when the second
     /// is smaller; with fades, it opens on black. Parts of one clip add up the same way.
     #[test]
+    #[ignore = "slow: encodes two joins (about 20 s in a debug build)"]
     fn joins_real_clips() {
         let Some([a, b]) = two_short_clips("join") else { return };
         // The second at 720p, so it has to be scaled up to fit.

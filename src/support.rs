@@ -10,7 +10,7 @@ use crate::config::{self, Config};
 /// secrets and `summary` into `out`. The secrets are also blanked out of the files' text, share
 /// links are taken out, and the Windows user folder shows as ~ (it has the user's name in it).
 pub fn write(out: &Path, files: &[(&str, PathBuf)], cfg: &Config, summary: &str) -> anyhow::Result<()> {
-    let secrets: Vec<&str> = [&cfg.recorder_password, &cfg.phone_key, &cfg.discord_webhook].into_iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let secrets: Vec<&str> = [&cfg.recorder_password, &cfg.discord_webhook].into_iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     let home = dirs::home_dir().map(|h| h.display().to_string()).filter(|h| h.len() > 3);
     let mut zip = zip::ZipWriter::new(std::fs::File::create(out)?);
     let mut add = |name: &str, text: String| -> anyhow::Result<()> {
@@ -34,7 +34,7 @@ pub fn write(out: &Path, files: &[(&str, PathBuf)], cfg: &Config, summary: &str)
 }
 
 /// The text with every kappa.lol share link (older logs have them) replaced.
-fn without_links(text: String) -> String {
+pub fn without_links(text: String) -> String {
     const HOST: &str = "https://kappa.lol/";
     if !text.contains(HOST) {
         return text;
@@ -51,18 +51,23 @@ fn without_links(text: String) -> String {
 
 /// Windows version, the app's version, GPU, RAM and monitors, one per line.
 pub fn summary(hw: &crate::profile::Hardware, monitors: &[crate::display::Monitor]) -> String {
-    use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
-    use windows::core::w;
-    let key = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
-    let read = |value| crate::startup::read_string(HKEY_LOCAL_MACHINE, key, value).unwrap_or_default();
     let mut lines = vec![
-        format!("Windows: {} {} (build {})", read(w!("ProductName")), read(w!("DisplayVersion")), read(w!("CurrentBuild"))),
+        format!("Windows: {}", windows_version()),
         format!("Replay Vault: {}", env!("CARGO_PKG_VERSION")),
         format!("GPU: {} ({} MB)", hw.gpu_name, hw.vram_mb),
         format!("RAM: {} MB", hw.ram_mb),
     ];
     lines.extend(monitors.iter().map(|m| format!("Monitor: {}", m.label())));
     lines.join("\r\n")
+}
+
+/// Like "Windows 10 Pro 24H2 (build 26100)".
+pub fn windows_version() -> String {
+    use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+    use windows::core::w;
+    let key = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+    let read = |value| crate::startup::read_string(HKEY_LOCAL_MACHINE, key, value).unwrap_or_default();
+    format!("{} {} (build {})", read(w!("ProductName")), read(w!("DisplayVersion")), read(w!("CurrentBuild")))
 }
 
 #[cfg(test)]
@@ -78,21 +83,20 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let cfg = Config {
             recorder_password: "pw-0123456789abcdef".into(),
-            phone_key: "key-fedcba9876543210".into(),
             discord_webhook: "https://discord.com/api/webhooks/1/hook-token-secret".into(),
             buffer_secs: 77,
             ..Config::default()
         };
         let log = dir.join("app.log");
         let home = dirs::home_dir().unwrap().display().to_string();
-        std::fs::write(&log, format!("started\r\nphone page at http://127.0.0.1:1/?key={}\r\nUploaded {home}\\Videos\\a.mp4 to https://kappa.lol/AbC12 ok\r\nfrom {}/Videos\r\n", cfg.phone_key, home.replace('\\', "/"))).unwrap();
+        std::fs::write(&log, format!("started\r\nUploaded {home}\\Videos\\a.mp4 to https://kappa.lol/AbC12 ok\r\nfrom {}/Videos\r\n", home.replace('\\', "/"))).unwrap();
         let obs = dir.join("obs.txt");
         std::fs::write(&obs, format!("websocket password {}\nposting to {}\n", cfg.recorder_password, cfg.discord_webhook)).unwrap();
         let out = dir.join("support.zip");
         let files = [("app.log", log), ("obs.log", obs), ("tweaks.json", dir.join("missing.json"))];
         write(&out, &files, &cfg, "Windows: test").unwrap();
 
-        let secrets = [cfg.recorder_password.as_str(), cfg.phone_key.as_str(), cfg.discord_webhook.as_str(), "hook-token-secret"];
+        let secrets = [cfg.recorder_password.as_str(), cfg.discord_webhook.as_str(), "hook-token-secret"];
         let raw = std::fs::read(&out).unwrap();
         for s in secrets {
             assert!(!raw.windows(s.len()).any(|w| w == s.as_bytes()), "the zip has {s}");

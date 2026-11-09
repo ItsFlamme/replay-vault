@@ -21,14 +21,18 @@ pub struct Monitor {
     pub primary: bool,
     /// HDR is on: Windows' brightness for normal (SDR) content on this monitor, in nits.
     pub hdr: Option<u32>,
+    /// The name Windows shows in its display settings, from the monitor itself (EDID), like
+    /// "MAG274QRF"; empty if Windows doesn't have one.
+    pub name: String,
 }
 
 impl Monitor {
+    /// "Main monitor: MAG274QRF (2560x1440, 144 Hz)". Without a name, the model code from the
+    /// device path stands in (between its first two '#'s, e.g. MSI3CD8).
     pub fn label(&self) -> String {
-        // The model code sits between the first two '#'s, e.g. MSI3CD8.
-        let model = self.id.split('#').nth(1).unwrap_or("Display");
-        let primary = if self.primary { ", primary" } else { "" };
-        format!("{model}: {}x{} @ {} Hz{primary}", self.width, self.height, self.hz)
+        let name = if self.name.trim().is_empty() { self.id.split('#').nth(1).unwrap_or("Monitor") } else { self.name.trim() };
+        let main = if self.primary { "Main monitor: " } else { "" };
+        format!("{main}{name} ({}x{}, {} Hz)", self.width, self.height, self.hz)
     }
 }
 
@@ -45,7 +49,7 @@ pub fn list() -> Vec<Monitor> {
 /// the much slower DXGI and display config queries.
 fn monitors(hdr: bool) -> Vec<Monitor> {
     let mut out = Vec::new();
-    let hdr = if hdr { hdr_monitors() } else { Vec::new() };
+    let (hdr, names) = if hdr { (hdr_monitors(), friendly_names()) } else { (Vec::new(), Vec::new()) };
     for i in 0.. {
         let mut adapter = DISPLAY_DEVICEW { cb: size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
         if !unsafe { EnumDisplayDevicesW(PCWSTR::null(), i, &mut adapter, 0) }.as_bool() {
@@ -64,11 +68,13 @@ fn monitors(hdr: bool) -> Vec<Monitor> {
             continue;
         }
         let pos = unsafe { mode.Anonymous1.Anonymous2.dmPosition };
+        let id = wide_to_string(&mon.DeviceID);
         out.push(Monitor {
-            id: wide_to_string(&mon.DeviceID),
+            name: names.iter().find(|(path, _)| path.eq_ignore_ascii_case(&id)).map(|(_, n)| n.clone()).unwrap_or_default(),
+            id,
             width: mode.dmPelsWidth,
             height: mode.dmPelsHeight,
-            hz: mode.dmDisplayFrequency,
+            hz: nominal_hz(mode.dmDisplayFrequency),
             x: pos.x,
             y: pos.y,
             primary: (adapter.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE).0 != 0,
@@ -77,6 +83,14 @@ fn monitors(hdr: bool) -> Vec<Monitor> {
     }
     out.sort_by_key(|m| (!m.primary, m.x));
     out
+}
+
+/// Windows rounds fractional rates down (59.94 Hz reads as 59); give the rate people know.
+fn nominal_hz(hz: u32) -> u32 {
+    match hz {
+        23 | 29 | 47 | 59 | 71 | 74 | 89 | 99 | 119 | 143 | 164 | 179 | 199 | 239 | 359 => hz + 1,
+        _ => hz,
+    }
 }
 
 /// Monitors with HDR on, by GDI name (`\\.\DISPLAY1`), with Windows' brightness for SDR
@@ -136,6 +150,42 @@ fn sdr_white(gdi: &str) -> Option<u32> {
     })
 }
 
+/// Each connected monitor's device path (as in `Monitor::id`) and the name Windows shows for it,
+/// read from the monitor (EDID) by Windows' display config.
+fn friendly_names() -> Vec<(String, String)> {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+    };
+    let (mut np, mut nm) = (0, 0);
+    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) }.is_err() {
+        return Vec::new();
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+    if unsafe { QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), None) }.is_err() {
+        return Vec::new();
+    }
+    paths
+        .iter()
+        .take(np as usize)
+        .filter_map(|p| {
+            let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                    size: size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                    adapterId: p.targetInfo.adapterId,
+                    id: p.targetInfo.id,
+                },
+                ..Default::default()
+            };
+            (unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } == 0)
+                .then(|| (wide_to_string(&target.monitorDevicePath), wide_to_string(&target.monitorFriendlyDeviceName)))
+                .filter(|(_, name)| !name.trim().is_empty())
+        })
+        .collect()
+}
+
 /// The monitor holding the desktop point (x, y), if any.
 pub fn at(mons: &[Monitor], x: i32, y: i32) -> Option<&Monitor> {
     mons.iter().find(|m| (m.x..m.x + m.width as i32).contains(&x) && (m.y..m.y + m.height as i32).contains(&y))
@@ -154,7 +204,25 @@ mod tests {
     use super::*;
 
     fn mon(id: &str, x: i32, y: i32, width: u32, height: u32) -> Monitor {
-        Monitor { id: id.into(), width, height, hz: 60, x, y, primary: x == 0 && y == 0, hdr: None }
+        Monitor { id: id.into(), width, height, hz: 60, x, y, primary: x == 0 && y == 0, hdr: None, name: String::new() }
+    }
+
+    /// The main monitor says so first, a name from the monitor wins over the device path's model
+    /// code, and each connected monitor this PC lists has a name or a code.
+    #[test]
+    fn monitor_labels() {
+        let mut m = mon(r"\\?\DISPLAY#MSI3CA8#5&1&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}", 0, 0, 2560, 1440);
+        assert_eq!(m.label(), "Main monitor: MSI3CA8 (2560x1440, 60 Hz)");
+        (m.name, m.primary) = ("MAG274QRF".into(), false);
+        assert_eq!(m.label(), "MAG274QRF (2560x1440, 60 Hz)");
+        for m in list() {
+            assert!(!m.label().starts_with(" ("), "{}", m.label());
+        }
+    }
+
+    #[test]
+    fn fractional_rates_read_as_nominal() {
+        assert_eq!([59, 60, 143, 144, 164, 239, 24].map(nominal_hz), [60, 60, 144, 144, 165, 240, 24]);
     }
 
     /// A 1440p main screen with a 1080p one to its left, set lower, and a gap below that one.

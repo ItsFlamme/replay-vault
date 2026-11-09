@@ -33,7 +33,7 @@ pub fn list(folder: &str, max: usize) -> Vec<Clip> {
         .filter_map(|(e, group)| {
             let path = e.path();
             let ext = path.extension()?.to_string_lossy().to_lowercase();
-            let is_picture = matches!(ext.as_str(), "png" | "gif");
+            let is_picture = is_picture(&path);
             // Skips a clip still being cut down by a short save.
             if !(is_picture || matches!(ext.as_str(), "mp4" | "mkv" | "mov")) || path.to_string_lossy().contains(".cutting.") {
                 return None;
@@ -47,9 +47,14 @@ pub fn list(folder: &str, max: usize) -> Vec<Clip> {
             Some(Clip { name: path.file_name()?.to_string_lossy().into_owned(), bytes: m.len(), modified, path, group, is_picture })
         })
         .collect();
-    clips.sort_by(|a, b| b.modified.cmp(&a.modified));
+    clips.sort_by_key(|c| std::cmp::Reverse(c.modified));
     clips.truncate(max);
     clips
+}
+
+/// A screenshot or GIF, not a video.
+pub fn is_picture(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png") || e.eq_ignore_ascii_case("gif"))
 }
 
 /// The folder name for whatever is in front (by its window title only; the game's process is
@@ -59,7 +64,11 @@ pub fn game_folder_name() -> String {
     let window = crate::overlay::window_in_front();
     let mut buf = [0u16; 256];
     let n = if window.is_invalid() { 0 } else { unsafe { GetWindowTextW(window, &mut buf) } };
-    folder_name_from_title(&String::from_utf16_lossy(&buf[..n.max(0) as usize]))
+    let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+    let name = folder_name_from_title(&title);
+    // A folder named after a browser tab or a document is never looked up on Steam.
+    crate::covers::note_title(&name, &title);
+    name
 }
 
 /// "VALORANT  " -> "VALORANT", "Elden Ring - v1.2" -> "Elden Ring"; nothing usable -> "Desktop".
@@ -102,15 +111,17 @@ pub fn rename(path: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Ok(dest)
 }
 
-/// Moves a file into `dir` (made if needed), never over an existing file; returns where it went.
+/// Moves a file into `dir` (made if needed) with `prefix` and a space put in front of its name
+/// (none if empty), never over an existing file; returns where it went.
 /// Retries for a few seconds in case OBS hasn't let go of it yet. To another drive or a NAS,
 /// which Windows can't move to, it's copied, checked and then removed.
-pub fn move_into(path: &Path, dir: &Path) -> std::io::Result<PathBuf> {
-    if path.parent() == Some(dir) {
+pub fn move_into(path: &Path, dir: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+    if path.parent() == Some(dir) && prefix.is_empty() {
         return Ok(path.to_path_buf());
     }
     std::fs::create_dir_all(dir)?;
     let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let stem = if prefix.is_empty() { stem } else { format!("{prefix} {stem}") };
     let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let dest = (1..)
         .map(|n| dir.join(if n == 1 { format!("{stem}{ext}") } else { format!("{stem} ({n}){ext}") }))
@@ -160,16 +171,24 @@ fn copy_then_remove(path: &Path, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Carries a clip's star, tags and share link to where it went (renamed or archived), or with
-/// `new` None (recycled) drops its star and tags; the share link stays, to be deleted. Saves
-/// whatever changed.
-pub fn moved(favs: &mut std::collections::BTreeSet<String>, tags: &mut Tags, old: &Path, new: Option<&Path>) {
+/// Carries a clip's star, tags, note, fingerprint and share link to where it went (renamed or
+/// archived), or with `new` None (recycled) drops its star, tags, note and fingerprint; the share
+/// link stays, to be deleted. Saves whatever changed.
+pub fn moved(favs: &mut std::collections::BTreeSet<String>, tags: &mut Tags, notes: &mut Notes, old: &Path, new: Option<&Path>) {
     if favs.remove(&old.display().to_string()) {
         favs.extend(new.map(|n| n.display().to_string()));
         save_favorites(favs);
     }
     if move_tags(tags, old, new) {
         save_tags(tags);
+    }
+    if move_note(notes, old, new) {
+        save_notes(notes);
+    }
+    let mut p = prints();
+    if let Some(print) = p.remove(&old.display().to_string()) {
+        p.extend(new.map(|n| (n.display().to_string(), print)));
+        save_prints(&p);
     }
     if let Some(new) = new {
         crate::upload::renamed(old, new);
@@ -257,13 +276,6 @@ pub fn set_tag(tags: &mut Tags, path: &Path, tag: &str, on: bool) {
     }
 }
 
-/// The tag that marks a clip for the cloud backup (any case, so a "cloud" tag counts too).
-pub const CLOUD: &str = "Cloud";
-
-pub fn is_cloud(tag: &str) -> bool {
-    tag.eq_ignore_ascii_case(CLOUD)
-}
-
 /// Carries a clip's tags to its new path after a rename, or drops them (`new` None, recycled).
 /// True if anything changed.
 pub fn move_tags(tags: &mut Tags, old: &Path, new: Option<&Path>) -> bool {
@@ -272,6 +284,130 @@ pub fn move_tags(tags: &mut Tags, old: &Path, new: Option<&Path>) -> bool {
         tags.insert(new.display().to_string(), set);
     }
     true
+}
+
+/// A one-line note per clip ("Clutch 1v4 on B site"), by clip path, kept in notes.json like the tags.
+pub type Notes = std::collections::BTreeMap<String, String>;
+
+/// The longest a note can be, in characters.
+pub const NOTE_MAX: usize = 120;
+
+fn notes_file() -> PathBuf {
+    if cfg!(test) { std::env::temp_dir().join("instant-replay-notes-test.json") } else { crate::config::dir().join("notes.json") }
+}
+
+pub fn notes() -> Notes {
+    read_notes(&notes_file())
+}
+
+pub fn save_notes(notes: &Notes) {
+    write_notes(&notes_file(), notes);
+}
+
+fn read_notes(file: &Path) -> Notes {
+    std::fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+fn write_notes(file: &Path, notes: &Notes) {
+    let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")));
+    let _ = std::fs::write(file, serde_json::to_string_pretty(notes).unwrap_or_default());
+}
+
+/// Sets a clip's note: one line (line breaks become spaces), trimmed, at most NOTE_MAX characters.
+/// An empty note takes it off.
+pub fn set_note(notes: &mut Notes, path: &Path, text: &str) {
+    let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(NOTE_MAX).collect();
+    let key = path.display().to_string();
+    if line.trim().is_empty() {
+        notes.remove(&key);
+    } else {
+        notes.insert(key, line.trim_end().to_string());
+    }
+}
+
+/// Carries a clip's note to its new path, or drops it (`new` None, recycled). True if it had one.
+pub fn move_note(notes: &mut Notes, old: &Path, new: Option<&Path>) -> bool {
+    let Some(note) = notes.remove(&old.display().to_string()) else { return false };
+    if let Some(new) = new {
+        notes.insert(new.display().to_string(), note);
+    }
+    true
+}
+
+/// Fingerprints (`fingerprint`) of starred, tagged and noted clips by path, so they can be found
+/// again after a rename or move outside the app. Kept in a file of their own: tags.json and
+/// favorites.json stay as they were, and entries from before fingerprints get one once their clip
+/// is next listed.
+pub type Prints = std::collections::BTreeMap<String, String>;
+
+fn prints_file() -> PathBuf {
+    if cfg!(test) { std::env::temp_dir().join("instant-replay-prints-test.json") } else { crate::config::dir().join("fingerprints.json") }
+}
+
+pub fn prints() -> Prints {
+    std::fs::read_to_string(prints_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+pub fn save_prints(prints: &Prints) {
+    let file = prints_file();
+    let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")));
+    let _ = std::fs::write(file, serde_json::to_string_pretty(prints).unwrap_or_default());
+}
+
+/// A file's size and a hash of its first and last 64 KB, as "size:hash": quick to work out even
+/// for a GB clip on a NAS, and enough to tell clips apart.
+pub fn fingerprint(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let size = f.metadata().ok()?.len();
+    let mut part = vec![0; size.min(64 << 10) as usize];
+    let mut hash = Sha256::new();
+    f.read_exact(&mut part).ok()?;
+    hash.update(&part);
+    f.seek(SeekFrom::Start(size - part.len() as u64)).ok()?;
+    f.read_exact(&mut part).ok()?;
+    hash.update(&part);
+    Some(format!("{size}:{}", hash.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()))
+}
+
+/// Finds starred, tagged and noted clips (`marked`) again after a rename or move outside the app.
+/// First fingerprints the marked clips in `scanned` that have none yet. Then each marked path with a
+/// fingerprint that's gone from under `roots` is looked for in `scanned` (only clips of the same
+/// size are read). Returns the moves (old, new), for `moved` to carry the star, tags, note and
+/// share link, and whether `prints` changed (it gets the new fingerprints, and the found ones re-keyed).
+pub fn refind(marked: &std::collections::BTreeSet<String>, prints: &mut Prints, scanned: &[&Clip], roots: &[&Path]) -> (Vec<(PathBuf, PathBuf)>, bool) {
+    let mut changed = false;
+    for c in scanned {
+        let key = c.path.display().to_string();
+        if marked.contains(&key)
+            && !prints.contains_key(&key)
+            && let Some(print) = fingerprint(&c.path)
+        {
+            prints.insert(key, print);
+            changed = true;
+        }
+    }
+    let listed: std::collections::HashSet<&Path> = scanned.iter().map(|c| c.path.as_path()).collect();
+    let gone: Vec<(String, String)> = prints
+        .iter()
+        .filter(|(k, _)| marked.contains(*k) && !listed.contains(Path::new(k)) && roots.iter().any(|r| inside(k, &r.display().to_string())) && !Path::new(k).exists())
+        .map(|(k, p)| (k.clone(), p.clone()))
+        .collect();
+    let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (old, print) in gone {
+        let size = print.split(':').next().and_then(|s| s.parse::<u64>().ok());
+        let found = scanned.iter().find(|c| {
+            Some(c.bytes) == size && !marked.contains(&c.path.display().to_string()) && !moves.iter().any(|(_, n)| *n == c.path) && fingerprint(&c.path).as_ref() == Some(&print)
+        });
+        if let Some(c) = found {
+            prints.remove(&old);
+            prints.insert(c.path.display().to_string(), print);
+            moves.push((PathBuf::from(old), c.path.clone()));
+            changed = true;
+        }
+    }
+    (moves, changed)
 }
 
 /// Auto-cleanup limits; None is no limit.
@@ -327,7 +463,12 @@ pub fn start_cleanup() {
                 continue;
             }
             match recycle(&path) {
-                Ok(()) => crate::log::write(&format!("Auto-cleanup moved {} to the Recycle Bin.", path.display())),
+                Ok(()) => {
+                    // Its tags and note go too, as when it's recycled in the window.
+                    moved(&mut favorites(), &mut tags(), &mut notes(), &path, None);
+                    MOVED.lock().unwrap().push((path.clone(), None));
+                    crate::log::write(&format!("Auto-cleanup moved {} to the Recycle Bin.", path.display()));
+                }
                 Err(e) => {
                     crate::log::write(&format!("Auto-cleanup left {} alone: {e:#}", path.display()));
                     skipped.insert(path);
@@ -371,13 +512,20 @@ pub fn inside(dir: &str, folder: &str) -> bool {
     lower(dir).starts_with(lower(folder))
 }
 
-static ARCHIVE: Mutex<Option<(String, Archive)>> = Mutex::new(None);
-/// Clips the archive moved (old, new), for the window to carry stars and tags over in its own
-/// copy. Reloading the files instead could lose a star or tag set while the archive was writing.
-static ARCHIVED: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+/// The clips in the archive folder and its game folders, newest first; None if it isn't there
+/// (the drive or NAS is off).
+pub fn archived(dir: &Path) -> Option<Vec<Clip>> {
+    dir.is_dir().then(|| list(&dir.to_string_lossy(), usize::MAX))
+}
 
-pub fn take_archived() -> Vec<(PathBuf, PathBuf)> {
-    std::mem::take(&mut ARCHIVED.lock().unwrap())
+static ARCHIVE: Mutex<Option<(String, Archive)>> = Mutex::new(None);
+/// Clips the archive moved (old, new) or auto-cleanup recycled (old, None), for the window to
+/// carry or drop stars, tags and notes in its own copy. Reloading the files instead could lose a
+/// star or tag set while the thread was writing.
+static MOVED: Mutex<Vec<(PathBuf, Option<PathBuf>)>> = Mutex::new(Vec::new());
+
+pub fn take_moved() -> Vec<(PathBuf, Option<PathBuf>)> {
+    std::mem::take(&mut MOVED.lock().unwrap())
 }
 /// Set while the archive folder wasn't there the last time it was looked for.
 pub static ARCHIVE_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -388,7 +536,7 @@ pub fn set_archive(folder: &str, rule: Option<Archive>) {
 }
 
 /// Every 5 minutes, moves what `archive_plan` picks into the archive's folder of the same name
-/// (VALORANT\x.mp4 to <archive>\VALORANT\x.mp4), with its star, tags and share link. If the
+/// (VALORANT\x.mp4 to <archive>\VALORANT\x.mp4), with its star, tags, note and share link. If the
 /// archive folder isn't there (a NAS that's off), waits for it, saying so in the log once.
 pub fn start_archive() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -407,12 +555,12 @@ pub fn start_archive() {
                 continue;
             }
             let dir = c.group.as_ref().map_or(rule.dir.clone(), |g| rule.dir.join(g));
-            match move_into(&c.path, &dir) {
+            match move_into(&c.path, &dir, "") {
                 Ok(new) => {
                     // Written here too, so it holds while the window is asleep in the tray. Read
                     // fresh: a copy to a NAS can take a while.
-                    moved(&mut favorites(), &mut tags(), &c.path, Some(&new));
-                    ARCHIVED.lock().unwrap().push((c.path.clone(), new.clone()));
+                    moved(&mut favorites(), &mut tags(), &mut notes(), &c.path, Some(&new));
+                    MOVED.lock().unwrap().push((c.path.clone(), Some(new.clone())));
                     crate::log::write(&format!("Archived {} to {}.", c.path.display(), new.display()));
                 }
                 Err(e) => {
@@ -420,52 +568,6 @@ pub fn start_archive() {
                     skipped.insert(c.path.clone());
                 }
             }
-        }
-    });
-}
-
-/// Copies clips tagged Cloud into `backup` (a OneDrive or Google Drive folder; its app uploads
-/// them), in their game folder (worked out from whichever of `roots` they're in), unless a file
-/// the same size is already there. Nothing in `backup` is ever removed. Returns how many were copied.
-pub fn backup_tagged(tags: &Tags, roots: &[PathBuf], backup: &Path) -> usize {
-    let mut copied = 0;
-    for path in tags.iter().filter(|(_, t)| t.iter().any(|t| is_cloud(t))).map(|(p, _)| Path::new(p)) {
-        let Ok(size) = std::fs::metadata(path).map(|m| m.len()) else { continue };
-        let rel = roots.iter().find_map(|r| path.strip_prefix(r).ok()).or(path.file_name().map(Path::new)).unwrap_or(path);
-        let dest = backup.join(rel);
-        if std::fs::metadata(&dest).is_ok_and(|m| m.len() == size) {
-            continue;
-        }
-        let made = dest.parent().map_or(Ok(()), std::fs::create_dir_all);
-        match made.and_then(|()| copy_checked(path, &dest)) {
-            Ok(()) => copied += 1,
-            Err(e) => crate::log::write(&format!("Couldn't back up {}: {e}", path.display())),
-        }
-    }
-    copied
-}
-
-/// The folders backed-up clips can be in (clips folder, archive), and the backup folder; None is off.
-static BACKUP: Mutex<Option<(Vec<PathBuf>, PathBuf)>> = Mutex::new(None);
-
-pub fn set_backup(rule: Option<(Vec<PathBuf>, PathBuf)>) {
-    *BACKUP.lock().unwrap() = rule;
-}
-
-/// Every 5 minutes, `backup_tagged`. A backup folder that can't be made is logged once.
-pub fn start_backup() {
-    let mut failed = false;
-    every(300, &BACKUP, move |(roots, dir)| {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            if !std::mem::replace(&mut failed, true) {
-                crate::log::write(&format!("Backup folder {} isn't available: {e}", dir.display()));
-            }
-            return;
-        }
-        failed = false;
-        let n = backup_tagged(&tags(), &roots, &dir);
-        if n > 0 {
-            crate::log::write(&format!("Backed up {n} clips to {}.", dir.display()));
         }
     });
 }
@@ -753,6 +855,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
+    /// A tagged clip renamed and moved into a game folder outside the app is found again by its
+    /// fingerprint, not by a clip the same size that only starts the same; an entry from before
+    /// fingerprints is left alone, and nothing outside the clips folder is looked for.
+    #[test]
+    fn refinds_moved_clips_by_fingerprint() {
+        let dir = std::env::temp_dir().join("instant-replay-refind");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("VALORANT")).unwrap();
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut other = body.clone();
+        *other.last_mut().unwrap() ^= 1;
+        let (a, old, elsewhere) = (dir.join("a.mp4"), dir.join("old.mp4"), Path::new(r"Q:\gone\x.mp4"));
+        std::fs::write(&a, &body).unwrap();
+        let key = |p: &Path| p.display().to_string();
+        let marked: std::collections::BTreeSet<String> = [key(&a), key(&old), key(elsewhere)].into();
+        let mut prints = Prints::new();
+        let scan = |prints: &mut Prints| {
+            let clips = list(&dir.to_string_lossy(), usize::MAX);
+            refind(&marked, prints, &clips.iter().collect::<Vec<_>>(), &[dir.as_path()])
+        };
+        // Listed and marked: gets a fingerprint. The old entry has none, so it stays as it is.
+        assert_eq!(scan(&mut prints), (vec![], true));
+        assert_eq!(prints.keys().collect::<Vec<_>>(), [&key(&a)]);
+        assert_eq!(scan(&mut prints), (vec![], false), "nothing new");
+        // Moved and renamed outside the app, next to a clip the same size that differs at the end.
+        let moved_to = dir.join(r"VALORANT\Ace on Ascent.mp4");
+        std::fs::rename(&a, &moved_to).unwrap();
+        std::fs::write(dir.join("decoy.mp4"), &other).unwrap();
+        prints.insert(key(elsewhere), prints[&key(&a)].clone());
+        assert_eq!(scan(&mut prints), (vec![(a.clone(), moved_to.clone())], true));
+        assert!(prints.contains_key(&key(&moved_to)) && !prints.contains_key(&key(&a)));
+        assert!(prints.contains_key(&key(elsewhere)), "outside the clips folder: not looked for");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Notes save and load (in a temp file, not the real notes.json), stay one line and short, and
+    /// a noted clip renamed outside the app is found again by its fingerprint and keeps its note.
+    #[test]
+    fn notes_store_and_follow_a_refind() {
+        let dir = std::env::temp_dir().join("instant-replay-notes");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.json");
+        let (a, b) = (dir.join("a.mp4"), dir.join("b.mp4"));
+        let mut n = Notes::new();
+        set_note(&mut n, &a, "  Clutch 1v4\non B site  ");
+        set_note(&mut n, &b, &"x".repeat(300));
+        assert_eq!(n[&a.display().to_string()], "Clutch 1v4 on B site");
+        assert_eq!(n[&b.display().to_string()].chars().count(), NOTE_MAX);
+        set_note(&mut n, &b, "   ");
+        assert!(!n.contains_key(&b.display().to_string()), "an empty note takes it off");
+        assert_eq!(read_notes(&file), Notes::new(), "no file yet: no notes (as on an older install)");
+        write_notes(&file, &n);
+        assert_eq!(read_notes(&file), n);
+        // Renamed outside the app: found by its fingerprint, and the note goes with it.
+        std::fs::write(&a, (0..100_000u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>()).unwrap();
+        let marked: std::collections::BTreeSet<String> = n.keys().cloned().collect();
+        let mut prints = Prints::new();
+        let scan = |prints: &mut Prints| {
+            let clips = list(&dir.to_string_lossy(), usize::MAX);
+            refind(&marked, prints, &clips.iter().collect::<Vec<_>>(), &[dir.as_path()])
+        };
+        scan(&mut prints);
+        let to = dir.join("Ace on Ascent.mp4");
+        std::fs::rename(&a, &to).unwrap();
+        let (moves, _) = scan(&mut prints);
+        assert_eq!(moves, vec![(a.clone(), to.clone())]);
+        for (old, new) in &moves {
+            assert!(move_note(&mut n, old, Some(new)));
+        }
+        assert_eq!(n[&to.display().to_string()], "Clutch 1v4 on B site");
+        assert!(move_note(&mut n, &to, None) && n.is_empty(), "recycled: the note goes");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Puts a small file in the real Recycle Bin, so it only runs when asked (--ignored).
     #[test]
     #[ignore]
@@ -835,49 +1012,35 @@ mod tests {
         let clip = from.join(r"VALORANT\x.mp4");
         std::fs::write(&clip, b"clip").unwrap();
         std::fs::write(to.join(r"VALORANT\x.mp4"), b"older").unwrap();
-        let new = move_into(&clip, &to.join("VALORANT")).unwrap();
+        let new = move_into(&clip, &to.join("VALORANT"), "").unwrap();
         assert_eq!(new, to.join(r"VALORANT\x (2).mp4"));
         assert_eq!(std::fs::read(&new).unwrap(), b"clip");
         assert_eq!(std::fs::read(to.join(r"VALORANT\x.mp4")).unwrap(), b"older");
         assert!(!clip.exists() && !to.join(r"VALORANT\x (2).mp4.part").exists());
+        // The Archive view lists both, in their game folder; a folder that isn't there is offline.
+        let shown = archived(&to).unwrap();
+        assert!(shown.len() == 2 && shown.iter().all(|c| c.group.as_deref() == Some("VALORANT")));
+        assert!(archived(&to.join("not plugged in")).is_none());
         for d in [&from, &to] {
             std::fs::remove_dir_all(d).unwrap();
         }
     }
 
-    /// Clips tagged Cloud (any case) are copied once into their game folder; a changed one is
-    /// copied again, others (even with another tag) aren't, and nothing in the backup is removed.
+    /// A new clip gets the game in front of its name, also when it stays in the same folder.
     #[test]
-    fn backup_copies_tagged() {
-        let (clips, backup) = (std::env::temp_dir().join("instant-replay-backup-clips"), std::env::temp_dir().join("instant-replay-backup-to"));
-        for d in [&clips, &backup] {
-            let _ = std::fs::remove_dir_all(d);
-        }
-        std::fs::create_dir_all(clips.join("VALORANT")).unwrap();
-        let (a, b, c) = (clips.join(r"VALORANT\a.mp4"), clips.join("b.mp4"), clips.join("c.mp4"));
-        for f in [&a, &b, &c] {
-            std::fs::write(f, b"clip").unwrap();
-        }
-        std::fs::create_dir_all(&backup).unwrap();
-        std::fs::write(backup.join("old.mp4"), b"x").unwrap();
-        let mut tags = Tags::new();
-        set_tag(&mut tags, &a, "cloud", true);
-        set_tag(&mut tags, &b, CLOUD, true);
-        set_tag(&mut tags, &c, "Aces", true);
-        let roots = [clips.clone()];
-        assert_eq!(backup_tagged(&tags, &roots, &backup), 2);
-        assert_eq!(std::fs::read(backup.join(r"VALORANT\a.mp4")).unwrap(), b"clip");
-        assert!(backup.join("b.mp4").exists() && !backup.join("c.mp4").exists());
-        assert_eq!(backup_tagged(&tags, &roots, &backup), 0, "already there");
-        std::fs::write(&b, b"longer clip").unwrap();
-        assert_eq!(backup_tagged(&tags, &roots, &backup), 1);
-        assert_eq!(std::fs::read(backup.join("b.mp4")).unwrap(), b"longer clip");
-        std::fs::remove_file(&a).unwrap();
-        assert_eq!(backup_tagged(&tags, &roots, &backup), 0);
-        assert!(backup.join(r"VALORANT\a.mp4").exists() && backup.join("old.mp4").exists());
-        for d in [&clips, &backup] {
-            std::fs::remove_dir_all(d).unwrap();
-        }
+    fn saved_clip_gets_game_name() {
+        let dir = std::env::temp_dir().join("instant-replay-game-name");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("2026-11-07 21-40-00.mp4");
+        std::fs::write(&clip, b"clip").unwrap();
+        let new = move_into(&clip, &dir, "VALORANT").unwrap();
+        assert_eq!(new, dir.join("VALORANT 2026-11-07 21-40-00.mp4"));
+        assert!(!clip.exists());
+        let sorted = dir.join("2026-11-07 21-41-00.mp4");
+        std::fs::write(&sorted, b"clip").unwrap();
+        assert_eq!(move_into(&sorted, &dir.join("VALORANT"), "VALORANT").unwrap(), dir.join(r"VALORANT\VALORANT 2026-11-07 21-41-00.mp4"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

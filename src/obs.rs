@@ -31,16 +31,18 @@ fn clips_folder() -> std::path::PathBuf {
     std::path::PathBuf::from(FOLDER.lock().unwrap().clone())
 }
 
-/// Where a new clip or screenshot belongs: the game's folder when sorting, else the clips folder.
-fn destination() -> std::path::PathBuf {
+/// Where a new clip or screenshot from `game` belongs: its folder when sorting, else the clips folder.
+fn destination(game: &str) -> std::path::PathBuf {
     let root = clips_folder();
-    if SORT_BY_GAME.load(Ordering::Relaxed) { root.join(clips::game_folder_name()) } else { root }
+    if SORT_BY_GAME.load(Ordering::Relaxed) { root.join(game) } else { root }
 }
 
-/// Moves a just-saved file to where it belongs (a replay saved during a full recording lands in
-/// the Recordings folder at first). Keeps it where it is if the move fails.
+/// Moves a just-saved clip to where it belongs (the game's folder when sorting, else the clips
+/// folder; a replay saved during a full recording lands in the Recordings folder at first) and
+/// puts the game in front of its name. Keeps it where it is if the move fails.
 fn place(path: &std::path::Path) -> std::path::PathBuf {
-    match clips::move_into(path, &destination()) {
+    let game = clips::game_folder_name();
+    match clips::move_into(path, &destination(&game), &game) {
         Ok(p) => p,
         Err(e) => {
             log::write(&format!("Couldn't move {} into its folder: {e}", path.display()));
@@ -214,7 +216,7 @@ pub type Repaint = Arc<dyn Fn() + Send + Sync>;
 
 pub enum Cmd {
     /// Write the recorder config and (re)start the hidden OBS.
-    Start(Config),
+    Start(Box<Config>),
     /// Save the replay into the clips folder.
     Save,
     /// Save, then keep only the last this many seconds.
@@ -318,7 +320,7 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                     *FOLDER.lock().unwrap() = new_cfg.folder.clone();
                     recorder::restart(&new_cfg)?;
                     last_launch = Instant::now();
-                    cfg = Some(new_cfg);
+                    cfg = Some(*new_cfg);
                     (want_buffer, reported_stuck, reported_no_connect) = (true, false, false);
                     Ok(Some("Starting the recorder...".into()))
                 }
@@ -377,7 +379,7 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                 }
                 Some(Cmd::Screenshot) => {
                     let c = client.as_ref().ok_or_else(|| anyhow::anyhow!("The recorder is still starting"))?;
-                    let dir = destination();
+                    let dir = destination(&clips::game_folder_name());
                     std::fs::create_dir_all(&dir)?;
                     let path = dir.join(format!("Screenshot {}.png", clips::stamp(std::time::SystemTime::now())));
                     c.sources()
@@ -396,7 +398,7 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                 Some(Cmd::ToggleMic) => {
                     let c = client.as_ref().ok_or_else(|| anyhow::anyhow!("The recorder is still starting"))?;
                     let mics = c.inputs().list(Some("wasapi_input_capture")).await?;
-                    anyhow::ensure!(!mics.is_empty(), "No mic is being recorded (pick one in the Audio tab)");
+                    anyhow::ensure!(!mics.is_empty(), "No mic is being recorded (pick one on the Audio page)");
                     // All mics follow the first, so they never end up half muted.
                     let mute = !c.inputs().muted((&mics[0].id).into()).await?;
                     for m in &mics {
@@ -471,8 +473,8 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                             if want_buffer && !buffer && !reported_stuck && connected_at.elapsed() > Duration::from_secs(10) {
                                 reported_stuck = true;
                                 anyhow::bail!(match recorder::last_obs_error() {
-                                    Some(line) => format!("The replay buffer didn't start. OBS says: {line}"),
-                                    None => "The replay buffer didn't start. Check the OBS log.".into(),
+                                    Some(line) => format!("Instant replay didn't start. OBS says: {line}"),
+                                    None => "Instant replay didn't start. Check the OBS log.".into(),
                                 });
                             }
                             if let Some((asked, before)) = save_pending {
@@ -572,6 +574,61 @@ fn shorten(path: &std::path::Path, secs: u32) -> Option<String> {
     }
 }
 
+fn clip_saved(path: &std::path::Path, note: Option<String>, events: &Sender<Event>, repaint: &Repaint) {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    feedback("Clip saved", match &note { Some(n) => format!("{name} ({n})"), None => name }, Some(path));
+    let msg = match note {
+        Some(n) => format!("Clip saved ({n}): {}", path.display()),
+        None => format!("Clip saved: {}", path.display()),
+    };
+    log::write(&msg);
+    let _ = events.send(Event::Status(msg));
+    repaint();
+}
+
+/// Listens for saved clips, whether from OBS's own hotkey or the Save button, and shows the popup.
+fn watch_saves(password: String, events: Sender<Event>, repaint: Repaint) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        loop {
+            if let Ok(client) = Client::connect("127.0.0.1", recorder::PORT, Some(password.as_str())).await
+                && let Ok(mut stream) = client.events().map(Box::pin) {
+                let mut health = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    tokio::select! {
+                        ev = stream.next() => match ev {
+                            Some(obws::events::Event::ReplayBufferSaved { path }) => {
+                                SAVED.fetch_add(1, Ordering::Relaxed);
+                                if !is_our_clip(&path) {
+                                    log::write(&format!("Ignored a saved-clip report outside the clips folder: {}", path.display()));
+                                    continue;
+                                }
+                                with_session(|s| s.clips += 1);
+                                let short = SHORTEN.lock().unwrap().take().filter(|(_, at)| at.elapsed() < Duration::from_secs(20));
+                                let (events, repaint) = (events.clone(), repaint.clone());
+                                // Cutting takes a moment; don't hold up the event stream.
+                                std::thread::spawn(move || {
+                                    let note = short.map(|(secs, _)| shorten(&path, secs));
+                                    let path = place(&path);
+                                    clip_saved(&path, note.flatten(), &events, &repaint);
+                                });
+                            }
+                            Some(_) => {}
+                            None => break,
+                        },
+                        // The stream stays open after OBS goes away (e.g. a restart); notice and reconnect.
+                        _ = health.tick() => if client.general().version().await.is_err() { break },
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FOLLOW_DELAY, Follow, Frames};
@@ -628,60 +685,4 @@ mod tests {
         assert_eq!(super::shorten(&copy, 60), None);
         let _ = std::fs::remove_file(&copy);
     }
-}
-
-fn clip_saved(path: &std::path::Path, note: Option<String>, events: &Sender<Event>, repaint: &Repaint) {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    feedback("Clip saved", match &note { Some(n) => format!("{name} ({n})"), None => name }, Some(path));
-    let msg = match note {
-        Some(n) => format!("Clip saved ({n}): {}", path.display()),
-        None => format!("Clip saved: {}", path.display()),
-    };
-    log::write(&msg);
-    let _ = events.send(Event::Status(msg));
-    repaint();
-}
-
-/// Listens for saved clips, whether from OBS's own hotkey or the Save button, and shows the popup.
-fn watch_saves(password: String, events: Sender<Event>, repaint: Repaint) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(async move {
-        loop {
-            if let Ok(client) = Client::connect("127.0.0.1", recorder::PORT, Some(password.as_str())).await {
-                if let Ok(mut stream) = client.events().map(Box::pin) {
-                    let mut health = tokio::time::interval(Duration::from_secs(5));
-                    loop {
-                        tokio::select! {
-                            ev = stream.next() => match ev {
-                                Some(obws::events::Event::ReplayBufferSaved { path }) => {
-                                    SAVED.fetch_add(1, Ordering::Relaxed);
-                                    if !is_our_clip(&path) {
-                                        log::write(&format!("Ignored a saved-clip report outside the clips folder: {}", path.display()));
-                                        continue;
-                                    }
-                                    with_session(|s| s.clips += 1);
-                                    let short = SHORTEN.lock().unwrap().take().filter(|(_, at)| at.elapsed() < Duration::from_secs(20));
-                                    let (events, repaint) = (events.clone(), repaint.clone());
-                                    // Cutting takes a moment; don't hold up the event stream.
-                                    std::thread::spawn(move || {
-                                        let note = short.map(|(secs, _)| shorten(&path, secs));
-                                        let path = place(&path);
-                                        clip_saved(&path, note.flatten(), &events, &repaint);
-                                    });
-                                }
-                                Some(_) => {}
-                                None => break,
-                            },
-                            // The stream stays open after OBS goes away (e.g. a restart); notice and reconnect.
-                            _ = health.tick() => if client.general().version().await.is_err() { break },
-                        }
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
 }

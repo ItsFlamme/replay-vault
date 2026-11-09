@@ -16,14 +16,14 @@ fn dir() -> PathBuf {
     if cfg!(test) { std::env::temp_dir().join("instant-replay-covers-test") } else { crate::config::dir().join("covers") }
 }
 
-/// The game's cover once it's downloaded. Until then None, and it's looked up in the background
-/// (never in tests).
-pub fn get(game: &str) -> Option<PathBuf> {
+/// The game's cover once it's downloaded. Until then None, and, if `online`, it's looked up in
+/// the background (never in tests).
+pub fn get(game: &str, online: bool) -> Option<PathBuf> {
     let dir = dir();
     match state(&dir, game, SystemTime::now()) {
         State::Have(path) => Some(path),
         State::Missing => None,
-        State::Ask if cfg!(test) => None,
+        State::Ask if cfg!(test) || !online => None,
         State::Ask => {
             let fresh = ASKING.lock().unwrap().get_or_insert_default().insert(game.to_string());
             if fresh {
@@ -55,7 +55,48 @@ fn state(dir: &Path, game: &str, now: SystemTime) -> State {
     }
     let asked = std::fs::metadata(dir.join(format!("{game}.none"))).and_then(|m| m.modified()).ok();
     let recent = asked.is_some_and(|t| now.duration_since(t).unwrap_or_default() < Duration::from_secs(7 * 86_400));
-    if recent || game.eq_ignore_ascii_case("desktop") { State::Missing } else { State::Ask }
+    let not_game = !looks_like_game(game) || dir.join(format!("{game}.skip")).exists();
+    if recent || not_game || game.eq_ignore_ascii_case("desktop") { State::Missing } else { State::Ask }
+}
+
+/// Programs whose windows are in front often but are never games. Lower case.
+const NOT_GAMES: &[&str] = &[
+    "google chrome", "chrome", "mozilla firefox", "firefox", "microsoft edge", "edge", "opera", "opera gx", "brave", "vivaldi",
+    "file explorer", "explorer", "windows explorer", "program manager", "discord", "slack", "microsoft teams", "teams", "zoom",
+    "spotify", "steam", "notepad", "notepad++", "visual studio code", "visual studio", "cursor", "sublime text", "obsidian",
+    "word", "microsoft word", "excel", "microsoft excel", "powerpoint", "outlook", "settings", "task manager", "windows powershell",
+    "command prompt", "terminal", "windows terminal",
+];
+
+/// Whether a window title (or a game folder named after one) could be a game: not an email
+/// address, a link, a file name, a Discord channel or a known non-game program. Only names that
+/// pass are ever sent to Steam.
+pub fn looks_like_game(title: &str) -> bool {
+    let t = title.trim().to_lowercase();
+    if t.is_empty() || t.contains('@') || t.starts_with('#') || t.contains("://") || t.contains("www.") || (t.starts_with("http") && t.contains('.')) {
+        return false;
+    }
+    // "Notes.docx", "gmail.com": a dot then 2 to 5 letters or digits (one a letter) at the end of
+    // any part of the title.
+    let parts: Vec<&str> = [" - ", " | ", " \u{2014} ", ": "].iter().fold(vec![t.as_str()], |acc, sep| acc.iter().flat_map(|p| p.split(sep)).collect());
+    let file_like = |p: &str| {
+        p.trim().rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty() && (2..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) && ext.chars().any(|c| c.is_ascii_alphabetic())
+        })
+    };
+    !parts.iter().any(|p| file_like(p) || NOT_GAMES.contains(&p.trim()))
+}
+
+/// Remembers that the game folder `game` was named after a window that isn't a game (see
+/// `looks_like_game`), so it's never looked up; a later save from a game window by that name
+/// takes it back.
+pub fn note_title(game: &str, title: &str) {
+    let skip = dir().join(format!("{game}.skip"));
+    if looks_like_game(title) {
+        let _ = std::fs::remove_file(skip);
+    } else if !skip.exists() && std::fs::create_dir_all(dir()).is_ok() {
+        let _ = std::fs::write(skip, b"");
+    }
 }
 
 /// Looks the game up on Steam and saves its cover, or a `.none` marker when there's no exact match.
@@ -154,6 +195,43 @@ mod tests {
         let img = load(&dir.join("Elden Ring.jpg")).unwrap();
         assert_eq!(img.size, [600, 900]);
         assert!(dir.join("VALORANT.none").exists() && !dir.join("VALORANT.jpg").exists());
+    }
+
+    /// Only names that could be a game go to Steam.
+    #[test]
+    fn non_games_are_never_sent() {
+        for game in ["VALORANT", "Elden Ring", "Counter-Strike 2", "S.T.A.L.K.E.R. 2", "Mr. Shifty", "Tom Clancy's Rainbow Six® Siege", "Mount & Blade II", "v1.2"] {
+            assert!(looks_like_game(game), "{game}");
+        }
+        for not in [
+            "jose@gmail.com",
+            "Inbox (3) - jose@gmail.com - Gmail",
+            "https://example.com/page",
+            "httpsexample.compage",
+            "www.reddit.com",
+            "Divorce papers.docx",
+            "Divorce papers.docx - Word",
+            "notes.txt - Notepad",
+            "#private-channel",
+            "#private-channel | Server - Discord",
+            "Elden Ring wiki - Google Chrome",
+            "Downloads - File Explorer",
+            "main.rs - replay-vault - Visual Studio Code",
+            "Discord",
+            "Mozilla Firefox",
+            "",
+        ] {
+            assert!(!looks_like_game(not), "{not}");
+        }
+        let dir = std::env::temp_dir().join("instant-replay-covers-skip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        assert_eq!(state(&dir, "jose@gmail.com", now), State::Missing);
+        assert_eq!(state(&dir, "Inbox (3)", now), State::Ask);
+        std::fs::write(dir.join("Inbox (3).skip"), b"").unwrap();
+        assert_eq!(state(&dir, "Inbox (3)", now), State::Missing, "named after a browser tab: never asked");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A saved cover is used, a "no match" is trusted for a week, Desktop is never asked about.

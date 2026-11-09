@@ -115,6 +115,12 @@ fn text(w: &[u16]) -> String {
     String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())])
 }
 
+/// Voice chat for its own track: Discord, matched by its exe (window title and class are only
+/// what OBS falls back on).
+pub fn chat_app() -> AppSel {
+    AppSel { title: "Discord".into(), class: "Chrome_WidgetWin_1".into(), exe: "Discord.exe".into() }
+}
+
 /// The "window" setting of OBS's application audio capture: "title:class:exe", with '#' and ':'
 /// escaped the way OBS does.
 pub fn obs_window(app: &AppSel) -> String {

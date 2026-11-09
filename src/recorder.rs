@@ -1,5 +1,5 @@
-//! The hidden "recorder" OBS: a second, portable-mode copy of the user's OBS install with its
-//! own config folder, so the user's own OBS profile and scenes are never touched.
+//! The hidden "recorder" OBS: our private copy in portable mode with its own config folder, so
+//! the user's own OBS install, profile and scenes are never touched.
 
 use std::fs;
 use std::os::windows::process::CommandExt;
@@ -122,15 +122,14 @@ pub fn adapters() -> Vec<Adapter> {
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else { return out };
     let mut i = 0;
     while let Ok(adapter) = unsafe { factory.EnumAdapters1(i) } {
-        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-                out.push(Adapter {
-                    vendor: desc.VendorId,
-                    name: String::from_utf16_lossy(&desc.Description[..end]).trim().to_string(),
-                    vram_mb: desc.DedicatedVideoMemory as u64 / (1024 * 1024),
-                });
-            }
+        if let Ok(desc) = unsafe { adapter.GetDesc1() }
+            && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            out.push(Adapter {
+                vendor: desc.VendorId,
+                name: String::from_utf16_lossy(&desc.Description[..end]).trim().to_string(),
+                vram_mb: desc.DedicatedVideoMemory as u64 / (1024 * 1024),
+            });
         }
         i += 1;
     }
@@ -190,9 +189,14 @@ pub fn plan(cfg: &Config, mon: &Monitor) -> Plan {
     };
     let base = out_w as f64 * out_h as f64 * fps as f64 / 6_000.0;
     let kbps = ((base * quality * codec) as u64).clamp(8_000, 150_000);
-    // Video + 3 audio tracks for the whole clip, with headroom for VBR peaks.
-    let mb = (kbps + 192 * 3) * cfg.buffer_secs as u64 / 8 / 1000 * 5 / 4 + 64;
+    // Video + each audio track (192 kbps) for the whole clip, with headroom for VBR peaks.
+    let mb = (kbps + 192 * cfg.track_count.clamp(1, 6) as u64) * cfg.buffer_secs as u64 / 8 / 1000 * 5 / 4 + 64;
     Plan { base_w, base_h, out_w, out_h, fps, kbps, mb }
+}
+
+/// OBS's RecTracks: one bit per recorded audio track, tracks 1 to `count` (1 to 6).
+pub fn track_mask(count: u8) -> u32 {
+    (1u32 << count.clamp(1, 6)) - 1
 }
 
 /// "About 8.5 GB per hour of clips (144.4 MB for a full 1-minute replay)": the video bitrate
@@ -210,16 +214,11 @@ pub const NAME_STYLES: [(&str, &str); 2] = [
     ("%MM-%DD-%CCYY %I-%mm-%ss %p", "11-06-2026 06-42-33 PM"),
 ];
 
-/// The clip name prefix without characters Windows doesn't allow in file names.
-pub fn clean_prefix(s: &str) -> String {
-    s.chars().filter(|c| !r#"\/:*?"<>|"#.contains(*c) && !c.is_control()).collect::<String>().trim().to_string()
-}
-
-/// What a clip saved now would be called.
+/// What a clip saved in VALORANT now would be called. OBS names it by the date alone; the game
+/// goes in front when the clip is moved into place.
 pub fn example_name(cfg: &Config) -> String {
     let (_, date) = NAME_STYLES[(cfg.name_style as usize).min(NAME_STYLES.len() - 1)];
-    let prefix = clean_prefix(&cfg.clip_prefix);
-    if prefix.is_empty() { format!("{date}.mp4") } else { format!("{prefix} {date}.mp4") }
+    format!("VALORANT {date}.mp4")
 }
 
 pub fn write_config(cfg: &Config) -> anyhow::Result<()> {
@@ -256,6 +255,10 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
         fs::write(root.join(file), ini)?;
     }
 
+    // obs-websocket 5 (OBS 30 and 31) has no setting to listen on 127.0.0.1 only: its config.json
+    // holds only these keys, and its server always binds every interface (the one address option
+    // is --websocket_ipv4_only, which limits IPv4 vs IPv6, not the interface). So the random
+    // password and the inbound firewall rule (obs_install::add_firewall_rule) keep others out.
     let ws = json!({
         "alerts_enabled": false, "auth_required": true, "first_load": false,
         "server_enabled": true, "server_port": PORT, "server_password": cfg.recorder_password,
@@ -308,12 +311,11 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
         enc_settings["psycho_aq"] = json!(false);
     }
     let summary = format!("Encoder: {} ({encoder}), {out_w}x{out_h} at {fps} fps, {kbps} kbps.", gpu().label());
-    let mask = (1u32 << cfg.track_count) - 1;
+    let mask = track_mask(cfg.track_count);
     // OBS won't start the replay buffer if the clip folder is missing ("bad output path").
     fs::create_dir_all(&cfg.folder)?;
     let folder = cfg.folder.replace('\\', "/");
     let (name_format, _) = NAME_STYLES[(cfg.name_style as usize).min(NAME_STYLES.len() - 1)];
-    let prefix = clean_prefix(&cfg.clip_prefix);
     // HDR monitor: clips stay normal (SDR) video in Rec. 709, and OBS's display capture tone-maps
     // the HDR picture down. OBS's SDR white level set to Windows' own SDR brightness keeps the
     // desktop and SDR games as bright as on screen, not washed out or dim.
@@ -322,9 +324,9 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
         .unwrap_or_default();
     let basic = format!(
         "[General]\nName={NAME}\n\n[Output]\nMode=Advanced\nFilenameFormatting={name_format}\n\n\
-         [AdvOut]\nRecType=Standard\nRecFilePath={folder}\nRecFormat2=mp4\nRecEncoder={encoder}\nRecRBPrefix={prefix}\n\
+         [AdvOut]\nRecType=Standard\nRecFilePath={folder}\nRecFormat2=mp4\nRecEncoder={encoder}\nRecRBPrefix=\n\
          RecTracks={mask}\nRecRB=true\nRecRBTime={}\nRecRBSize={mb}\nRecAudioEncoder=ffmpeg_aac\n\
-         Track1Bitrate=192\nTrack2Bitrate=192\nTrack3Bitrate=192\n\n\
+         Track1Bitrate=192\nTrack2Bitrate=192\nTrack3Bitrate=192\nTrack4Bitrate=192\nTrack5Bitrate=192\nTrack6Bitrate=192\n\n\
          [Video]\nBaseCX={base_w}\nBaseCY={base_h}\nOutputCX={out_w}\nOutputCY={out_h}\nFPSType=1\nFPSInt={fps}\n{hdr}\n\
          [Audio]\nSampleRate=48000\nChannelSetup=Stereo\n",
         cfg.buffer_secs
@@ -361,8 +363,8 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
         }));
         items.push(json!({ "name": "Game", "visible": true }));
     }
-    let n = cfg.track_count as usize;
-    let unique = |items: &[serde_json::Value], mut name: String| {
+    let n = cfg.tracks();
+    let unique =|items: &[serde_json::Value], mut name: String| {
         while items.iter().any(|i| i["name"] == name.as_str()) {
             name.push('\''); // OBS source names must be unique
         }
@@ -410,6 +412,17 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
             }));
             items.push(json!({ "name": name, "visible": true }));
         }
+    }
+    // Voice chat on tracks of its own: Discord's sound alone, matched by its exe like the apps
+    // above. Track 1 has it already, from the playback devices.
+    let chat: u32 = (1..n).filter(|&i| cfg.chat_tracks[i]).map(|i| 1 << i).sum();
+    if chat != 0 {
+        let name = unique(&items, "Voice chat".to_string());
+        sources.push(json!({
+            "name": name, "id": "wasapi_process_output_capture", "versioned_id": "wasapi_process_output_capture",
+            "mixers": chat, "settings": { "window": crate::devices::obs_window(&crate::devices::chat_app()), "priority": 2 },
+        }));
+        items.push(json!({ "name": name, "visible": true }));
     }
     sources.insert(0, json!({
         "name": "Replay", "id": "scene", "versioned_id": "scene", "settings": { "items": items },
@@ -496,10 +509,9 @@ pub fn restart(cfg: &Config) -> anyhow::Result<()> {
     write_config(cfg)?;
     let exe = obs_exe()?;
     // Only for our private copy: the user's own OBS exe keeps whatever they chose for it.
-    if obs_install::is_private(&exe) {
-        if let Err(e) = crate::tweaks::set_gpu_high(&exe, cfg.gpu_high) {
-            log::write(&format!("Couldn't set the recorder's graphics preference: {e:#}"));
-        }
+    if obs_install::is_private(&exe)
+        && let Err(e) = crate::tweaks::set_gpu_high(&exe, cfg.gpu_high) {
+        log::write(&format!("Couldn't set the recorder's graphics preference: {e:#}"));
     }
     let child = Command::new(&exe)
         .args(["--portable", "--multi", "--minimize-to-tray", "--startreplaybuffer", "--disable-updater"])
@@ -558,7 +570,7 @@ mod tests {
     use crate::config::{AppSel, DeviceSel};
 
     fn test_monitor() -> Monitor {
-        Monitor { id: r"\\?\DISPLAY#TEST#1".into(), width: 2560, height: 1440, hz: 144, x: 0, y: 0, primary: true, hdr: None }
+        Monitor { id: r"\\?\DISPLAY#TEST#1".into(), width: 2560, height: 1440, hz: 144, x: 0, y: 0, primary: true, hdr: None, name: String::new() }
     }
 
     /// Writes the recorder files into a fresh temp folder (never the real OBS config) and
@@ -624,8 +636,8 @@ mod tests {
     #[test]
     fn only_these_apps_replaces_desktop_audio() {
         let mut cfg = Config { track_count: 3, ..Config::default() };
-        cfg.devices.insert("out:default".into(), DeviceSel { name: "Default playback device".into(), tracks: [true, true, false] });
-        cfg.devices.insert("in:default".into(), DeviceSel { name: "Default microphone".into(), tracks: [true, false, true] });
+        cfg.devices.insert("out:default".into(), DeviceSel { name: "Default playback device".into(), tracks: [true, true, false, false, false, false] });
+        cfg.devices.insert("in:default".into(), DeviceSel { name: "Default microphone".into(), tracks: [true, false, true, false, false, false] });
         let (_, scene) = written("desktop", &mut cfg, &test_monitor());
         assert_eq!(source(&scene, "wasapi_output_capture").len(), 1);
         assert!(source(&scene, "wasapi_process_output_capture").is_empty());
@@ -647,6 +659,41 @@ mod tests {
         assert_eq!(source(&scene, "wasapi_input_capture")[0]["mixers"], 0b101);
         let items = scene["sources"][0]["settings"]["items"].as_array().unwrap();
         assert!(items.iter().any(|i| i["name"] == "VALORANT-Win64-Shipping"));
+    }
+
+    /// RecTracks has one bit per track, 1 to 6, and a hand-edited count can't overflow it.
+    #[test]
+    fn track_bitmask() {
+        assert_eq!([1, 2, 3, 4, 5, 6].map(track_mask), [0b1, 0b11, 0b111, 0b1111, 0b1_1111, 0b11_1111]);
+        assert_eq!((track_mask(0), track_mask(200)), (0b1, 0b11_1111));
+    }
+
+    /// Six tracks: RecTracks covers them all with a bitrate each, each source's mixers are its
+    /// ticked tracks, voice chat gets its own capture on its tracks only (never track 1), and
+    /// the memory estimate grows by a track's 192 kbps.
+    #[test]
+    fn six_tracks_and_voice_chat() {
+        let mut cfg = Config { track_count: 6, ..Config::default() };
+        cfg.devices.insert("out:default".into(), DeviceSel { name: "Default playback device".into(), tracks: [true, true, false, false, true, false] });
+        cfg.devices.insert("in:default".into(), DeviceSel { name: "Default microphone".into(), tracks: [true, false, true, false, false, true] });
+        cfg.chat_tracks = [true, false, false, true, false, false];
+        let (basic, scene) = written("six", &mut cfg, &test_monitor());
+        assert!(basic.contains("\nRecTracks=63\n"), "{basic}");
+        assert!(basic.contains("\nTrack6Bitrate=192\n"));
+        assert_eq!(source(&scene, "wasapi_output_capture")[0]["mixers"], 0b01_0011);
+        assert_eq!(source(&scene, "wasapi_input_capture")[0]["mixers"], 0b10_0101);
+        let chat = source(&scene, "wasapi_process_output_capture");
+        assert_eq!((chat.len(), chat[0]["name"].as_str()), (1, Some("Voice chat")));
+        assert_eq!(chat[0]["mixers"], 0b00_1000, "track 4 only, not track 1");
+        assert!(chat[0]["settings"]["window"].as_str().unwrap().ends_with(":Discord.exe"));
+        // Ticks past the track count aren't recorded, and no chat track means no chat capture.
+        cfg.track_count = 3;
+        let (basic, scene) = written("three", &mut cfg, &test_monitor());
+        assert!(basic.contains("\nRecTracks=7\n"));
+        assert_eq!(source(&scene, "wasapi_input_capture")[0]["mixers"], 0b101);
+        assert!(source(&scene, "wasapi_process_output_capture").is_empty());
+        let mb = |t: u8| plan(&Config { track_count: t, buffer_secs: 300, ..Config::default() }, &test_monitor()).mb;
+        assert!((7..=10).contains(&(mb(2) - mb(1))), "about 7 MB per track for 5 minutes, with headroom: {}", mb(2) - mb(1));
     }
 
     #[test]

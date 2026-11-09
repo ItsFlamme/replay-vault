@@ -1,6 +1,6 @@
 //! Finding an OBS the recorder can use, or downloading a private portable copy of the official
-//! release (github.com/obsproject/obs-studio) and keeping that copy up to date. The user's own
-//! OBS install is used when its folder is writable, and is never updated or changed by this app.
+//! release (github.com/obsproject/obs-studio) and keeping that copy up to date. The recorder only
+//! ever runs that private copy; the user's own OBS install is never run, updated or changed.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use crate::{recorder, startup};
+use crate::recorder;
 
 const RELEASES: &str = "https://api.github.com/repos/obsproject/obs-studio/releases/latest";
 const VC_REDIST: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
@@ -38,6 +38,173 @@ pub fn install_root() -> PathBuf {
     INSTALL_ROOT.read().unwrap().clone().unwrap_or_else(base)
 }
 
+/// Makes sure only this Windows account, SYSTEM and Administrators can change the install folder
+/// (and everything in it), since this app runs the programs in it. A folder made on a second
+/// drive takes that drive's permissions, which on Windows let every signed-in account change it;
+/// those are replaced, here and in every file under it. Returns what was wrong if anything was
+/// fixed; an error if it can't be made private (another account owns it, or the drive has no
+/// permissions at all, like FAT32).
+pub fn secure_install_root() -> anyhow::Result<Option<String>> {
+    secure_dir(&install_root())
+}
+
+fn secure_dir(dir: &Path) -> anyhow::Result<Option<String>> {
+    let trusted = trusted_sids()?;
+    let Some(problem) = acl_problem(dir, &trusted)? else { return Ok(None) };
+    // Only inheriting from a private folder above (like a new folder in the user's profile) is
+    // harmless. If another account could get in, it could have planted programs, and a file it
+    // owns stays changeable by it whatever the permissions say.
+    // Every file and folder counts: one with its own open permissions inside a private folder
+    // would let another account in just the same.
+    let exposed = tree_exposed(dir, &trusted);
+    set_dacl(dir, &format!("D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", trusted[0]), true)?;
+    if let Some(still) = acl_problem(dir, &trusted)? {
+        anyhow::bail!("{} can't be kept private: {still}", dir.display());
+    }
+    if !exposed {
+        return Ok(Some(problem));
+    }
+    // So nothing in it is run again: the OBS copy is downloaded and checked afresh.
+    for name in ["obs-studio", "obs-studio.update", "obs-studio.old", "obs-download.zip"] {
+        let p = dir.join(name);
+        let r = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
+        if let Err(e) = r
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            anyhow::bail!("couldn't remove {} after other accounts could change it: {e}", p.display());
+        }
+    }
+    Ok(Some(format!("{problem}; removed the OBS copy in it, so it's downloaded again")))
+}
+
+/// Whether another account owns, or may get into, `path` or anything under it. Anything that can't
+/// be read counts as exposed.
+fn tree_exposed(path: &Path, trusted: &[String]) -> bool {
+    let open = read_acl(path).map_or(true, |acl| {
+        acl.is_none_or(|(owner, _, aces)| !trusted.contains(&owner) || aces.iter().any(|(allowed, sid)| *allowed != Some(false) && !trusted.contains(sid)))
+    });
+    open || (path.is_dir() && fs::read_dir(path).map_or(true, |items| items.flatten().any(|e| tree_exposed(&e.path(), trusted))))
+}
+
+/// This user's SID, then SYSTEM and Administrators.
+fn trusted_sids() -> anyhow::Result<[String; 3]> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // u64s, so the TOKEN_USER in it is aligned.
+    let mut buf = [0u64; 64];
+    let mut len = 0u32;
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+        let r = GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), size_of_val(&buf) as u32, &mut len);
+        let _ = CloseHandle(token);
+        r?;
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        Ok([sid_string(user.User.Sid)?, "S-1-5-18".into(), "S-1-5-32-544".into()])
+    }
+}
+
+/// "S-1-5-21-...".
+unsafe fn sid_string(sid: windows::Win32::Security::PSID) -> anyhow::Result<String> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    let mut s = windows::core::PWSTR::null();
+    unsafe {
+        windows::Win32::Security::Authorization::ConvertSidToStringSidW(sid, &mut s)?;
+        let out = s.to_string();
+        LocalFree(Some(HLOCAL(s.0.cast())));
+        Ok(out?)
+    }
+}
+
+/// The folder's owner, whether it ignores the permissions of the folder above, and its permission
+/// entries as (allowed, SID); allowed is false for a deny entry and None for any other kind.
+/// None when the drive keeps no permissions.
+type Acl = (String, bool, Vec<(Option<bool>, String)>);
+
+fn read_acl(path: &Path) -> anyhow::Result<Option<Acl>> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED,
+    };
+    let (mut owner, mut dacl, mut sd) = (PSID::default(), std::ptr::null_mut::<ACL>(), PSECURITY_DESCRIPTOR::default());
+    let name = windows::core::HSTRING::from(path.as_os_str());
+    unsafe {
+        GetNamedSecurityInfoW(&name, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, Some(&mut owner), None, Some(&mut dacl), None, &mut sd)
+            .ok()
+            .map_err(|e| anyhow::anyhow!("couldn't read the permissions of {}: {}", path.display(), e.message()))?;
+        let read = || -> anyhow::Result<Option<Acl>> {
+            if dacl.is_null() || owner.is_invalid() {
+                return Ok(None);
+            }
+            let (mut control, mut rev) = (0u16, 0u32);
+            GetSecurityDescriptorControl(sd, &mut control, &mut rev)?;
+            let mut aces = Vec::new();
+            for i in 0..(*dacl).AceCount as u32 {
+                let mut ace = std::ptr::null_mut();
+                GetAce(dacl, i, &mut ace)?;
+                let kind = (*(ace as *const ACE_HEADER)).AceType;
+                // Allowed (0) and denied (1) entries have the same layout, the SID at SidStart.
+                let sid = PSID((&raw const (*(ace as *const ACCESS_ALLOWED_ACE)).SidStart).cast_mut().cast());
+                aces.push(match kind {
+                    0 | 1 => (Some(kind == 0), sid_string(sid)?),
+                    _ => (None, String::new()),
+                });
+            }
+            Ok(Some((sid_string(owner)?, control & SE_DACL_PROTECTED.0 != 0, aces)))
+        };
+        let r = read();
+        LocalFree(Some(HLOCAL(sd.0)));
+        r
+    }
+}
+
+/// What's wrong with `dir` for holding programs this app runs, or None when it's private.
+fn acl_problem(dir: &Path, trusted: &[String]) -> anyhow::Result<Option<String>> {
+    let Some((owner, protected, aces)) = read_acl(dir)? else { return Ok(Some("the drive keeps no permissions (not NTFS?)".into())) };
+    if !trusted.contains(&owner) {
+        return Ok(Some(format!("it belongs to another account ({owner})")));
+    }
+    if !protected {
+        return Ok(Some("it takes its permissions from the folder above".into()));
+    }
+    Ok(aces.iter().find_map(|(allowed, sid)| match allowed {
+        Some(false) => None,
+        Some(true) if trusted.contains(sid) => None,
+        Some(true) => Some(format!("{sid} can get in")),
+        None => Some("it has an unusual permission entry".into()),
+    }))
+}
+
+/// Sets `dir`'s permissions from SDDL; `tree` also resets everything under it to inherit them.
+fn set_dacl(dir: &Path, sddl: &str, tree: bool) -> anyhow::Result<()> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, ProgressInvokeNever, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW, TREE_SEC_INFO_RESET,
+        TreeSetNamedSecurityInfoW,
+    };
+    use windows::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let name = windows::core::HSTRING::from(dir.as_os_str());
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(&windows::core::HSTRING::from(sddl), SDDL_REVISION_1, &mut sd, None)?;
+        let (mut present, mut defaulted, mut dacl) = (Default::default(), Default::default(), std::ptr::null_mut::<ACL>());
+        let r = GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).map_err(anyhow::Error::from).and_then(|()| {
+            let info = if sddl.starts_with("D:P") { DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION } else { DACL_SECURITY_INFORMATION };
+            let err = if tree {
+                TreeSetNamedSecurityInfoW(&name, SE_FILE_OBJECT, info, None, None, Some(dacl), None, TREE_SEC_INFO_RESET, None, ProgressInvokeNever, None)
+            } else {
+                SetNamedSecurityInfoW(&name, SE_FILE_OBJECT, info, None, None, Some(dacl), None)
+            };
+            err.ok().map_err(|e| anyhow::anyhow!("couldn't set the permissions of {}: {}", dir.display(), e.message()))
+        });
+        LocalFree(Some(HLOCAL(sd.0)));
+        r
+    }
+}
+
 /// Our private copy, and where a downloaded update waits until the next start.
 pub fn private_dir() -> PathBuf {
     install_root().join("obs-studio")
@@ -47,12 +214,17 @@ fn staged_dir() -> PathBuf {
     install_root().join("obs-studio.update")
 }
 
+/// When the update check last ran; next to the private copy, so its folder is known to exist.
+fn update_stamp() -> PathBuf {
+    install_root().join("last-update-check")
+}
+
 fn exe_in(dir: &Path) -> PathBuf {
     dir.join(r"bin\64bit\obs64.exe")
 }
 
 /// The install folder of an OBS that runs in portable mode (OBS checks for these marker files
-/// there), whose own settings then live in `<install>\config` — where the recorder writes.
+/// there), whose own settings then live in `<install>\config`, where the recorder writes.
 pub fn portable_install_root(exe: &Path) -> Option<PathBuf> {
     let root = exe.ancestors().nth(3)?;
     ["portable_mode", "obs_portable_mode", "portable_mode.txt", "obs_portable_mode.txt"]
@@ -61,28 +233,15 @@ pub fn portable_install_root(exe: &Path) -> Option<PathBuf> {
         .then(|| root.to_path_buf())
 }
 
-/// The OBS the recorder runs: the user's install if the recorder can keep its config next to it,
-/// else our private copy. A portable-mode install is never used: its own settings live in the
-/// same folder the recorder rewrites on every start.
+/// The OBS the recorder runs: always our private copy. The user's own OBS install is never run
+/// and nothing is ever written into its folder or its settings, so it can't be harmed.
 pub fn find() -> Option<PathBuf> {
-    if let Some(exe) = startup::obs_exe().filter(|e| writable(e) && portable_install_root(e).is_none()) {
-        return Some(exe);
-    }
     let exe = exe_in(&private_dir());
     exe.exists().then_some(exe)
 }
 
 pub fn is_private(exe: &Path) -> bool {
     exe.starts_with(private_dir())
-}
-
-/// Program Files installs aren't writable without admin, so the recorder can't use them.
-fn writable(exe: &Path) -> bool {
-    let root = recorder::portable_root(exe);
-    let probe = root.join(".write-test");
-    let ok = fs::create_dir_all(&root).is_ok() && fs::write(&probe, b"").is_ok();
-    let _ = fs::remove_file(probe);
-    ok
 }
 
 /// OBS needs Microsoft's Visual C++ runtime, which the portable zip doesn't include.
@@ -143,7 +302,7 @@ struct Release {
 }
 
 /// GET with timeouts, so a dead connection fails with a message instead of hanging setup forever.
-/// ody caps the whole download (the OBS zip gets long enough for slow links).
+/// `body` caps the whole download (the OBS zip gets long enough for slow links).
 fn get(url: &str, body: Duration) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
     ureq::get(url)
         .header("User-Agent", AGENT)
@@ -182,11 +341,20 @@ fn latest_release() -> anyhow::Result<Release> {
 fn fetch(rel: &Release, dest: &Path, p: &Shared) -> anyhow::Result<()> {
     // Downloaded next to the install, so a chosen drive also takes the 225 MB zip.
     fs::create_dir_all(install_root())?;
+    if let Some(fixed) = secure_install_root()? {
+        crate::log::write(&format!("Made the private OBS folder {} private to this account ({fixed}).", install_root().display()));
+    }
     let zip_path = install_root().join("obs-download.zip");
+    // Kept open from download to unpacking, and no one else may write to it meanwhile, so what's
+    // unpacked is exactly the bytes whose checksum was checked.
+    let mut file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        File::options().read(true).write(true).create(true).truncate(true).share_mode(FILE_SHARE_READ).open(&zip_path)?
+    };
     {
         let mut resp = get(&rel.url, Duration::from_secs(2 * 3600))?;
         let mut reader = resp.body_mut().as_reader();
-        let mut file = File::create(&zip_path)?;
         let mut hash = Sha256::new();
         let mut buf = vec![0u8; 256 * 1024];
         let mut done = 0u64;
@@ -202,6 +370,7 @@ fn fetch(rel: &Release, dest: &Path, p: &Shared) -> anyhow::Result<()> {
         }
         let got: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
         if got != rel.sha256 {
+            drop(file);
             let _ = fs::remove_file(&zip_path);
             anyhow::bail!("the OBS download didn't match its published checksum, so it was thrown away");
         }
@@ -209,7 +378,8 @@ fn fetch(rel: &Release, dest: &Path, p: &Shared) -> anyhow::Result<()> {
 
     let tmp = dest.with_extension("partial");
     let _ = fs::remove_dir_all(&tmp);
-    let mut zip = zip::ZipArchive::new(File::open(&zip_path)?)?;
+    io::Seek::rewind(&mut file)?;
+    let mut zip = zip::ZipArchive::new(file)?;
     let total = zip.len() as u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
@@ -227,48 +397,54 @@ fn fetch(rel: &Release, dest: &Path, p: &Shared) -> anyhow::Result<()> {
     fs::write(tmp.join("version.txt"), &rel.version)?;
     let _ = fs::remove_dir_all(dest);
     fs::rename(&tmp, dest)?;
+    drop(zip);
     let _ = fs::remove_file(&zip_path);
     Ok(())
 }
 
-/// First install of the private copy.
-pub fn install(repaint: impl Fn() + Send + 'static) -> Shared {
+/// Everything setup needs in one go: the VC++ runtime if missing, the private OBS copy if there's
+/// no OBS yet, and, if `firewall`, the rule that blocks incoming connections to our copy.
+pub fn install(firewall: bool, repaint: impl Fn() + Send + 'static) -> Shared {
     spawn(
-        |p| {
-            set(p, "Finding the latest OBS", 0, 0);
-            let rel = latest_release().map_err(|e| anyhow::anyhow!("{e:#}. Check your internet connection"))?;
-            fetch(&rel, &private_dir(), p)
+        move |p| {
+            if !has_vc_runtime() {
+                vc_runtime(p)?;
+            }
+            if find().is_none() {
+                set(p, "Finding the latest OBS", 0, 0);
+                let rel = latest_release().map_err(|e| anyhow::anyhow!("{e:#}. Check your internet connection"))?;
+                fetch(&rel, &private_dir(), p)?;
+            }
+            if let Some(exe) = find().filter(|e| firewall && is_private(e) && !firewall_rule_exists()) {
+                firewall_rule(exe, p)?;
+            }
+            Ok(())
         },
         repaint,
     )
 }
 
 /// Downloads and runs Microsoft's VC++ runtime installer; Windows asks the user for permission.
-pub fn install_vc_runtime(repaint: impl Fn() + Send + 'static) -> Shared {
-    spawn(
-        |p| {
-            set(p, "Downloading the Visual C++ runtime", 0, 0);
-            // A new folder each time, so nothing can be swapped in at a known path before it runs.
-            let dir = base().join(format!("vc-{}", crate::config::random_hex()));
-            fs::create_dir_all(&dir)?;
-            let path = dir.join("vc_redist.x64.exe");
-            let mut resp = get(VC_REDIST, Duration::from_secs(30 * 60))?;
-            io::copy(&mut resp.body_mut().as_reader(), &mut File::create(&path)?)?;
-            if !signed_by_microsoft(&path) {
-                let _ = fs::remove_dir_all(&dir);
-                anyhow::bail!("the downloaded Visual C++ installer isn't signed by Microsoft, so it wasn't run");
-            }
-            set(p, "Installing the Visual C++ runtime", 0, 0);
-            let status = Command::new(&path).args(["/install", "/passive", "/norestart"]).status()?;
-            let _ = fs::remove_dir_all(&dir);
-            // 3010 = installed, restart recommended; the DLLs are usable right away.
-            if !status.success() && status.code() != Some(3010) && !has_vc_runtime() {
-                anyhow::bail!("the Visual C++ runtime installer didn't finish (code {:?})", status.code());
-            }
-            Ok(())
-        },
-        repaint,
-    )
+fn vc_runtime(p: &Shared) -> anyhow::Result<()> {
+    set(p, "Downloading the Visual C++ runtime", 0, 0);
+    // A new folder each time, so nothing can be swapped in at a known path before it runs.
+    let dir = base().join(format!("vc-{}", crate::config::random_hex()));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("vc_redist.x64.exe");
+    let mut resp = get(VC_REDIST, Duration::from_secs(30 * 60))?;
+    io::copy(&mut resp.body_mut().as_reader(), &mut File::create(&path)?)?;
+    if !signed_by_microsoft(&path) {
+        let _ = fs::remove_dir_all(&dir);
+        anyhow::bail!("the downloaded Visual C++ installer isn't signed by Microsoft, so it wasn't run");
+    }
+    set(p, "Installing the Visual C++ runtime", 0, 0);
+    let status = Command::new(&path).args(["/install", "/passive", "/norestart"]).status()?;
+    let _ = fs::remove_dir_all(&dir);
+    // 3010 = installed, restart recommended; the DLLs are usable right away.
+    if !status.success() && status.code() != Some(3010) && !has_vc_runtime() {
+        anyhow::bail!("the Visual C++ runtime installer didn't finish (code {:?})", status.code());
+    }
+    Ok(())
 }
 
 /// Whether Windows says `path` has a valid signature from Microsoft Corporation, issued by
@@ -306,25 +482,25 @@ fn rule_exists(name: &str) -> bool {
 
 /// OBS's WebSocket listens on every network interface and can't be limited to this PC, so a
 /// fresh copy makes Windows Firewall ask about it. Blocking inbound network traffic for our
-/// private copy stops that prompt and keeps it off the network; the app's own connection stays
-/// on this PC, which the firewall doesn't filter. Windows asks for permission (UAC).
+/// private copy stops that prompt and keeps other devices from connecting to it (outgoing
+/// traffic isn't blocked); the app's own connection stays on this PC, which the firewall
+/// doesn't filter. Windows asks for permission (UAC).
 pub fn add_firewall_rule(exe: PathBuf, repaint: impl Fn() + Send + 'static) -> Shared {
-    spawn(
-        move |p| {
-            set(p, "Waiting for Windows to allow the firewall rule", 0, 0);
-            let args = format!(
-                "advfirewall firewall add rule name=\"{FIREWALL_RULE}\" dir=in action=block enable=yes profile=any program=\"{}\"",
-                exe.display()
-            );
-            let code = run_elevated(&crate::recorder::windows_exe("netsh.exe"), &args)?;
-            if code != 0 || !firewall_rule_exists() {
-                anyhow::bail!("the firewall rule wasn't added (netsh code {code})");
-            }
-            crate::log::write("Added a firewall rule blocking network access to the private OBS copy.");
-            Ok(())
-        },
-        repaint,
-    )
+    spawn(move |p| firewall_rule(exe, p), repaint)
+}
+
+fn firewall_rule(exe: PathBuf, p: &Shared) -> anyhow::Result<()> {
+    set(p, "Waiting for Windows to allow the firewall rule", 0, 0);
+    let args = format!(
+        "advfirewall firewall add rule name=\"{FIREWALL_RULE}\" dir=in action=block enable=yes profile=any program=\"{}\"",
+        exe.display()
+    );
+    let code = run_elevated(&crate::recorder::windows_exe("netsh.exe"), &args)?;
+    if code != 0 || !firewall_rule_exists() {
+        anyhow::bail!("the firewall rule wasn't added (netsh code {code})");
+    }
+    crate::log::write("Added a firewall rule blocking incoming connections to the private OBS copy.");
+    Ok(())
 }
 
 /// Takes our firewall rule away again (for Remove); Windows asks for permission (UAC).
@@ -393,7 +569,7 @@ pub fn apply_staged_update() -> Option<String> {
 /// replay buffer is never cut off. Returns the version that was staged, if any.
 pub fn check_for_update() -> anyhow::Result<Option<String>> {
     let Some(current) = private_version() else { return Ok(None) };
-    let stamp = base().join("last-update-check");
+    let stamp = update_stamp();
     let recent = fs::metadata(&stamp)
         .and_then(|m| m.modified())
         .is_ok_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() < Duration::from_secs(24 * 3600));
@@ -421,7 +597,7 @@ mod tests {
     #[test]
     #[ignore]
     fn download_private_copy() {
-        let p = install(|| {});
+        let p = install(false, || {});
         let result = loop {
             if let Some(r) = p.lock().unwrap().result.clone() {
                 break r;
@@ -432,7 +608,7 @@ mod tests {
         assert!(exe_in(&private_dir()).exists());
         assert!(private_version().is_some());
         // Same version as the latest release, so nothing gets staged.
-        let _ = fs::remove_file(base().join("last-update-check"));
+        let _ = fs::remove_file(update_stamp());
         assert_eq!(check_for_update().unwrap(), None);
     }
 
@@ -454,14 +630,97 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+    /// Tests that change the install folder take turns, since it's one global.
+    static ROOT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// With a chosen folder the default one under %LOCALAPPDATA% may not exist, so the update
+    /// check's stamp has to go next to the private copy, or writing it fails every start.
+    #[test]
+    fn update_stamp_in_chosen_folder() {
+        let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("replay-vault-root-{}", crate::config::random_hex()));
+        fs::create_dir_all(&root).unwrap();
+        set_install_root(root.to_str().unwrap());
+        let stamp = update_stamp();
+        let wrote = fs::write(&stamp, b"");
+        set_install_root("");
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(stamp, root.join("last-update-check"));
+        assert!(wrote.is_ok(), "{wrote:?}");
+    }
+
     #[test]
     fn chosen_install_folder() {
+        let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_install_root(r"E:\Games\Instant Replay OBS");
         assert_eq!(private_dir(), PathBuf::from(r"E:\Games\Instant Replay OBS\obs-studio"));
         assert_eq!(exe_in(&private_dir()), PathBuf::from(r"E:\Games\Instant Replay OBS\obs-studio\bin\64bit\obs64.exe"));
         assert!(is_private(&exe_in(&private_dir())));
         set_install_root("  ");
         assert_eq!(install_root(), base());
+    }
+
+    /// A folder open to every signed-in account (like one on a second drive), with a file in it,
+    /// is made private: no Authenticated Users, Users or Everyone entry left on it or the file,
+    /// and nothing taken from the folder above. In a temp folder; skipped where there are no
+    /// permissions (not NTFS).
+    #[test]
+    fn install_folder_made_private() {
+        let root = std::env::temp_dir().join(format!("replay-vault-acl-{}", crate::config::random_hex()));
+        fs::create_dir_all(root.join("obs-studio")).unwrap();
+        fs::write(root.join(r"obs-studio\obs64.exe"), b"x").unwrap();
+        let trusted = trusted_sids().unwrap();
+        if read_acl(&root).unwrap().is_none() {
+            eprintln!("no permissions on this drive, skipped");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        // What a second drive gives a new folder: Authenticated Users may modify, inherited.
+        set_dacl(&root, &format!("D:(A;OICI;0x1301bf;;;AU)(A;OICI;0x1301bf;;;BU)(A;OICI;FA;;;{})", trusted[0]), true).unwrap();
+        let open = |p: &Path| read_acl(p).unwrap().unwrap().2.iter().any(|(a, s)| *a == Some(true) && ["S-1-5-11", "S-1-5-32-545", "S-1-1-0"].contains(&s.as_str()));
+        assert!(open(&root) && open(&root.join(r"obs-studio\obs64.exe")), "the test setup didn't take");
+        assert!(acl_problem(&root, &trusted).unwrap().is_some());
+
+        fs::write(root.join("keep.txt"), b"x").unwrap();
+        let fixed = secure_dir(&root).unwrap();
+        assert!(fixed.is_some_and(|f| f.contains("downloaded again")));
+        assert_eq!(acl_problem(&root, &trusted).unwrap(), None);
+        let (_, protected, _) = read_acl(&root).unwrap().unwrap();
+        assert!(protected, "nothing comes from the folder above");
+        assert!(!root.join("obs-studio").exists(), "an OBS copy others could change is never run again");
+        for p in [root.clone(), root.join("keep.txt")] {
+            assert!(!open(&p), "{} is still open to other accounts", p.display());
+        }
+        assert_eq!(secure_dir(&root).unwrap(), None, "already private: nothing to do");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A folder that only inherits private permissions (a new folder in the user's profile) is
+    /// made private on its own, and its OBS copy is kept.
+    #[test]
+    fn private_inherited_folder_keeps_obs() {
+        let root = std::env::temp_dir().join(format!("replay-vault-acl-{}", crate::config::random_hex()));
+        fs::create_dir_all(root.join("obs-studio")).unwrap();
+        fs::write(root.join(r"obs-studio\obs64.exe"), b"x").unwrap();
+        let trusted = trusted_sids().unwrap();
+        if read_acl(&root).unwrap().is_none() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        // Inherited, and only this account, SYSTEM and Administrators.
+        let private = format!("D:(A;OICI;FA;;;{})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", trusted[0]);
+        set_dacl(&root, &private, true).unwrap();
+        let fixed = secure_dir(&root).unwrap();
+        let kept = root.join(r"obs-studio\obs64.exe").exists();
+        // The same, but one folder inside has its own entry letting every signed-in account in.
+        set_dacl(&root, &private, true).unwrap();
+        set_dacl(&root.join("obs-studio"), &format!("D:P(A;OICI;0x1301bf;;;AU)(A;OICI;FA;;;{})", trusted[0]), true).unwrap();
+        let inner = secure_dir(&root).unwrap();
+        let removed = !root.join("obs-studio").exists();
+        let _ = fs::remove_dir_all(&root);
+        assert!(fixed.is_some_and(|f| !f.contains("downloaded again")));
+        assert!(kept, "a copy nobody else could change is kept");
+        assert!(inner.is_some_and(|f| f.contains("downloaded again")) && removed, "an open folder inside counts too");
     }
 
     #[test]

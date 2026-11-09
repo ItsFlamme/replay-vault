@@ -1,0 +1,136 @@
+//! The tray icon: its menu, its three looks and what each item does.
+
+use crate::*;
+
+/// Instant replay is on, for the tray menu's Pause / Resume (its handler can't reach the app).
+pub(crate) static REPLAY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The tray menu changed Start with Windows; the app's checkbox re-reads it.
+pub(crate) static STARTUP_TOGGLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The tray menu items that follow the app's state, and what they last showed (status, save
+/// text, connected, replay on, start with Windows). Kept in the app: menu items aren't Send.
+pub(crate) struct TrayMenu {
+    pub(crate) status: MenuItem,
+    pub(crate) save: MenuItem,
+    pub(crate) pause: MenuItem,
+    pub(crate) startup: CheckMenuItem,
+    pub(crate) shown: Option<(String, String, bool, bool, bool)>,
+}
+
+/// Tray icon: left click toggles the overlay, right click opens the menu, a quick panel with the
+/// recorder's state. The handlers run even while the window is hidden, so they act directly
+/// instead of waiting for a frame.
+pub(crate) fn make_tray(ctx: &egui::Context, cmds: Sender<Cmd>) -> anyhow::Result<(TrayIcon, TrayMenu)> {
+    let status = MenuItem::new("Recorder not running", false, None);
+    let save = MenuItem::new("Save clip", false, None);
+    let pause = MenuItem::new("Pause replay", false, None);
+    let open = MenuItem::new("Open Replay Vault", true, None);
+    let folder = MenuItem::new("Open clips folder", true, None);
+    let startup = CheckMenuItem::new("Start with Windows", true, startup::is_enabled(), None);
+    let quit = MenuItem::new("Quit", true, None);
+    let menu = Menu::new();
+    menu.append_items(&[&status, &PredefinedMenuItem::separator(), &save, &pause, &open, &folder, &startup, &PredefinedMenuItem::separator(), &quit])?;
+    let (save_id, pause_id, open_id, folder_id, startup_id, quit_id) =
+        (save.id().clone(), pause.id().clone(), open.id().clone(), folder.id().clone(), startup.id().clone(), quit.id().clone());
+
+    let c = ctx.clone();
+    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+        if e.id == open_id {
+            overlay::show();
+            c.request_repaint();
+        } else if e.id == save_id {
+            let _ = cmds.send(Cmd::Save);
+        } else if e.id == pause_id {
+            let _ = cmds.send(Cmd::SetReplay(!REPLAY_ON.load(std::sync::atomic::Ordering::Relaxed)));
+        } else if e.id == folder_id {
+            clips::open(std::path::Path::new(&Config::load().folder), false);
+        } else if e.id == startup_id {
+            if let Err(e) = startup::set_enabled(!startup::is_enabled()) {
+                log::write(&format!("Couldn't change the startup setting: {e}"));
+            }
+            STARTUP_TOGGLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            c.request_repaint();
+        } else if e.id == quit_id {
+            shutdown();
+            std::process::exit(0);
+        }
+    }));
+    let c = ctx.clone();
+    TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+            overlay::toggle();
+            c.request_repaint();
+        }
+    }));
+
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .with_tooltip(crate::APP_TITLE)
+        .with_icon(tray_icon_image(TrayLook::Off)?)
+        .build()?;
+    Ok((tray, TrayMenu { status, save, pause, startup, shown: None }))
+}
+
+/// What the tray icon shows: replay off (or no recorder), replay on, or a full recording running.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum TrayLook {
+    Off,
+    Buffer,
+    Recording,
+}
+
+impl TrayLook {
+    pub(crate) fn of(connected: bool, buffer: bool, recording: bool) -> TrayLook {
+        match (connected, buffer, recording) {
+            (true, _, true) => TrayLook::Recording,
+            (true, true, false) => TrayLook::Buffer,
+            _ => TrayLook::Off,
+        }
+    }
+
+    pub(crate) fn tooltip(self) -> &'static str {
+        match self {
+            TrayLook::Off => "Replay Vault: instant replay off",
+            TrayLook::Buffer => "Replay Vault: instant replay on",
+            TrayLook::Recording => "Replay Vault: recording",
+        }
+    }
+}
+
+pub(crate) const TRAY_N: u32 = 32;
+
+pub(crate) fn tray_icon_image(look: TrayLook) -> anyhow::Result<tray_icon::Icon> {
+    Ok(tray_icon::Icon::from_rgba(tray_rgba(look), TRAY_N, TRAY_N)?)
+}
+
+/// A record dot with a dark ring, drawn in code: the accent colour while replay is on, gray when
+/// off, red while recording.
+pub(crate) fn tray_rgba(look: TrayLook) -> Vec<u8> {
+    const N: u32 = TRAY_N;
+    // The light accent whatever the mode: the taskbar is dark or light on its own.
+    let on = accent_of().1;
+    let dot = match look {
+        TrayLook::Off => [120, 120, 128, 255],
+        TrayLook::Buffer => [on.r(), on.g(), on.b(), 255],
+        TrayLook::Recording => [235, 60, 60, 255],
+    };
+    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
+    for y in 0..N {
+        for x in 0..N {
+            let d = ((x as f32 - 15.5).powi(2) + (y as f32 - 15.5).powi(2)).sqrt();
+            let px = if d < 9.5 {
+                dot
+            } else if d < 14.5 {
+                [30, 30, 34, 255]
+            } else if d < 15.5 {
+                [30, 30, 34, ((15.5 - d) * 255.0) as u8]
+            } else {
+                [0, 0, 0, 0]
+            };
+            rgba.extend_from_slice(&px);
+        }
+    }
+    rgba
+}
