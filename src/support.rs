@@ -7,17 +7,16 @@ use std::path::{Path, PathBuf};
 use crate::config::{self, Config};
 
 /// Zips `files` (name in the zip, file; missing ones are skipped), the settings without their
-/// secrets and `summary` into `out`. The secrets are also blanked out of the files' text, share
-/// links are taken out, and the Windows user folder shows as ~ (it has the user's name in it).
+/// secrets and `summary` into `out`. Every file's text goes through feedback::scrub, as a log
+/// sent with feedback does: the secrets, share links, the Windows user folder (as ~) and user
+/// name, URL query strings, email addresses and anything that looks like a key come out.
 pub fn write(out: &Path, files: &[(&str, PathBuf)], cfg: &Config, summary: &str) -> anyhow::Result<()> {
     let secrets: Vec<&str> = [&cfg.recorder_password, &cfg.discord_webhook].into_iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-    let home = dirs::home_dir().map(|h| h.display().to_string()).filter(|h| h.len() > 3);
+    let home = dirs::home_dir().map(|h| h.display().to_string());
+    let user = std::env::var("USERNAME").ok();
     let mut zip = zip::ZipWriter::new(std::fs::File::create(out)?);
     let mut add = |name: &str, text: String| -> anyhow::Result<()> {
-        let mut text = without_links(secrets.iter().fold(text, |t, s| t.replace(s, "(removed)")));
-        if let Some(home) = &home {
-            text = text.replace(home.as_str(), "~").replace(&home.replace('\\', "/"), "~");
-        }
+        let text = crate::feedback::scrub(&text, home.as_deref(), user.as_deref(), &secrets);
         zip.start_file(name, zip::write::SimpleFileOptions::default())?;
         zip.write_all(text.as_bytes())?;
         Ok(())
@@ -89,7 +88,15 @@ mod tests {
         };
         let log = dir.join("app.log");
         let home = dirs::home_dir().unwrap().display().to_string();
-        std::fs::write(&log, format!("started\r\nUploaded {home}\\Videos\\a.mp4 to https://kappa.lol/AbC12 ok\r\nfrom {}/Videos\r\n", home.replace('\\', "/"))).unwrap();
+        std::fs::write(
+            &log,
+            format!(
+                "started\r\nUploaded {home}\\Videos\\a.mp4 to https://kappa.lol/AbC12 ok\r\nfrom {}/Videos\r\nin {}\\x\r\nmail a.b@example.com, phone http://192.168.1.5:8080/clips?key=abc ok\r\n",
+                home.replace('\\', "/"),
+                home.to_lowercase()
+            ),
+        )
+        .unwrap();
         let obs = dir.join("obs.txt");
         std::fs::write(&obs, format!("websocket password {}\nposting to {}\n", cfg.recorder_password, cfg.discord_webhook)).unwrap();
         let out = dir.join("support.zip");
@@ -115,6 +122,8 @@ mod tests {
             if name == "app.log" {
                 assert!(text.contains("Uploaded ~\\Videos\\a.mp4 to (link removed) ok") && text.contains("from ~/Videos"), "{text}");
                 assert!(!text.contains(&home) && !text.contains("kappa.lol/AbC12"), "{text}");
+                // The home folder in any case, emails and query strings go too, as in feedback.
+                assert!(text.contains("in ~\\x") && text.contains("mail <email>, phone http://192.168.1.5:8080/clips?<removed> ok"), "{text}");
             }
             if name == "config.json" {
                 assert!(text.contains("\"buffer_secs\": 77"));

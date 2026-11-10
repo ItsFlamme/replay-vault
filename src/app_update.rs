@@ -30,6 +30,8 @@ static FINDS: AtomicU32 = AtomicU32::new(0);
 /// What the last "Check for updates" click found, for the General page.
 static STATUS: Mutex<Option<String>> = Mutex::new(None);
 static CHECKING: AtomicBool = AtomicBool::new(false);
+/// The SHA-256 the last download matched, so a portable swap can check the file again.
+static CHECKED: Mutex<Option<String>> = Mutex::new(None);
 
 /// The newer release the last check found, if any.
 pub fn found() -> Option<Newer> {
@@ -267,28 +269,73 @@ fn fetch(inst: &Installer, dest: &Path, p: &Shared) -> anyhow::Result<()> {
         obs_install::set(p, "Downloading", done, inst.size);
     }
     drop(file);
-    let got: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let got = hex(hash);
     if got != inst.sha256 {
         let _ = fs::remove_file(dest);
         anyhow::bail!("the download didn't match its published checksum, so it was thrown away");
     }
+    *CHECKED.lock().unwrap() = Some(got);
     Ok(())
 }
 
-/// Starts the downloaded installer: it installs over this copy, keeping settings and clips, and
-/// opens the new version when it's done. The app must quit right after.
+fn hex(hash: Sha256) -> String {
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Puts `exe`.new in `exe`'s place, parking `exe` as `exe`.old; on failure `exe` is put back.
+/// The new exe is hashed again through a handle no one else can write to, rename or delete, and
+/// moved through that same handle, so what starts is what matched the download's checksum.
 fn swap(exe: &Path) -> std::io::Result<()> {
     let (new, old) = (beside(exe, "new"), beside(exe, "old"));
+    let mut file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        File::options().access_mode(GENERIC_READ | DELETE).share_mode(FILE_SHARE_READ).open(&new)?
+    };
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    let want = CHECKED.lock().unwrap().clone();
+    if want.is_none() || want != Some(hex(hash)) {
+        return Err(std::io::Error::other("the new version changed after it was checked, so it wasn't used"));
+    }
     let _ = fs::remove_file(&old);
     fs::rename(exe, &old)?;
-    if let Err(e) = fs::rename(&new, exe) {
+    if let Err(e) = rename_open(&file, exe) {
         let _ = fs::rename(&old, exe);
         return Err(e);
     }
     Ok(())
 }
 
+/// Renames the open `file` to `to` (a full path), through its handle.
+fn rename_open(file: &File, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle};
+    let name: Vec<u16> = to.as_os_str().encode_wide().collect();
+    // The struct ends with the first letter of the name; the rest follows it.
+    let size = std::mem::size_of::<FILE_RENAME_INFO>() + name.len() * 2;
+    let mut buf = vec![0u64; size.div_ceil(8)];
+    let info = buf.as_mut_ptr() as *mut FILE_RENAME_INFO;
+    unsafe {
+        (*info).FileNameLength = (name.len() * 2) as u32;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), std::ptr::addr_of_mut!((*info).FileName) as *mut u16, name.len());
+        SetFileInformationByHandle(HANDLE(file.as_raw_handle()), FileRenameInfo, info as *const _, size as u32)?;
+    }
+    Ok(())
+}
+
+/// Starts the downloaded installer: it installs over this copy, keeping settings and clips, and
+/// opens the new version when it's done. The app must quit right after.
 fn run_installer() -> std::io::Result<()> {
     std::process::Command::new(installer_path()).args(["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]).spawn().map(|_| ())
 }
@@ -344,7 +391,8 @@ mod tests {
     }
 
     /// A portable update puts the new exe in the old one's place and parks the old one; if the
-    /// new one can't be moved in, the old one goes back.
+    /// new one can't be moved in, the old one goes back. The new one is used only if it still
+    /// matches what the download was checked against.
     #[test]
     fn portable_swap() {
         let dir = std::env::temp_dir().join("replay-vault-swap-test");
@@ -352,13 +400,23 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("replay-vault.exe");
         fs::write(&exe, b"old").unwrap();
+        let mut h = Sha256::new();
+        h.update(b"new");
+        *CHECKED.lock().unwrap() = Some(hex(h));
         assert!(swap(&exe).is_err(), "nothing downloaded");
         assert_eq!(fs::read(&exe).unwrap(), b"old", "put back");
+        fs::write(beside(&exe, "new"), b"tampered").unwrap();
+        assert!(swap(&exe).is_err(), "changed after the check");
+        assert_eq!(fs::read(&exe).unwrap(), b"old");
+        assert!(beside(&exe, "new").exists() && !beside(&exe, "old").exists(), "both left alone");
         fs::write(beside(&exe, "new"), b"new").unwrap();
         swap(&exe).unwrap();
         assert_eq!(fs::read(&exe).unwrap(), b"new");
         assert_eq!(fs::read(beside(&exe, "old")).unwrap(), b"old", "parked, deleted at the next start");
         assert!(!beside(&exe, "new").exists());
+        *CHECKED.lock().unwrap() = None;
+        fs::rename(beside(&exe, "old"), beside(&exe, "new")).unwrap();
+        assert!(swap(&exe).is_err(), "nothing checked this run: not used");
         fs::remove_dir_all(&dir).unwrap();
     }
 

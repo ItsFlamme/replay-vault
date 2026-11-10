@@ -117,6 +117,11 @@ impl GeneralPart {
 }
 
 impl App {
+    /// The clips in `folder`: the last read of the clips folder when it's that one, else read now.
+    fn listed(&self, folder: &str) -> std::borrow::Cow<'_, [clips::Clip]> {
+        if folder == self.saved.folder { std::borrow::Cow::Borrowed(&self.clip_list) } else { std::borrow::Cow::Owned(clips::list(folder, usize::MAX)) }
+    }
+
     /// General, in tabs: Clips (length, folder, game folders, what a save does, names and covers),
     /// Storage (cleanup, archive), Appearance (look, tips), Startup (startup, updates, Windows),
     /// Sharing (Discord) and Backup (moving PCs, Remove).
@@ -189,7 +194,9 @@ impl App {
                     ui.label(RichText::new(s).color(pal().muted));
                 }
             });
-            note(ui, format!("{}, Esc or X hides this window. The app keeps running in the tray.", self.cfg.overlay_hotkey));
+            // With no show/hide key (its key went to another action), just X.
+            let keys = if self.cfg.overlay_hotkey.trim().is_empty() { "The X".to_string() } else { format!("{} or the X", self.cfg.overlay_hotkey) };
+            note(ui, format!("{keys} hides this window. The app keeps running in the tray."));
         });
     }
 
@@ -220,8 +227,10 @@ impl App {
             if rule != clips::Cleanup::default() {
                 let stale = self.cleanup_preview.is_none_or(|(r, at, ..)| r != rule || at.elapsed() > std::time::Duration::from_secs(5));
                 if stale {
-                    let plan = clips::cleanup_plan(&clips::list(&self.cfg.folder, usize::MAX), &self.favorites, rule, std::time::SystemTime::now());
-                    let bytes = plan.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+                    let all = self.listed(&self.cfg.folder);
+                    let plan = clips::cleanup_plan(&all, &self.favorites, rule, std::time::SystemTime::now());
+                    let planned: std::collections::HashSet<&std::path::PathBuf> = plan.iter().collect();
+                    let bytes = all.iter().filter(|c| planned.contains(&c.path)).map(|c| c.bytes).sum();
                     self.cleanup_preview = Some((rule, std::time::Instant::now(), plan.len(), bytes));
                 }
                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(5));
@@ -235,7 +244,7 @@ impl App {
             limit(ui, &mut self.cfg.archive_days, "Move clips older than", "days", 30, 3650);
             if self.cfg.archive_days > 0 {
                 folder_field(ui, &mut self.cfg.archive_folder, "Another drive or a NAS folder");
-                note(ui, "Oldest first, into the same game folders there. Stars, tags and share links go along. Clips from the last 10 minutes are left alone.");
+                note(ui, "Oldest first, into the same game folders there. Stars, tags, notes and share links go along. Clips from the last 10 minutes are left alone.");
                 let (text, color) = match archive_rule(&self.cfg) {
                     None if self.cfg.archive_folder.trim().is_empty() => ("Pick a folder to move them to.".to_string(), pal().muted),
                     None => ("Pick a folder outside the clips folder.".to_string(), pal().amber),
@@ -245,7 +254,7 @@ impl App {
                     Some(rule) => {
                         let stale = self.archive_preview.as_ref().is_none_or(|(r, at, ..)| *r != rule || at.elapsed() > std::time::Duration::from_secs(5));
                         if stale {
-                            let all = clips::list(&self.cfg.folder, usize::MAX);
+                            let all = self.listed(&self.cfg.folder);
                             let plan = clips::archive_plan(&all, rule.after, std::time::SystemTime::now());
                             let (n, bytes) = (plan.len(), plan.iter().map(|c| c.bytes).sum());
                             self.archive_preview = Some((rule, std::time::Instant::now(), n, bytes));
@@ -289,9 +298,9 @@ impl App {
     fn backup_cards(&mut self, ui: &mut egui::Ui) {
         if self.wizard.is_none() {
             card(ui, "Move to a new PC", |ui| {
-                note(ui, "One file with your saved settings, stars and tags, for a new PC or a reinstall. Passwords and the Discord webhook are left out.");
+                note(ui, "One file with your saved settings, stars, tags and notes, for a new PC or a reinstall. Passwords and the Discord webhook are left out.");
                 ui.horizontal(|ui| {
-                    if button(ui, "Export settings...").on_hover_text("Saves your settings, stars and tags to one file").clicked() {
+                    if button(ui, "Export settings...").on_hover_text("Saves your settings, stars, tags and notes to one file").clicked() {
                         self.export_settings();
                     }
                     if button(ui, "Import settings...").on_hover_text("Loads settings from a file you exported before").clicked() {

@@ -37,7 +37,7 @@ Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.c
 - Full recording and screenshots on their own keys
 - Desktop capture by default, which is safe with anti-cheat. Game capture is there if you want it.
 - Game and mic on separate tracks, noise suppression, or record only the apps you pick
-- Even sound on both sides: a clip that comes out louder on one side (your balance in Windows or another app) is evened after saving, still in stereo
+- Even sound on both sides (experimental, off to start with, on the Audio page): a clip that comes out louder on one side (your balance in Windows or another app) is evened after saving, still in stereo, with your mic kept in the middle
 - Optional pause when no game is open, back on by itself when one is. A game in a window counts too, once you pick it from the tray.
 - If instant replay stops by itself, you're told and it's turned back on. Every saved clip is checked, and you're told if it came out empty or without sound.
 

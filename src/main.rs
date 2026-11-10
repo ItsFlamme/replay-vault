@@ -104,8 +104,10 @@ fn main() -> eframe::Result {
 fn first_instance() -> bool {
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows::Win32::System::Threading::CreateMutexW;
-    // The handle is never closed: Windows releases the mutex when this process exits.
-    match unsafe { CreateMutexW(None, true, windows::core::w!("Local\\ReplayVault")) } {
+    // The handle is never closed: Windows releases the mutex when this process exits. A dev build
+    // has its own, so it and a release copy can run side by side.
+    let name = if DEV_BUILD { windows::core::w!("Local\\ReplayVaultDev") } else { windows::core::w!("Local\\ReplayVault") };
+    match unsafe { CreateMutexW(None, true, name) } {
         Ok(_) => (unsafe { GetLastError() }) != ERROR_ALREADY_EXISTS,
         Err(_) => true,
     }
@@ -220,10 +222,13 @@ struct App {
     /// Running OBS or VC++ runtime download.
     job: Option<obs_install::Shared>,
     job_error: Option<String>,
-    /// Last lines of the app log for the Logs tab, and the file size/time they were read at.
+    /// Last lines of the app log for the Help page, and the file size/time they were read at.
     log_view: Vec<String>,
     log_stamp: (u64, Option<std::time::SystemTime>),
     log_checked: std::time::Instant,
+    /// Setup's last settings that couldn't be saved, and when: tried again every 2 seconds, not
+    /// every frame.
+    setup_unsaved: Option<(Config, std::time::Instant)>,
     /// This PC's GPU and RAM, for the recommended settings.
     hw: profile::Hardware,
     /// Summary of the recommended settings last applied.
@@ -240,7 +245,7 @@ struct App {
     nvidia: Option<(bool, bool)>,
     /// AMD Software's settings (None inside if it isn't on this PC), looked at when needed.
     amd: Option<Option<amd::Amd>>,
-    /// The Logs page's Send feedback card.
+    /// The Feedback page's form.
     feedback: feedback::Form,
     /// The user has their own OBS setup to import from, and what was last imported.
     obs_settings_found: bool,
@@ -248,6 +253,10 @@ struct App {
     /// Clips tab: the folder's clips (re-read every few seconds), their frames and lengths.
     clip_list: Vec<clips::Clip>,
     clips_checked: std::time::Instant,
+    /// The clips folder being read on another thread: (folder, clips, free space).
+    clips_scan: Option<std::sync::mpsc::Receiver<ClipsScan>>,
+    /// Free space on the clips drive, from the last scan.
+    clips_free: Option<u64>,
     /// The archive folder and its clips (None: its drive or NAS isn't connected), looked at in the
     /// background while the Archive view is up (a NAS that's off can take a while to answer).
     archive_list: Option<(std::path::PathBuf, Option<Vec<clips::Clip>>)>,
@@ -310,6 +319,8 @@ struct App {
     placement_checked: std::time::Instant,
     /// Picked clips waiting for "Move to Recycle Bin?" to be answered.
     confirm_recycle: Option<Vec<std::path::PathBuf>>,
+    /// The card to highlight after Delete in the grid, once the clip is gone.
+    recycle_next: Option<std::path::PathBuf>,
     /// Share copies waiting to be made, one at a time after the running ones.
     export_queue: std::collections::VecDeque<(std::path::PathBuf, media::Share)>,
     /// Clips page search text.
@@ -320,7 +331,7 @@ struct App {
     cleanup_preview: Option<(clips::Cleanup, std::time::Instant, usize, u64)>,
     /// What the archive would move right now (clips, bytes), for the rule it was worked out for.
     archive_preview: Option<(clips::Archive, std::time::Instant, usize, u64)>,
-    /// CPU, GPU and memory readings; only while the Logs page is open.
+    /// CPU, GPU and memory readings; only while the Help page is open.
     perf: Option<perf::Sampler>,
     /// OBS skipped frames while encoding: how many, at which Encoder effort. Until dismissed.
     encoder_hint: Option<(u64, u8)>,
@@ -400,6 +411,9 @@ impl App {
         let needs_setup = !cfg.setup_done || obs_exe.is_none();
 
         toast::start();
+        let clips_root = std::path::PathBuf::from(&cfg.folder);
+        let archive = (cfg.archive_days > 0 && !cfg.archive_folder.trim().is_empty()).then(|| std::path::PathBuf::from(cfg.archive_folder.trim()));
+        std::thread::spawn(move || covers::tidy(&clips_root, archive.as_deref()));
         let ctx = cc.egui_ctx.clone();
         let repaint: obs::Repaint = Arc::new(move || ctx.request_repaint());
         let (update_tx, update_repaint) = (ev_tx.clone(), repaint.clone());
@@ -424,7 +438,7 @@ impl App {
 
         // The app's hotkeys work even while a game has focus.
         let ctx = cc.egui_ctx.clone();
-        let hotkey_cmds = std::sync::Mutex::new(cmd_tx.clone());
+        let hotkey_cmds = cmd_tx.clone();
         let hook = hotkey::install(move |action| {
             let cmd = match action {
                 hotkey::Action::Overlay => {
@@ -441,7 +455,7 @@ impl App {
                 hotkey::Action::Replay => Cmd::ToggleReplay,
                 hotkey::Action::Mic => Cmd::ToggleMic,
             };
-            let _ = hotkey_cmds.lock().unwrap().send(cmd);
+            let _ = hotkey_cmds.send(cmd);
         });
         let ctx = cc.egui_ctx.clone();
         let previews = clips::Previews::new(move || ctx.request_repaint());
@@ -461,6 +475,7 @@ impl App {
             wizard: needs_setup.then_some(0),
             obs_exe,
             log_checked: std::time::Instant::now() - std::time::Duration::from_secs(2),
+            setup_unsaved: None,
             recommended,
             obs_settings_found: obs_import::found(),
             links: upload::links(),
@@ -548,6 +563,7 @@ impl App {
             log_view: Vec::new(),
             log_stamp: (0, None),
             log_checked: std::time::Instant::now(),
+            setup_unsaved: None,
             hw,
             recommended: None,
             audio_custom: false,
@@ -563,6 +579,8 @@ impl App {
             clips_checked: std::time::Instant::now().checked_sub(std::time::Duration::from_secs(60)).unwrap_or_else(std::time::Instant::now),
             archive_list: None,
             archive_scan: None,
+            clips_scan: None,
+            clips_free: None,
             archive_checked: std::time::Instant::now(),
             previews,
             textures: Default::default(),
@@ -597,6 +615,7 @@ impl App {
             drag_out_ended: None,
             placement_checked: std::time::Instant::now(),
             confirm_recycle: None,
+            recycle_next: None,
             export_queue: Default::default(),
             search: String::new(),
             montage: None,
@@ -638,7 +657,7 @@ impl App {
         }
         if let Some((_, menu)) = &mut self.tray {
             let status = match (self.connected, self.buffer) {
-                (true, true) => format!("Recording: last {}", mmss(self.saved.buffer_secs)),
+                (true, true) => format!("Instant replay: last {}", mmss(self.saved.buffer_secs)),
                 (true, false) => "Paused".to_string(),
                 _ => "Recorder not running".to_string(),
             };
@@ -754,6 +773,7 @@ impl App {
         obs::SAVE_POPUP.store(s.save_popup, std::sync::atomic::Ordering::Relaxed);
         obs::SORT_BY_GAME.store(s.sort_by_game, std::sync::atomic::Ordering::Relaxed);
         obs::SAVE_SOUND.store(s.save_sound, std::sync::atomic::Ordering::Relaxed);
+        obs::CENTER_SOUND.store(s.center_sound, std::sync::atomic::Ordering::Relaxed);
         clips::set_cleanup(&s.folder, cleanup_rule(s));
         clips::set_archive(&s.folder, archive_rule(s));
         if self.wizard.is_none() && recorder_settings(s) != self.applied {
@@ -786,7 +806,15 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         // The height kept free at the bottom for the status: a line more when it says why it
         // isn't recording.
-        let status_h = if self.connected && self.buffer { 92.0 } else { 108.0 };
+        let mut status_h = if self.connected && self.buffer { 92.0 } else { 108.0 };
+        // And a small row each for "Version X is out" and "Key clash" when they show.
+        let row = ui.text_style_height(&egui::TextStyle::Small).max(ui.spacing().interact_size.y) + ui.spacing().item_spacing.y;
+        if self.saved.check_updates && app_update::found().is_some() {
+            status_h += row + 8.0;
+        }
+        if !self.conflicts.is_empty() {
+            status_h += row;
+        }
         // A hairline on its right edge. The whole panel, margins too.
         let panel = ui.max_rect().expand2(egui::vec2(12.0, 0.0));
         let back = ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(panel);
@@ -1044,7 +1072,9 @@ impl App {
     /// The new-version popup is up: a newer version was found and not put off with Later, or it's
     /// being installed. It waits while a recording runs or setup is open.
     fn update_due(&self) -> bool {
+        // With checks off, only after "Check for updates" was clicked.
         app_update::found().is_some()
+            && (self.saved.check_updates || app_update::status().is_some())
             && (self.update_job.is_some() || self.update_error.is_some() || (app_update::finds() != self.update_later && !self.recording && self.wizard.is_none()))
     }
 
@@ -1155,12 +1185,18 @@ impl App {
         }
         if let Some(paths) = self.confirm_recycle.take() {
             let confirm = Confirm { label: "Move to Recycle Bin", hint: "Moves every clip picked to the Recycle Bin", danger: true };
-            match modal(ctx, "recycle_picked", 360.0, &format!("Move {} to the Recycle Bin?", count(paths.len(), "clip")), confirm, CANCEL, |ui| {
-                ui.label("You can get them back from the Recycle Bin.");
+            let set: std::collections::HashSet<&std::path::PathBuf> = paths.iter().collect();
+            let bytes: u64 = self.clip_list.iter().filter(|c| set.contains(&c.path)).map(|c| c.bytes).sum();
+            let title = format!("Move {} ({}) to the Recycle Bin?", count(paths.len(), "clip"), clips::size(bytes));
+            match modal(ctx, "recycle_picked", 360.0, &title, confirm, CANCEL, |ui| {
+                match paths.as_slice() {
+                    [one] => ui.label(format!("{}\n\nYou can get it back from the Recycle Bin.", one.file_name().unwrap_or_default().to_string_lossy())),
+                    _ => ui.label("You can get them back from the Recycle Bin."),
+                };
                 (true, false)
             }) {
                 Some(true) => self.recycle_picked(&paths),
-                Some(false) => {}
+                Some(false) => self.recycle_next = None,
                 None => self.confirm_recycle = Some(paths),
             }
         }
@@ -1193,7 +1229,7 @@ impl App {
             }) {
                 Some(true) => {
                     let c = ctx.clone();
-                    self.uploads.insert(path.clone(), upload::post_discord(&path, &self.cfg.discord_webhook, move || c.request_repaint()));
+                    self.uploads.insert(path.clone(), upload::post_discord(&path, &self.saved.discord_webhook, move || c.request_repaint()));
                 }
                 Some(false) => {}
                 None => self.confirm_discord = Some(path),
@@ -1281,6 +1317,7 @@ impl App {
     /// Undoes everything the app did to this PC, then quits. Clips are kept.
     fn remove_everything(&mut self) {
         self.player = None;
+        obs::QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
         recorder::stop();
         tweaks::give_back_nvidia_overlay();
         let mut problems = Vec::new();
@@ -1423,9 +1460,13 @@ const HOTKEY_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
 fn shutdown() {
     obs::end_session("app closed");
     log::write("App closed.");
+    obs::QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
     recorder::stop();
     tweaks::give_back_nvidia_overlay();
 }
+
+/// A read of the clips folder: (folder, clips, free space).
+type ClipsScan = (String, Vec<clips::Clip>, Option<u64>);
 
 /// "1 clip", "2 clips": `n` and `one`, made plural with an s past 1.
 fn count(n: usize, one: &str) -> String {
@@ -1483,7 +1524,14 @@ impl eframe::App for App {
         }
         // Setup has no Save button: what's picked there is kept as it goes.
         if self.wizard.is_some() && self.cfg != self.saved {
-            self.keep_settings();
+            let wait = std::time::Duration::from_secs(2);
+            let failed_now = self.setup_unsaved.as_ref().is_some_and(|(c, at)| *c == self.cfg && at.elapsed() < wait);
+            if failed_now {
+                ui.ctx().request_repaint_after(wait);
+            } else {
+                self.keep_settings();
+                self.setup_unsaved = (self.cfg != self.saved).then(|| (self.cfg.clone(), std::time::Instant::now()));
+            }
         }
         let moved = clips::take_moved();
         if !moved.is_empty() {
@@ -1522,6 +1570,10 @@ impl eframe::App for App {
         if hidden && self.capturing.is_none() {
             match self.slim {
                 Slim::Visible => {
+                    // However it was hidden (X, the tray, the key), a clip stops playing.
+                    if let Some((_, p)) = &mut self.player {
+                        p.pause();
+                    }
                     self.textures.clear();
                     self.covers.clear();
                     self.previews.forget();
@@ -1547,8 +1599,9 @@ impl eframe::App for App {
         }
         self.slim = Slim::Visible;
 
-        // Closing (Alt+F4) or Esc only hides the overlay; Quit lives in the tray menu. During
-        // setup nothing is recording yet, so closing quits instead of vanishing into the tray.
+        // Closing (Alt+F4, X) only hides the overlay; Quit lives in the tray menu. During setup
+        // nothing is recording yet, so closing quits instead of vanishing into the tray. Esc never
+        // hides it; it only cancels or lets go of things.
         // Esc pressed in a text box just leaves the box (focus is still last frame's here).
         let typing = ui.ctx().text_edit_focused();
         let (close, esc) = ui.input(|i| (i.viewport().close_requested(), i.key_pressed(egui::Key::Escape)));
@@ -1563,7 +1616,7 @@ impl eframe::App for App {
         if unpick {
             self.picked.clear();
         }
-        if !in_setup && (close || (esc && !unpick && self.capturing.is_none() && !typing)) {
+        if !in_setup && close {
             overlay::close();
         }
 
@@ -1589,11 +1642,7 @@ impl eframe::App for App {
             return;
         }
         // Re-read every few seconds: the Clips page and the sidebar's games both show it.
-        if self.clips_checked.elapsed() > std::time::Duration::from_secs(3) {
-            self.clips_checked = std::time::Instant::now();
-            self.clip_list = clips::list(&self.saved.folder, usize::MAX);
-            self.refind_marked();
-        }
+        self.scan_clips(ui.ctx());
         ui.ctx().request_repaint_after(std::time::Duration::from_secs(3));
         let nav = egui::Frame::new().fill(pal().sidebar).inner_margin(egui::Margin { left: 12, right: 12, top: 0, bottom: 0 });
         egui::Panel::left("nav").frame(nav).exact_size(220.0).resizable(false).show(ui, |ui| self.sidebar(ui));
@@ -1610,9 +1659,6 @@ impl eframe::App for App {
             self.perf = None;
         }
         if HIDE_REQUEST.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            if let Some((_, p)) = &mut self.player {
-                p.pause();
-            }
             overlay::close();
         }
         // Read before this frame's dialogs and text fields, so the Enter that closes the rename box
@@ -1825,7 +1871,7 @@ mod tests {
                 // More options open where the page's state is (a view choice; nothing is saved).
                 let more = ["general-discord", "general-discord-bad", "general-archive", "general-move", "general-cleanup", "video-hint", "video-follow", "video-hdr", "audio-apps"];
                 if name.ends_with("-more") || more.contains(&name.as_str()) {
-                    app.cfg.more_open = ["General", "Keybinds", "Video", "Audio", "Help"].map(String::from).to_vec();
+                    app.cfg.more_open = ["General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
                     app.saved.more_open = app.cfg.more_open.clone();
                 }
                 // A graphics card nobody has tried yet, then game, mic and chat apart, then a custom
@@ -1920,7 +1966,7 @@ mod tests {
                 }
                 // First-run tips only on the "-tip" pages.
                 if !name.ends_with("-tip") {
-                    app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Help"].map(String::from).to_vec();
+                    app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
                     app.saved.tips_seen = app.cfg.tips_seen.clone();
                 }
                 // Stars the second-newest clip (in memory only; favorites.json isn't written).
@@ -2222,8 +2268,8 @@ mod tests {
                 let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).wgpu().build_eframe(|cc| {
                     let mut app = App::preview(cc);
                     (app.cfg.folder, app.cfg.theme, app.cfg.light_mode, app.tab) = (demo.clone(), theme.into(), light, tab);
-                    app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Help"].map(String::from).to_vec();
-                    app.cfg.more_open = ["General", "Keybinds", "Video", "Audio", "Help"].map(String::from).to_vec();
+                    app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
+                    app.cfg.more_open = ["General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
                     app.saved = app.cfg.clone();
                     app.applied = recorder_settings(&app.cfg);
                     app
@@ -2270,7 +2316,7 @@ mod tests {
         let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size(size).with_accessibility_check(false).wgpu().build_eframe(|cc| {
             let mut app = App::preview(cc);
             app.cfg.folder = demo.clone();
-            app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Help"].map(String::from).to_vec();
+            app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
             setup(&mut app);
             app.saved = app.cfg.clone();
             app.applied = recorder_settings(&app.cfg);
@@ -2305,7 +2351,7 @@ mod tests {
             app.cfg.light_mode = light;
         };
         // More options open on every page that has it (set as a view choice; nothing is saved).
-        let open_all = |app: &mut App| app.cfg.more_open = ["General", "Keybinds", "Video", "Audio", "Help"].map(String::from).to_vec();
+        let open_all = |app: &mut App| app.cfg.more_open = ["General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
         // Every page in each look, then with More options open.
         if want("core") {
             for (theme, light) in looks {
@@ -2675,7 +2721,7 @@ mod tests {
             app
         });
         h.run();
-        let item = "The app reopens maximized if you left it maximized.";
+        let item = "Del now works on a clip picked in Recent clips too, not only in All clips.";
         assert!(h.query_by_label(item).is_some());
         h.get_by_label_contains("(this version)").click();
         // Past the closing animation.
@@ -3089,6 +3135,59 @@ mod tests {
         h.key_press(egui::Key::Escape);
         h.run_steps(2);
         assert!(h.state().picked.is_empty());
+        // Delete on one clip asks too, and the highlight stays on it until it's gone.
+        h.key_press(egui::Key::ArrowRight);
+        h.run_steps(2);
+        let one = h.state().selected.clone();
+        h.key_press(egui::Key::Delete);
+        h.run_steps(2);
+        assert_eq!(h.state().confirm_recycle.as_ref().map(Vec::len), Some(1));
+        assert_eq!(h.state().selected, one, "still on the clip asked about");
+        assert!(h.state().recycle_next.is_some() && h.state().recycle_next != one, "the next card waits");
+        h.state_mut().confirm_recycle = None;
+        h.run_steps(2);
+        // And on one clicked (below its picture, which would open it): the click focuses the card.
+        h.state_mut().selected = None;
+        egui_kittest::kittest::Queryable::get_by_label(&h, "b").click();
+        h.run_steps(2);
+        assert_eq!(h.state().selected.as_ref(), Some(&dir.join("b.png")), "the click picks it");
+        h.key_press(egui::Key::Delete);
+        h.run_steps(2);
+        assert_eq!(h.state().confirm_recycle.as_ref().map(Vec::len), Some(1), "Delete after a click");
+        h.state_mut().confirm_recycle = None;
+        h.run_steps(2);
+        // Ctrl+click on two pictures (just above their names), then Delete asks for both. From no
+        // selection: Delete moved it to the next card, which a Ctrl+click would pick too.
+        h.state_mut().selected = None;
+        for name in ["a", "c"] {
+            let at = egui_kittest::kittest::Queryable::get_by_label(&h, name).rect().center_top() - egui::vec2(0.0, 30.0);
+            h.event(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+            h.event(egui::Event::PointerMoved(at));
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::COMMAND });
+            }
+            h.run_steps(2);
+        }
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        h.run_steps(1);
+        assert_eq!(h.state().picked.len(), 2, "Ctrl+click picks");
+        h.key_press(egui::Key::Delete);
+        h.run_steps(2);
+        assert_eq!(h.state().confirm_recycle.as_ref().map(Vec::len), Some(2), "Delete after Ctrl+clicks");
+        h.state_mut().confirm_recycle = None;
+        h.run_steps(2);
+        // On Recent too: a click on a clip there, then Delete.
+        (h.state_mut().view, h.state_mut().selected) = (ClipsView::Games, None);
+        h.state_mut().picked.clear();
+        h.run_steps(2);
+        egui_kittest::kittest::Queryable::get_all_by_label(&h, "b").next().unwrap().click();
+        h.run_steps(2);
+        assert_eq!(h.state().selected.as_ref(), Some(&dir.join("b.png")), "picked on Recent");
+        h.key_press(egui::Key::Delete);
+        h.run_steps(2);
+        assert_eq!(h.state().confirm_recycle.as_ref().map(Vec::len), Some(1), "Delete on Recent");
+        h.state_mut().confirm_recycle = None;
+        h.run_steps(2);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "nothing recycled");
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);

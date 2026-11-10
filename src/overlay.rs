@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetForegroundWindow, GetWindowRect, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_HIDE, SW_RESTORE,
+    FindWindowExW, GetForegroundWindow, GetWindowRect, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_HIDE, SW_RESTORE,
     SW_SHOWMAXIMIZED, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
 };
 use windows::core::PCWSTR;
@@ -28,11 +28,6 @@ pub fn set_window(hwnd: isize) {
         let h = HWND(hwnd as *mut _);
         SetWindowLongPtrW(h, GWL_STYLE, GetWindowLongPtrW(h, GWL_STYLE) | WS_CLIPCHILDREN.0 as isize);
     }
-}
-
-/// The app window's handle, for the clip player.
-pub fn raw() -> Option<isize> {
-    WINDOW.get().copied()
 }
 
 pub fn hwnd() -> Option<HWND> {
@@ -89,12 +84,37 @@ pub fn show() {
     }
 }
 
-/// Brings up the window of the copy that's already running (used by a second launch).
+/// Brings up the window of the copy that's already running (used by a second launch). A File
+/// Explorer window on the install folder has the same title, so the window also has to belong to
+/// a process run from an exe with this one's file name.
 pub fn show_existing() {
     let title: Vec<u16> = crate::APP_TITLE.encode_utf16().chain([0]).collect();
-    if let Ok(window) = unsafe { FindWindowW(None, PCWSTR(title.as_ptr())) } {
-        bring_up(window, false);
+    let ours = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+    let mut after = None;
+    while let Ok(window) = unsafe { FindWindowExW(None, after, None, PCWSTR(title.as_ptr())) } {
+        if ours.is_some() && exe_name(window) == ours {
+            bring_up(window, false);
+            return;
+        }
+        after = Some(window);
     }
+}
+
+/// The lowercase file name of the exe that made `window`, if it can be read.
+fn exe_name(window: HWND) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    let read = unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len) };
+    let _ = unsafe { CloseHandle(process) };
+    read.ok()?;
+    let path = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]));
+    path.file_name().map(|n| n.to_string_lossy().to_lowercase())
 }
 
 /// Restores the window on top of everything; `center` puts it in the middle of the monitor

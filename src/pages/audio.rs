@@ -213,6 +213,8 @@ impl App {
             if ui.add_enabled(!mics.is_empty(), egui::Checkbox::new(&mut denoise, "Reduce background noise on my mic")).on_hover_text("Filters out fans, keyboards and hum from your mic").changed() {
                 self.cfg.noise = if denoise { "rnnoise" } else { "off" }.into();
             }
+            ui.checkbox(&mut self.cfg.center_sound, "Even out sound that's louder on one side (experimental)")
+                .on_hover_text("After a clip is saved, a track that's louder on one side all the way through is raised on the quiet side, so it plays centered for whoever you share it with. Your mic stays in the middle. Off: clips are kept exactly as recorded.");
             let n = self.cfg.tracks();
             if self.cfg.chat_tracks[..n].iter().any(|&t| t) && !self.open_apps.iter().any(|a| a.exe.eq_ignore_ascii_case(&devices::chat_app().exe)) {
                 ui.label(RichText::new("Discord isn't open right now. Its voice chat is saved whenever it is.").small().color(pal().amber));

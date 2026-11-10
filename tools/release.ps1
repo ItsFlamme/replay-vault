@@ -14,8 +14,15 @@ cargo build --release --locked --target-dir target\dist
 if ($LASTEXITCODE) { throw 'cargo build failed' }
 
 $dist = Join-Path (Get-Location) 'dist'
+# A copy running from dist\ keeps it from being emptied: build into a fresh folder instead.
+if (Test-Path $dist) {
+    try { Remove-Item $dist -Recurse -Force }
+    catch {
+        $dist = Join-Path (Get-Location) ('dist-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        Write-Host "dist\ is in use (a copy running from it?), so this build goes to $dist"
+    }
+}
 $stage = Join-Path $dist 'stage'
-if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory $stage | Out-Null
 Copy-Item target\dist\release\replay-vault.exe, LICENSE, NOTICE, THIRD-PARTY-NOTICES.md, README.md $stage
 

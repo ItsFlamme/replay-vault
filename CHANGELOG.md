@@ -2,6 +2,49 @@
 
 Notable changes in each release. The app's What's new page is built from this file.
 
+## 0.2.1
+
+### Changed
+
+- Evening out sound that's louder on one side is now an experimental option on the Audio page, off to start with. Clips are kept exactly as recorded unless you turn it on.
+- Esc no longer hides the window. It still closes menus and dialogs and lets go of picked clips. The X or the show/hide key hides it.
+- Deleting a clip with Del or Move to Recycle Bin now asks first, the same as for several clips. The question says how many clips and how much space they take. Ctrl+click or Shift+click picks several, Ctrl+A picks all.
+
+### Fixed
+
+- After the recorder restarts (saving settings, for example), typing goes to the window you were in again, instead of to the hidden recorder until you clicked something.
+- Clicking a clip's name or the line under it now picks the clip, so Del asks to delete it. Before, that click only selected the text.
+- Del now works on a clip picked in Recent clips too, not only in All clips.
+- A full recording is finished and saved properly when you quit, remove the app or change settings, instead of being cut off and unplayable.
+- Encoder effort Balanced and Max FPS now really lighten the NVIDIA encoder on current OBS versions.
+- Clip sound follows you when you switch or unplug headphones, instead of going silent until the clip is reopened.
+- Trimming or exporting a .mkv or .mov clip works: the copy is saved as an .mp4.
+- The Clip saved popup is the right size on screens set to 150% or 200% scaling.
+- The status at the bottom of the sidebar no longer runs off the window when Version X is out or Key clash shows.
+- Opening the app again while it's running brings up its window, even with File Explorer open on its folder.
+- GIFs of clips under 15 fps play at the right speed.
+- A trim or GIF that finishes after you leave the trim screen says it was saved and shows up in your clips.
+- Renaming a clip to the name of one you deleted outside the app no longer gives it the old clip's star, tags or note.
+- If the private OBS folder moves, the firewall rule follows it, so other devices stay blocked.
+- The support zip hides your user name, email addresses and link details, the same way feedback does.
+- Portable updates check the download again right before putting it in place.
+- The window no longer stutters every few seconds with a big clips folder or one on a NAS: the folder is read in the background.
+- Setting a key no longer catches Alt+Tab or a key pressed in another window: switching away cancels it, and your other keys work again at once.
+- After Ctrl+clicking clips, Enter and F2 act on the one that's highlighted, and Del asks about the clips picked.
+- A send that fails on the Feedback page doesn't count toward the 2 a day, and it always includes the latest log lines.
+- With no internet, the Clips page no longer asks Steam for game covers over and over (once every 10 minutes).
+- A clip that couldn't be moved to the Recycle Bin (open in another app) stays in your picks and the montage.
+- Export for sharing works on clips with no sound.
+- After saving a trim, the clip plays with its usual sound again instead of the trim's track volumes.
+- A playing clip pauses whenever the window hides (the X, the tray icon), not only with the show/hide key.
+- If you turned instant replay off (or it paused with no game open), it stays off when the recorder restarts or you save settings.
+- A recorder that can't start (its drive unplugged) is retried every 20 seconds instead of every 2, and Remove from this PC no longer starts it again.
+- Settings and share links are saved so a crash can't leave the file half written.
+- Post to Discord uses the saved webhook, not one typed on General but not saved.
+- When a clip's sound was louder on one side and your mic was on the same track, evening it out also pushed your voice to one side. With the option on, your voice now stays in the middle.
+- Stars, tags and notes are saved so that a crash or a full disk can't leave the file half written, and yesterday's copy is kept to fall back on.
+- The covers folder no longer fills with a small file for every window you had open. Those files are cleaned up when the app starts.
+
 ## 0.2.0
 
 ### New

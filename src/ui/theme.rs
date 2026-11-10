@@ -44,11 +44,30 @@ pub(crate) fn accent_of() -> (Color32, Color32, Color32) {
     match ACCENTS.get(ACCENT.load(std::sync::atomic::Ordering::Relaxed) as usize) {
         Some(&(_, main, light, dim)) => (main, light, dim),
         None => {
-            let [_, r, g, b] = CUSTOM.load(std::sync::atomic::Ordering::Relaxed).to_be_bytes();
-            let main = fit_accent(Color32::from_rgb(r, g, b), pal());
+            let main = fitted_custom();
             (main, main.lerp_to_gamma(Color32::WHITE, 0.35), main.lerp_to_gamma(Color32::BLACK, 0.52))
         }
     }
+}
+
+/// The last custom accent fitted by `fit_accent`: the color, the Retro and light flags and a set
+/// bit in the high half, the fitted color in the low. `accent_of` runs many times a frame and
+/// fitting takes hundreds of contrast checks, so it's redone only when one of those changes.
+static FITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn fitted_custom() -> Color32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let custom = CUSTOM.load(Relaxed) & 0xFF_FFFF;
+    let key = custom as u64 | (retro() as u64) << 24 | (LIGHT.load(Relaxed) as u64) << 25 | 1 << 26;
+    let cached = FITTED.load(Relaxed);
+    if cached >> 32 == key {
+        let [_, r, g, b] = (cached as u32).to_be_bytes();
+        return Color32::from_rgb(r, g, b);
+    }
+    let [_, r, g, b] = custom.to_be_bytes();
+    let main = fit_accent(Color32::from_rgb(r, g, b), pal());
+    FITTED.store(key << 32 | u32::from_be_bytes([0, main.r(), main.g(), main.b()]) as u64, Relaxed);
+    main
 }
 
 pub(crate) fn accent() -> Color32 {

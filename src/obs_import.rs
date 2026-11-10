@@ -156,7 +156,7 @@ fn apply_from(root: &std::path::Path, cfg: &mut Config, mon: &Monitor, present: 
             _ => get(&basic, "Video", "FPSCommon").and_then(|s| s.parse::<f64>().ok()),
         };
         if let Some(f) = fps {
-            cfg.fps = (f.round() as u32).clamp(10, 360);
+            cfg.fps = (f.round() as u32).clamp(10, 240); // as Config::sanitize allows
         }
         got.push("resolution, frame rate");
     }

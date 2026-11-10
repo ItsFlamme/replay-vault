@@ -20,6 +20,9 @@ const AGENT: &str = "replay-vault";
 /// %LOCALAPPDATA%\replay-vault. An OBS copy installed before the rename stays where it is
 /// (obs-instant-replay): moving it would break the firewall rule and graphics setting that name its exe.
 fn base() -> PathBuf {
+    if let Some(d) = crate::config::local_data() {
+        return d.join("obs");
+    }
     let root = dirs::data_local_dir().unwrap_or_default();
     let old = root.join("obs-instant-replay");
     if old.exists() { old } else { root.join("replay-vault") }
@@ -65,7 +68,7 @@ fn secure_dir(dir: &Path) -> anyhow::Result<Option<String>> {
         return Ok(Some(problem));
     }
     // So nothing in it is run again: the OBS copy is downloaded and checked afresh.
-    for name in ["obs-studio", "obs-studio.update", "obs-studio.old", "obs-download.zip"] {
+    for name in ["obs-studio", "obs-studio.update", "obs-studio.old", "obs-studio.partial", "obs-download.zip"] {
         let p = dir.join(name);
         let r = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
         if let Err(e) = r
@@ -217,7 +220,7 @@ pub fn private_dir() -> PathBuf {
 /// these by name, so anything else in a folder the user picked stays. Returns what couldn't go.
 pub fn recycle_install_root() -> Vec<String> {
     let root = install_root();
-    let ours = [private_dir(), staged_dir(), root.join("obs-studio.old"), root.join("obs-download.zip"), update_stamp(), crate::app_update::installer_path()];
+    let ours = [private_dir(), staged_dir(), root.join("obs-studio.old"), root.join("obs-studio.partial"), root.join("obs-download.zip"), update_stamp(), crate::app_update::installer_path()];
     let problems = ours
         .iter()
         .filter(|p| p.exists())
@@ -255,10 +258,6 @@ pub fn portable_install_root(exe: &Path) -> Option<PathBuf> {
 pub fn find() -> Option<PathBuf> {
     let exe = exe_in(&private_dir());
     exe.exists().then_some(exe)
-}
-
-pub fn is_private(exe: &Path) -> bool {
-    exe.starts_with(private_dir())
 }
 
 /// OBS needs Microsoft's Visual C++ runtime, which the portable zip doesn't include.
@@ -432,7 +431,7 @@ pub fn install(firewall: bool, repaint: impl Fn() + Send + 'static) -> Shared {
                 let rel = latest_release().map_err(|e| anyhow::anyhow!("{e:#}. Check your internet connection"))?;
                 fetch(&rel, &private_dir(), p)?;
             }
-            if let Some(exe) = find().filter(|e| firewall && is_private(e) && !firewall_rule_exists()) {
+            if firewall && let Some(exe) = find() {
                 firewall_rule(exe, p)?;
             }
             Ok(())
@@ -486,18 +485,73 @@ const FIREWALL_RULE: &str = "Replay Vault recorder";
 const OLD_FIREWALL_RULE: &str = "Instant Replay recorder";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Whether our firewall rule for the private copy is in place (readable without admin).
+/// Whether our firewall rule is in place for the private copy where it is now (readable without
+/// admin). A rule left for another folder (OBS moved to another drive) doesn't count.
 pub fn firewall_rule_exists() -> bool {
-    rule_exists(FIREWALL_RULE) || rule_exists(OLD_FIREWALL_RULE)
+    rule_state(&exe_in(&private_dir())) == Rule::Ok
+}
+
+/// How our firewall rule stands for one OBS exe.
+#[derive(Debug, PartialEq)]
+enum Rule {
+    Missing,
+    Ok,
+    /// There, under this name, but for another program path.
+    Elsewhere(&'static str),
+}
+
+fn rule_state(exe: &Path) -> Rule {
+    let mut other = None;
+    for name in [FIREWALL_RULE, OLD_FIREWALL_RULE] {
+        let Some(listing) = show_rule(name) else { continue };
+        if lists_program(&listing, exe) {
+            return Rule::Ok;
+        }
+        other.get_or_insert(name);
+    }
+    other.map_or(Rule::Missing, Rule::Elsewhere)
 }
 
 fn rule_exists(name: &str) -> bool {
+    show_rule(name).is_some()
+}
+
+/// netsh's full listing of the rules called `name`, or None when there are none.
+fn show_rule(name: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
-    Command::new(crate::recorder::windows_exe("netsh.exe"))
-        .args(["advfirewall", "firewall", "show", "rule", &format!("name={name}")])
+    let out = Command::new(crate::recorder::windows_exe("netsh.exe"))
+        .args(["advfirewall", "firewall", "show", "rule", &format!("name={name}"), "verbose"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .is_ok_and(|o| o.status.success())
+        .ok()?;
+    out.status.success().then(|| oem_text(&out.stdout))
+}
+
+/// Whether a netsh rule listing has `exe` as a rule's program: a line whose value (after the first
+/// colon, whatever the field is called in this Windows language) is its path, in any case.
+fn lists_program(listing: &str, exe: &Path) -> bool {
+    let exe = exe.to_string_lossy().to_lowercase();
+    listing.lines().filter_map(|l| l.split_once(':')).any(|(_, v)| v.trim().to_lowercase() == exe)
+}
+
+/// netsh's output, which comes in the console's OEM code page, not UTF-8: a path with letters
+/// outside ASCII (an accented user name) only compares right decoded.
+fn oem_text(bytes: &[u8]) -> String {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MultiByteToWideChar(code_page: u32, flags: u32, s: *const u8, len: i32, out: *mut u16, out_len: i32) -> i32;
+    }
+    const CP_OEMCP: u32 = 1;
+    let Ok(len) = i32::try_from(bytes.len()) else { return String::from_utf8_lossy(bytes).into_owned() };
+    if bytes.is_ascii() {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    unsafe {
+        let n = MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0).max(0);
+        let mut wide = vec![0u16; n as usize];
+        let n = MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n).max(0);
+        String::from_utf16_lossy(&wide[..n as usize])
+    }
 }
 
 /// OBS's WebSocket listens on every network interface and can't be limited to this PC, so a
@@ -509,17 +563,26 @@ pub fn add_firewall_rule(exe: PathBuf, repaint: impl Fn() + Send + 'static) -> S
     spawn(move |p| firewall_rule(exe, p), repaint)
 }
 
+/// Adds our rule for `exe`, or points it at `exe` if it's there for another path. Nothing to do,
+/// and no prompt, when it's already right.
 fn firewall_rule(exe: PathBuf, p: &Shared) -> anyhow::Result<()> {
+    let (args, done) = match rule_state(&exe) {
+        Rule::Ok => return Ok(()),
+        Rule::Elsewhere(name) => (
+            format!("advfirewall firewall set rule name=\"{name}\" new program=\"{}\"", exe.display()),
+            "Pointed the firewall rule at the private OBS copy's new folder.",
+        ),
+        Rule::Missing => (
+            format!("advfirewall firewall add rule name=\"{FIREWALL_RULE}\" dir=in action=block enable=yes profile=any program=\"{}\"", exe.display()),
+            "Added a firewall rule blocking incoming connections to the private OBS copy.",
+        ),
+    };
     set(p, "Waiting for Windows to allow the firewall rule", 0, 0);
-    let args = format!(
-        "advfirewall firewall add rule name=\"{FIREWALL_RULE}\" dir=in action=block enable=yes profile=any program=\"{}\"",
-        exe.display()
-    );
     let code = run_elevated(&crate::recorder::windows_exe("netsh.exe"), &args)?;
-    if code != 0 || !firewall_rule_exists() {
+    if code != 0 || rule_state(&exe) != Rule::Ok {
         anyhow::bail!("the firewall rule wasn't added (netsh code {code})");
     }
-    crate::log::write("Added a firewall rule blocking incoming connections to the private OBS copy.");
+    crate::log::write(done);
     Ok(())
 }
 
@@ -706,6 +769,23 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+    /// The rule counts only for the program it names; netsh's field names change with the Windows
+    /// language and its path's case can differ.
+    #[test]
+    fn firewall_rule_program_path() {
+        let exe = Path::new(r"D:\Videos\Replay Vault OBS\obs-studio\bin\64bit\obs64.exe");
+        let listing = "\r\nRule Name:                            Replay Vault recorder\r\n----------\r\nEnabled:                              Yes\r\n\
+                       Direction:                            In\r\nProgram:                              D:\\Videos\\Replay Vault OBS\\obs-studio\\bin\\64bit\\obs64.exe\r\n\
+                       Action:                               Block\r\nOk.\r\n";
+        assert!(lists_program(listing, exe));
+        assert!(lists_program(&listing.to_uppercase().replace("PROGRAM", "Programm"), exe));
+        assert!(!lists_program(listing, Path::new(r"C:\Users\x\AppData\Local\replay-vault\obs-studio\bin\64bit\obs64.exe")));
+        assert!(!lists_program("No rules match the specified criteria.\r\n", exe));
+        assert_eq!(oem_text(br"Program: C:\a.exe"), r"Program: C:\a.exe");
+        // Not ASCII: decoded as text, not dropped.
+        assert_eq!(oem_text(&[b'a', 0x82]).chars().count(), 2);
+    }
+
     /// Tests that change the install folder take turns, since it's one global.
     static ROOT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -731,7 +811,6 @@ mod tests {
         set_install_root(r"E:\Games\Instant Replay OBS");
         assert_eq!(private_dir(), PathBuf::from(r"E:\Games\Instant Replay OBS\obs-studio"));
         assert_eq!(exe_in(&private_dir()), PathBuf::from(r"E:\Games\Instant Replay OBS\obs-studio\bin\64bit\obs64.exe"));
-        assert!(is_private(&exe_in(&private_dir())));
         set_install_root("  ");
         assert_eq!(install_root(), base());
     }

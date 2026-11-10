@@ -3,13 +3,24 @@
 //! `covers\` in the app's folder: `<game>.jpg`, or `<game>.none` when Steam has no game by exactly
 //! that name (asked again after a week).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Games being looked up right now.
 static ASKING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Games found with no cover, when and whether online, so the cards don't look in the covers
+/// folder every frame. Looked at again after RECHECK, or as soon as a download ends.
+static MISSED: Mutex<Option<HashMap<String, (Instant, bool)>>> = Mutex::new(None);
+
+const RECHECK: Duration = Duration::from_secs(45);
+
+/// Whether `game` was found with no cover within RECHECK of `now`, asked the same way.
+fn missed_lately(missed: &HashMap<String, (Instant, bool)>, game: &str, online: bool, now: Instant) -> bool {
+    missed.get(game).is_some_and(|&(at, was)| was == online && now.saturating_duration_since(at) < RECHECK)
+}
 
 /// Tests use their own folder, filled only by `steam_lookup_live`.
 fn dir() -> PathBuf {
@@ -19,8 +30,15 @@ fn dir() -> PathBuf {
 /// The game's cover once it's downloaded. Until then None, and, if `online`, it's looked up in
 /// the background (never in tests).
 pub fn get(game: &str, online: bool) -> Option<PathBuf> {
+    if missed_lately(MISSED.lock().unwrap().get_or_insert_default(), game, online, Instant::now()) {
+        return None;
+    }
     let dir = dir();
-    match state(&dir, game, SystemTime::now()) {
+    let state = state(&dir, game, SystemTime::now());
+    if !matches!(state, State::Have(_)) {
+        MISSED.lock().unwrap().get_or_insert_default().insert(game.to_string(), (Instant::now(), online));
+    }
+    match state {
         State::Have(path) => Some(path),
         State::Missing => None,
         State::Ask if cfg!(test) || !online => None,
@@ -29,8 +47,13 @@ pub fn get(game: &str, online: bool) -> Option<PathBuf> {
             if fresh {
                 let game = game.to_string();
                 std::thread::spawn(move || {
-                    if let Err(e) = fetch(&dir, &game) {
+                    let got = fetch(&dir, &game);
+                    // Shown on the next look, not after RECHECK.
+                    MISSED.lock().unwrap().get_or_insert_default().remove(&game);
+                    if let Err(e) = got {
                         crate::log::write(&format!("Couldn't get the cover for {game}: {e:#}"));
+                        // Offline or Steam busy: not asked again for 10 minutes.
+                        std::thread::sleep(Duration::from_secs(600));
                     }
                     ASKING.lock().unwrap().get_or_insert_default().remove(&game);
                 });
@@ -96,6 +119,31 @@ pub fn note_title(game: &str, title: &str) {
         let _ = std::fs::remove_file(skip);
     } else if !skip.exists() && std::fs::create_dir_all(dir()).is_ok() {
         let _ = std::fs::write(skip, b"");
+    }
+}
+
+/// Removes the markers (`.skip`, `.none`, a half-downloaded `.part`) of games with no folder in
+/// the clips folder or the archive any more, and those older versions wrote for every window
+/// seen. Covers stay. Does nothing if either folder isn't there (a drive or NAS that's off).
+pub fn tidy(clips: &Path, archive: Option<&Path>) {
+    tidy_in(&dir(), clips, archive);
+}
+
+fn tidy_in(dir: &Path, clips: &Path, archive: Option<&Path>) {
+    let roots: Vec<&Path> = std::iter::once(clips).chain(archive).collect();
+    if !roots.iter().all(|r| r.is_dir()) {
+        return;
+    }
+    let Ok(files) = std::fs::read_dir(dir) else { return };
+    let mut removed = 0;
+    for path in files.flatten().map(|f| f.path()) {
+        let marker = path.extension().is_some_and(|e| ["skip", "none", "part"].iter().any(|m| e.eq_ignore_ascii_case(m)));
+        if marker && path.file_stem().is_some_and(|game| !roots.iter().any(|r| r.join(game).is_dir())) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        crate::log::write(&format!("Removed {removed} cover notes for games with no clips."));
     }
 }
 
@@ -232,6 +280,50 @@ mod tests {
         std::fs::write(dir.join("Inbox (3).skip"), b"").unwrap();
         assert_eq!(state(&dir, "Inbox (3)", now), State::Missing, "named after a browser tab: never asked");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Markers of games with no clips folder go, everything else stays; nothing goes if the
+    /// clips folder is missing.
+    #[test]
+    fn tidy_removes_orphan_markers() {
+        let root = std::env::temp_dir().join("instant-replay-covers-tidy");
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, clips) = (root.join("covers"), root.join("clips"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["Inbox (3).skip", "Gone.none", "Gone.part", "Gone.jpg", "Kept.skip", "Kept.none"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        tidy_in(&dir, &clips, None);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 6, "no clips folder: nothing removed");
+        std::fs::create_dir_all(clips.join("Kept")).unwrap();
+        tidy_in(&dir, &clips, None);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|f| f.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["Gone.jpg", "Kept.none", "Kept.skip"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A game with no cover isn't looked for again until RECHECK has gone by, unless it's now
+    /// asked the other way (covers just turned on or off).
+    #[test]
+    fn misses_are_remembered_for_a_while() {
+        let now = Instant::now();
+        let missed: HashMap<String, (Instant, bool)> = [("VALORANT".to_string(), (now, true))].into();
+        assert!(missed_lately(&missed, "VALORANT", true, now + Duration::from_secs(10)));
+        assert!(!missed_lately(&missed, "VALORANT", true, now + RECHECK));
+        assert!(!missed_lately(&missed, "VALORANT", false, now), "asked the other way");
+        assert!(!missed_lately(&missed, "Elden Ring", true, now));
+        // Through get: a cover saved after a miss shows once the miss is forgotten.
+        let (game, dir) = ("Replay Vault miss test", dir());
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpg = dir.join(format!("{game}.jpg"));
+        let _ = std::fs::remove_file(&jpg);
+        assert_eq!(get(game, false), None);
+        std::fs::write(&jpg, b"x").unwrap();
+        assert_eq!(get(game, false), None, "remembered as missing");
+        MISSED.lock().unwrap().get_or_insert_default().remove(game);
+        assert_eq!(get(game, false), Some(jpg.clone()));
+        std::fs::remove_file(&jpg).unwrap();
     }
 
     /// A saved cover is used, a "no match" is trusted for a week, Desktop is never asked about.

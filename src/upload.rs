@@ -29,26 +29,33 @@ pub struct Job {
 }
 
 fn file() -> PathBuf {
-    crate::config::dir().join("uploads.json")
+    if cfg!(test) { std::env::temp_dir().join("instant-replay-uploads-test.json") } else { crate::config::dir().join("uploads.json") }
 }
 
 /// Clip path -> its share link.
 pub fn links() -> BTreeMap<String, Link> {
-    std::fs::read_to_string(file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    crate::clips::load_json(&file())
+}
+
+/// Changes the saved links. One change at a time, so two uploads ending together both stay; the
+/// file is replaced whole (clips::save_json), so a crash never loses the delete keys.
+fn edit_links(change: impl FnOnce(&mut BTreeMap<String, Link>)) {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock();
+    let mut map = links();
+    change(&mut map);
+    crate::clips::save_json(&file(), &map);
 }
 
 /// Keeps a clip's share link after it's renamed.
 pub fn renamed(old: &Path, new: &Path) {
-    let mut map = links();
-    if let Some(l) = map.remove(&old.display().to_string()) {
-        map.insert(new.display().to_string(), l);
-        save_links(&map);
+    if links().contains_key(&old.display().to_string()) {
+        edit_links(|map| {
+            if let Some(l) = map.remove(&old.display().to_string()) {
+                map.insert(new.display().to_string(), l);
+            }
+        });
     }
-}
-
-fn save_links(map: &BTreeMap<String, Link>) {
-    let _ = std::fs::create_dir_all(crate::config::dir());
-    let _ = std::fs::write(file(), serde_json::to_string_pretty(map).unwrap_or_default());
 }
 
 /// Counts bytes as they're read, for the progress bar.
@@ -113,7 +120,6 @@ fn spawn(repaint: impl Fn() + Send + 'static, work: impl FnOnce(&Arc<Job>) -> an
 fn post_file(url: &str, field: &str, path: &Path, job: &Arc<Job>) -> Result<(u16, String), ureq::Error> {
     let file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    job.total.store(len, Ordering::Relaxed);
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_else(|| "mp4".into());
     let mime = match ext.as_str() {
         "mkv" => "video/x-matroska",
@@ -127,6 +133,9 @@ fn post_file(url: &str, field: &str, path: &Path, job: &Arc<Job>) -> Result<(u16
     let head = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"clip.{ext}\"\r\nContent-Type: {mime}\r\n\r\n");
     let tail = format!("\r\n--{boundary}--\r\n");
     let total = head.len() as u64 + len + tail.len() as u64;
+    // Progress counts the form around the file too, so it ends at exactly 100%.
+    job.sent.store(0, Ordering::Relaxed);
+    job.total.store(total, Ordering::Relaxed);
     let mut body = Counted { inner: head.as_bytes().chain(file).chain(tail.as_bytes()), job: job.clone() };
     let mut resp = agent()
         .post(url)
@@ -148,9 +157,7 @@ fn send(path: &Path, job: &Arc<Job>) -> anyhow::Result<String> {
         anyhow::bail!("{}", refusal(status, &text));
     };
     anyhow::ensure!(link.starts_with("https://"), "kappa.lol sent back a link that isn't https, so it wasn't kept.");
-    let mut map = links();
-    map.insert(path.display().to_string(), Link { link: link.into(), key: key.into() });
-    save_links(&map);
+    edit_links(|map| _ = map.insert(path.display().to_string(), Link { link: link.into(), key: key.into() }));
     Ok(link.into())
 }
 
@@ -170,9 +177,7 @@ pub fn delete(path: &Path, repaint: impl Fn() + Send + 'static) -> Arc<Job> {
         let ok = serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| v["success"] == true);
         // 404: already gone from the host.
         anyhow::ensure!(ok || status == 404, "Couldn't delete it, try again in a bit. The link still works.");
-        let mut map = links();
-        map.remove(&id);
-        save_links(&map);
+        edit_links(|map| _ = map.remove(&id));
         crate::log::write(&format!("Deleted the share link for {id}"));
         Ok("deleted".into())
     })
@@ -291,9 +296,10 @@ mod tests {
         let has = |needle: &[u8]| request.windows(needle.len()).any(|w| w == needle);
         assert!(has(b"name=\"files[0]\"; filename=\"clip.mp4\""));
         assert!(has(&bytes), "the file goes in whole");
-        // Progress: the file's size, and all of it (plus the form around it) sent.
-        assert_eq!(job.total.load(Ordering::Relaxed), bytes.len() as u64);
-        assert!(job.sent.load(Ordering::Relaxed) > bytes.len() as u64);
+        // Progress: the file plus the form around it, all of it sent and no more.
+        let total = job.total.load(Ordering::Relaxed);
+        assert!(total > bytes.len() as u64);
+        assert_eq!(job.sent.load(Ordering::Relaxed), total);
         // A refusal comes back in plain words.
         let (url, server) = serve("429 Too Many Requests");
         let err = send_discord(&url, &clip, &job).unwrap_err().to_string();

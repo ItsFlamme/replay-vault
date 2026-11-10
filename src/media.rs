@@ -70,6 +70,33 @@ pub fn duration(path: &Path) -> anyhow::Result<f64> {
     length(&reader(path, false)?)
 }
 
+/// What a clip holds, read in one go.
+#[derive(Clone, Copy, Debug)]
+pub struct Probe {
+    /// Length in seconds.
+    pub secs: f64,
+    /// The video's frames per second; None if it doesn't say.
+    pub fps: Option<f64>,
+    /// The video's width and height in pixels.
+    pub size: (u32, u32),
+    /// Number of audio tracks.
+    pub tracks: usize,
+}
+
+/// Length, frame rate, size and audio tracks of `path`, from one reader.
+pub fn probe(path: &Path) -> anyhow::Result<Probe> {
+    probe_reader(&reader(path, false)?)
+}
+
+fn probe_reader(r: &IMFSourceReader) -> anyhow::Result<Probe> {
+    let video = unsafe { r.GetNativeMediaType(FIRST_VIDEO, 0)? };
+    let size = unsafe { video.GetUINT64(&MF_MT_FRAME_SIZE)? };
+    // Pairs packed as high and low 32 bits; the frame rate as numerator over denominator.
+    let rate = unsafe { video.GetUINT64(&MF_MT_FRAME_RATE) }.ok();
+    let fps = rate.map(|p| ((p >> 32) as f64, (p & 0xffff_ffff) as f64)).filter(|&(num, den)| num > 0.0 && den > 0.0).map(|(num, den)| num / den);
+    Ok(Probe { secs: length(r)?, fps, size: ((size >> 32) as u32, size as u32), tracks: audio_streams(r).len() })
+}
+
 /// The frame at `at` seconds, scaled down to at most `max_w` pixels wide.
 pub fn frame(path: &Path, at: f64, max_w: usize) -> anyhow::Result<Frame> {
     decode_frame(path, at, max_w, true)
@@ -81,8 +108,16 @@ pub fn keyframe(path: &Path, at: f64, max_w: usize) -> anyhow::Result<Frame> {
     decode_frame(path, at, max_w, false)
 }
 
-/// `frame`, or with `exact` false the first frame decoded after seeking (the keyframe).
-fn decode_frame(path: &Path, at: f64, max_w: usize, exact: bool) -> anyhow::Result<Frame> {
+/// How an RGB32 reader's frames are laid out (see rgb_reader).
+struct Rgb {
+    w: usize,
+    h: usize,
+    /// Bytes from one row to the next; negative when the rows are stored bottom-up.
+    stride: i32,
+}
+
+/// A reader of just `path`'s video, decoded to RGB32, and how its frames are laid out.
+fn rgb_reader(path: &Path) -> anyhow::Result<(IMFSourceReader, Rgb)> {
     let r = reader(path, true)?;
     unsafe {
         r.SetStreamSelection(ALL_STREAMS, false)?;
@@ -94,7 +129,50 @@ fn decode_frame(path: &Path, at: f64, max_w: usize, exact: bool) -> anyhow::Resu
         let current = r.GetCurrentMediaType(FIRST_VIDEO)?;
         let size = current.GetUINT64(&MF_MT_FRAME_SIZE)?;
         let (w, h) = ((size >> 32) as usize, (size & 0xffff_ffff) as usize);
-        let stride = current.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or((w * 4) as i32);
+        let stride = current.GetUINT32(&MF_MT_DEFAULT_STRIDE).map_or((w * 4) as i32, |s| s as i32);
+        Ok((r, Rgb { w, h, stride }))
+    }
+}
+
+impl Rgb {
+    /// The size a frame comes out at `max_w` pixels wide at most, keeping its shape.
+    fn fit(&self, max_w: usize) -> (usize, usize) {
+        let ow = max_w.min(self.w).max(1);
+        (ow, (self.h * ow).div_ceil(self.w.max(1)))
+    }
+
+    /// The decoded frame in `s` scaled to `ow`x`oh` (scale), as RGBA.
+    unsafe fn rgba(&self, s: &IMFSample, ow: usize, oh: usize) -> anyhow::Result<Vec<u8>> {
+        let row = self.stride.unsigned_abs() as usize;
+        let mut px = vec![0u8; ow * oh * 4];
+        unsafe {
+            let buf = s.ConvertToContiguousBuffer()?;
+            let (mut ptr, mut len) = (std::ptr::null_mut(), 0u32);
+            buf.Lock(&mut ptr, None, Some(&mut len))?;
+            let data = std::slice::from_raw_parts(ptr, len as usize);
+            let fits = row >= self.w * 4 && data.len() >= row * self.h;
+            if fits {
+                scale(data, row, 4, [0, 0, self.w, self.h], &mut px, ow, oh);
+            }
+            let _ = buf.Unlock();
+            anyhow::ensure!(fits, "the video frames are smaller than the clip says");
+        }
+        // BGRA to RGBA; a negative stride means the rows came bottom-up.
+        let mut rgba: Vec<u8> = Vec::with_capacity(px.len());
+        for y in 0..oh {
+            let sy = if self.stride < 0 { oh - 1 - y } else { y };
+            for [b, g, r, _] in px[sy * ow * 4..(sy + 1) * ow * 4].as_chunks::<4>().0 {
+                rgba.extend_from_slice(&[*r, *g, *b, 255]);
+            }
+        }
+        Ok(rgba)
+    }
+}
+
+/// `frame`, or with `exact` false the first frame decoded after seeking (the keyframe).
+fn decode_frame(path: &Path, at: f64, max_w: usize, exact: bool) -> anyhow::Result<Frame> {
+    let (r, layout) = rgb_reader(path)?;
+    unsafe {
         seek(&r, at)?;
         // Decoding starts at the keyframe before `at`; read on until we reach it.
         let target = (at * SEC) as i64;
@@ -113,26 +191,8 @@ fn decode_frame(path: &Path, at: f64, max_w: usize, exact: bool) -> anyhow::Resu
             }
         }
         let sample = last.ok_or_else(|| anyhow::anyhow!("no video frame"))?;
-        let buf = sample.ConvertToContiguousBuffer()?;
-        let mut ptr = std::ptr::null_mut();
-        let mut len = 0u32;
-        buf.Lock(&mut ptr, None, Some(&mut len))?;
-        let data = std::slice::from_raw_parts(ptr, len as usize);
-        let row = stride.unsigned_abs() as usize;
-        let scale = w.div_ceil(max_w.max(1)).max(1);
-        let (ow, oh) = (w / scale, h / scale);
-        let mut rgba = Vec::with_capacity(ow * oh * 4);
-        for y in 0..oh {
-            // A negative stride means the image is stored bottom-up.
-            let sy = if stride < 0 { h - 1 - y * scale } else { y * scale };
-            for x in 0..ow {
-                let i = sy * row + x * scale * 4;
-                let px = data.get(i..i + 4).unwrap_or(&[0, 0, 0, 0]);
-                rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
-            }
-        }
-        let _ = buf.Unlock();
-        Ok(Frame { width: ow, height: oh, rgba })
+        let (width, height) = layout.fit(max_w);
+        Ok(Frame { width, height, rgba: layout.rgba(&sample, width, height)? })
     }
 }
 
@@ -258,15 +318,6 @@ unsafe fn timeline_start(s: &IMFSample, ts: i64) -> i64 {
     unsafe { s.GetUINT64(&MFSampleExtension_DecodeTimestamp) }.map_or(ts, |d| (d as i64).min(ts))
 }
 
-/// Frames per second of the clip's video; None if it can't be read.
-pub fn frame_rate(path: &Path) -> Option<f64> {
-    let r = reader(path, false).ok()?;
-    let packed = unsafe { r.GetNativeMediaType(FIRST_VIDEO, 0).and_then(|t| t.GetUINT64(&MF_MT_FRAME_RATE)) }.ok()?;
-    // Numerator in the high 32 bits, denominator in the low.
-    let (num, den) = ((packed >> 32) as f64, (packed & 0xffff_ffff) as f64);
-    (num > 0.0 && den > 0.0).then(|| num / den)
-}
-
 /// Number of audio tracks in the clip.
 pub fn audio_tracks(path: &Path) -> anyhow::Result<usize> {
     Ok(audio_streams(&reader(path, false)?).len())
@@ -354,8 +405,17 @@ pub fn channel_energy(path: &Path) -> anyhow::Result<Vec<(f64, f64)>> {
 /// Writes `src` to `dst` with every sound track that's louder on one side brought back to the
 /// middle (see centering), from its `energy` (channel_energy); other tracks and the video are
 /// copied as they are. Returns false, writing nothing, when every track is already even.
-pub fn center(src: &Path, dst: &Path, energy: &[(f64, f64)]) -> anyhow::Result<bool> {
-    let fixes: Vec<Option<Center>> = energy.iter().map(|&(l, r)| centering(l, r)).collect();
+/// On the tracks in `mic_mixed` (bit 0 = track 1) the loud side is copied instead of the quiet
+/// side raised, which would move the mic in them off to that side.
+pub fn center(src: &Path, dst: &Path, energy: &[(f64, f64)], mic_mixed: u8) -> anyhow::Result<bool> {
+    let fixes: Vec<Option<Center>> = energy
+        .iter()
+        .enumerate()
+        .map(|(t, &(l, r))| match centering(l, r) {
+            Some(Center::Gains(..)) if t < 8 && mic_mixed & 1 << t != 0 => Some(Center::Copy(l > r)),
+            fix => fix,
+        })
+        .collect();
     if fixes.iter().all(Option::is_none) {
         return Ok(false);
     }
@@ -503,10 +563,15 @@ fn remix(src: &Path, dst: &Path, start: f64, end: f64, gains: &[f32], enc: Optio
             i += 1;
         }
         let video = video.ok_or_else(|| anyhow::anyhow!("the clip has no video"))?;
-        anyhow::ensure!(tracks > 0, "the clip has no sound to mix");
         anyhow::ensure!(gains.len() == tracks, "got {} track volumes for {tracks} audio tracks", gains.len());
-        let mixed = w.AddStream(&audio_type(true)?)?;
-        w.SetInputMediaType(mixed, &audio_type(false)?, None)?;
+        // A clip with no sound at all (one dropped into the folder) gets a copy with no sound.
+        let mixed = if tracks > 0 {
+            let mixed = w.AddStream(&audio_type(true)?)?;
+            w.SetInputMediaType(mixed, &audio_type(false)?, None)?;
+            Some(mixed)
+        } else {
+            None
+        };
         w.BeginWriting()?;
         // After a seek, video starts at the keyframe before `start` but audio only at `start`, so
         // the cut would open with up to 2 s of silence. Finding that keyframe and seeking again
@@ -595,11 +660,13 @@ fn remix(src: &Path, dst: &Path, start: f64, end: f64, gains: &[f32], enc: Optio
             }
             if let Some(m) = &mut mixer {
                 ended.iter().enumerate().filter(|(_, e)| **e).for_each(|(t, _)| m.end(t));
-                write_mix(&w, mixed, m, gains)?;
+                if let Some(mixed) = mixed {
+                    write_mix(&w, mixed, m, gains)?;
+                }
             }
         }
         anyhow::ensure!(wrote > 0, "nothing in that range");
-        if let Some(m) = &mut mixer {
+        if let (Some(m), Some(mixed)) = (&mut mixer, mixed) {
             (0..tracks).for_each(|t| m.end(t));
             write_mix(&w, mixed, m, gains)?;
         }
@@ -695,12 +762,9 @@ fn plan(share: Share, w: u32, h: u32, fps: f64, secs: f64) -> anyhow::Result<Enc
 /// when it can, else in software. `progress` hears how far along it is, 0 to 1 (twice, if a size
 /// preset came out too big and is made again).
 pub fn export(src: &Path, dst: &Path, share: Share, progress: &dyn Fn(f32)) -> anyhow::Result<()> {
-    let r = reader(src, false)?;
-    let secs = length(&r)?;
-    let size = unsafe { r.GetNativeMediaType(FIRST_VIDEO, 0)?.GetUINT64(&MF_MT_FRAME_SIZE)? };
-    let gains = track1(audio_streams(&r).len());
-    drop(r);
-    let mut e = plan(share, (size >> 32) as u32, size as u32, frame_rate(src).unwrap_or(60.0), secs)?;
+    let p = probe(src)?;
+    let (secs, gains) = (p.secs, track1(p.tracks));
+    let mut e = plan(share, p.size.0, p.size.1, p.fps.unwrap_or(60.0), secs)?;
     for again in [false, true] {
         gpu_else_cpu(dst, e, &|| false, |e| remix(src, dst, 0.0, secs, &gains, Some(e), progress))?;
         let Some(limit) = share.limit_mb().map(|mb| mb * 1_000_000) else { break };
@@ -722,67 +786,55 @@ const GIF_WIDTH: usize = 480;
 const GIF_FPS: f64 = 15.0;
 
 /// `start`..`end` seconds of `src` as a looping GIF at `dst`, 480 px wide at 15 fps, no sound.
-/// `progress` hears how far along it is, 0 to 1.
+/// It keeps the clip's speed: a frame the clip shows for longer (under 15 fps, or held) stays up
+/// as long. `progress` hears how far along it is, 0 to 1.
 pub fn save_gif(src: &Path, dst: &Path, start: f64, end: f64, progress: &dyn Fn(f32)) -> anyhow::Result<()> {
-    let r = reader(src, true)?;
+    let (r, layout) = rgb_reader(src)?;
     let end = end.min(length(&r)?);
     anyhow::ensure!(end > start, "the end has to come after the start");
     anyhow::ensure!(end - start <= GIF_MAX_SECS + 0.01, "a GIF can be up to {GIF_MAX_SECS:.0} s long");
-    unsafe {
-        r.SetStreamSelection(ALL_STREAMS, false)?;
-        r.SetStreamSelection(FIRST_VIDEO, true)?;
-        let t = MFCreateMediaType()?;
-        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
-        r.SetCurrentMediaType(FIRST_VIDEO, None, &t)?;
-        let current = r.GetCurrentMediaType(FIRST_VIDEO)?;
-        let size = current.GetUINT64(&MF_MT_FRAME_SIZE)?;
-        let (w, h) = ((size >> 32) as usize, (size & 0xffff_ffff) as usize);
-        let stride = current.GetUINT32(&MF_MT_DEFAULT_STRIDE).map_or((w * 4) as i32, |s| s as i32);
-        let row = stride.unsigned_abs() as usize;
-        let (ow, oh) = (GIF_WIDTH.min(w), (h * GIF_WIDTH.min(w)).div_ceil(w.max(1)));
-        let mut out = gif::Encoder::new(std::io::BufWriter::new(std::fs::File::create(dst)?), ow as u16, oh as u16, &[])?;
-        out.set_repeat(gif::Repeat::Infinite)?;
-        seek(&r, start)?;
-        let (start_t, end_t, step) = ((start * SEC) as i64, (end * SEC) as i64, SEC / GIF_FPS);
-        // Frame n is due at start + n steps; decoding begins at the keyframe before the start.
-        let mut n = 0u32;
-        let mut px = vec![0u8; ow * oh * 4];
-        while (n as f64 * step) < (end_t - start_t) as f64 {
-            let (mut flags, mut ts, mut sample) = (0u32, 0i64, None);
-            r.ReadSample(FIRST_VIDEO, 0, None, Some(&mut flags), Some(&mut ts), Some(&mut sample))?;
-            if ts > end_t || flags & END_OF_STREAM != 0 {
-                break;
-            }
-            let Some(sample) = sample.filter(|_| ts as f64 + step / 2.0 >= start_t as f64 + n as f64 * step) else { continue };
-            let buf = sample.ConvertToContiguousBuffer()?;
-            let (mut ptr, mut len) = (std::ptr::null_mut(), 0u32);
-            buf.Lock(&mut ptr, None, Some(&mut len))?;
-            let data = std::slice::from_raw_parts(ptr, len as usize);
-            let fits = data.len() >= row * h;
-            if fits {
-                scale(data, row, 4, [0, 0, w, h], &mut px, ow, oh);
-            }
-            let _ = buf.Unlock();
-            anyhow::ensure!(fits, "the video frames are smaller than the clip says");
-            // BGRA to RGBA; a negative stride means the rows came bottom-up.
-            let mut rgba: Vec<u8> = Vec::with_capacity(px.len());
-            for y in 0..oh {
-                let sy = if stride < 0 { oh - 1 - y } else { y };
-                for [b, g, r, _] in px[sy * ow * 4..(sy + 1) * ow * 4].as_chunks::<4>().0 {
-                    rgba.extend_from_slice(&[*r, *g, *b, 255]);
-                }
-            }
-            let mut f = gif::Frame::from_rgba_speed(ow as u16, oh as u16, &mut rgba, 10);
-            // Delays are in 1/100 s; rounded so they add up to 15 fps over the whole GIF.
-            let cs = |k: u32| (k as f64 * 100.0 / GIF_FPS).round() as u16;
-            f.delay = cs(n + 1) - cs(n);
-            out.write_frame(&f)?;
-            n += 1;
-            progress(((ts - start_t) as f64 / (end_t - start_t).max(1) as f64) as f32);
+    let (ow, oh) = layout.fit(GIF_WIDTH);
+    let mut out = gif::Encoder::new(std::io::BufWriter::new(std::fs::File::create(dst)?), ow as u16, oh as u16, &[])?;
+    out.set_repeat(gif::Repeat::Infinite)?;
+    seek(&r, start)?;
+    let (start_t, end_t, step) = ((start * SEC) as i64, (end * SEC) as i64, SEC / GIF_FPS);
+    // The GIF is `due` slots of 1/15 s from the start. A clip frame shows from the slot it's the
+    // nearest for until the next frame's; it's written once, lasting all of those.
+    let due = ((end_t - start_t) as f64 / step).ceil() as u32;
+    // Delays are in 1/100 s; rounded so they add up to 15 fps over the whole GIF.
+    let cs = |k: u32| (k as f64 * 100.0 / GIF_FPS).round() as u16;
+    let mut put = |s: &IMFSample, from: u32, to: u32| -> anyhow::Result<()> {
+        let mut rgba = unsafe { layout.rgba(s, ow, oh)? };
+        let mut f = gif::Frame::from_rgba_speed(ow as u16, oh as u16, &mut rgba, 10);
+        f.delay = cs(to) - cs(from);
+        out.write_frame(&f)?;
+        progress(to as f32 / due as f32);
+        Ok(())
+    };
+    // Slots filled so far, and the newest frame (decoding begins at the keyframe before the start).
+    let mut n = 0u32;
+    let mut held: Option<IMFSample> = None;
+    while n < due {
+        let (mut flags, mut ts, mut sample) = (0u32, 0i64, None);
+        unsafe { r.ReadSample(FIRST_VIDEO, 0, None, Some(&mut flags), Some(&mut ts), Some(&mut sample))? };
+        if ts > end_t || flags & END_OF_STREAM != 0 {
+            break;
         }
-        anyhow::ensure!(n > 0, "nothing in that range");
+        let Some(sample) = sample else { continue };
+        // The slots due before this frame is the nearest show the one held.
+        let upto = (((ts - start_t) as f64 - step / 2.0) / step).ceil().clamp(0.0, due as f64) as u32;
+        if let Some(h) = held.as_ref().filter(|_| upto > n) {
+            put(h, n, upto)?;
+            n = upto;
+        }
+        held = Some(sample);
     }
+    // The last frame lasts to the end.
+    if let Some(h) = held.as_ref().filter(|_| n < due) {
+        put(h, n, due)?;
+        n = due;
+    }
+    anyhow::ensure!(n > 0, "nothing in that range");
     Ok(())
 }
 
@@ -813,14 +865,16 @@ const MUSIC_FADE: f64 = 2.0;
 /// when it can, else in software. `progress` hears how far along it is (0 to 1); once `stop`
 /// says so it gives up with an error.
 pub fn join(parts: &[Part], dst: &Path, fades: bool, music: Option<&Music>, progress: &dyn Fn(f32), stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
-    let first = parts.first().ok_or_else(|| anyhow::anyhow!("nothing to join"))?;
-    let size = unsafe { reader(&first.path, false)?.GetNativeMediaType(FIRST_VIDEO, 0)?.GetUINT64(&MF_MT_FRAME_SIZE)? };
-    let (w, h) = ((size >> 32) as u32 & !1, size as u32 & !1);
-    let fps = frame_rate(&first.path).unwrap_or(60.0);
+    anyhow::ensure!(!parts.is_empty(), "nothing to join");
+    // Each part's clip looked at once, for its length (and the first for the size and rate).
+    let probes = parts.iter().map(|p| probe(&p.path)).collect::<anyhow::Result<Vec<_>>>()?;
+    let (w, h) = (probes[0].size.0 & !1, probes[0].size.1 & !1);
+    let fps = probes[0].fps.unwrap_or(60.0);
     // About 0.12 bits a pixel, as plan uses.
     let kbps = (w as f64 * h as f64 * fps * 0.12 / 1000.0) as u32;
     let e = Encode { crop: [0, 0, w, h], width: w, height: h, fps, kbps, hw: true };
-    gpu_else_cpu(dst, e, stop, |e| join_as(parts, dst, e, fades, music, progress, stop))
+    let lens: Vec<f64> = probes.iter().map(|p| p.secs).collect();
+    gpu_else_cpu(dst, e, stop, |e| join_as(parts, &lens, dst, e, fades, music, progress, stop))
 }
 
 /// Runs `encode` with `e` on the graphics card, and if that fails (and `stop` doesn't say to
@@ -868,13 +922,14 @@ pub fn track1(n: usize) -> Vec<f32> {
     (0..n).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect()
 }
 
-/// join, encoding as `e` says.
-fn join_as(parts: &[Part], dst: &Path, e: &Encode, fades: bool, music: Option<&Music>, progress: &dyn Fn(f32), stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
+/// join, encoding as `e` says. `lens` are the lengths of the parts' clips.
+#[allow(clippy::too_many_arguments)]
+fn join_as(parts: &[Part], lens: &[f64], dst: &Path, e: &Encode, fades: bool, music: Option<&Music>, progress: &dyn Fn(f32), stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
     let step = SEC / e.fps;
     // Each part's length in output frames; its sound is cut to match.
     let mut frames = Vec::new();
-    for p in parts {
-        let end = p.end.min(duration(&p.path)?);
+    for (p, &len) in parts.iter().zip(lens) {
+        let end = p.end.min(len);
         anyhow::ensure!(end > p.start, "the end has to come after the start");
         frames.push(((end - p.start) * e.fps).round().max(1.0) as u64);
     }
@@ -1074,8 +1129,10 @@ unsafe fn frame_pixels(r: &IMFSourceReader, stream: u32, s: &IMFSample, e: &Enco
         if fits {
             let (y, uv) = data.split_at(stride * rows);
             let (oy, ouv) = o.split_at_mut(ow * oh);
-            scale(y, stride, 1, [cx, cy, cw, ch], oy, ow, oh);
-            scale(uv, stride, 2, [cx / 2, cy / 2, cw / 2, ch / 2], ouv, ow / 2, oh / 2);
+            scale_planes(vec![
+                Plane { src: y, stride, n: 1, crop: [cx, cy, cw, ch], dst: oy, ow, oh },
+                Plane { src: uv, stride, n: 2, crop: [cx / 2, cy / 2, cw / 2, ch / 2], dst: ouv, ow: ow / 2, oh: oh / 2 },
+            ]);
         }
         let _ = buf.Unlock();
         anyhow::ensure!(fits, "the video frames are smaller than the clip says");
@@ -1111,43 +1168,76 @@ unsafe fn nv12_sample(px: &[u8], e: &Encode, time: i64, fade: f32) -> anyhow::Re
     }
 }
 
-/// Crops a plane (rows `stride` bytes apart, `n` bytes a pixel: 1 for brightness, 2 for NV12's
-/// colour pairs) to `crop` (x, y, width, height in pixels) and scales that to `ow`x`oh` into
-/// `dst`, blending the nearest four pixels.
+/// One plane of a picture for scale_planes: rows `stride` bytes apart, `n` bytes a pixel (1 for
+/// brightness, 2 for NV12's colour pairs, 4 for RGB32), cropped to `crop` (x, y, width, height
+/// in pixels) and scaled to `ow`x`oh` into `dst`.
+struct Plane<'a> {
+    src: &'a [u8],
+    stride: usize,
+    n: usize,
+    crop: [usize; 4],
+    dst: &'a mut [u8],
+    ow: usize,
+    oh: usize,
+}
+
+/// Crops a plane and scales it into `dst`, blending the nearest four pixels (see Plane).
 fn scale(src: &[u8], stride: usize, n: usize, crop: [usize; 4], dst: &mut [u8], ow: usize, oh: usize) {
-    let [cx, cy, cw, ch] = crop;
-    if (cw, ch) == (ow, oh) {
-        for (y, row) in dst.chunks_exact_mut(ow * n).enumerate() {
-            let at = (cy + y) * stride + cx * n;
-            row.copy_from_slice(&src[at..at + ow * n]);
+    scale_planes(vec![Plane { src, stride, n, crop, dst, ow, oh }]);
+}
+
+/// Where output pixel `i` of `out` falls (its centre) in `size` pixels: the pixel before it, how
+/// far on to the next (0 to 256), and the next.
+fn pos(i: usize, out: usize, size: usize) -> (usize, u32, usize) {
+    let f = ((i as f64 + 0.5) * size as f64 / out as f64 - 0.5).clamp(0.0, (size - 1) as f64);
+    (f as usize, (f.fract() * 256.0) as u32, (f as usize + 1).min(size - 1))
+}
+
+/// scale, for all the planes of a picture at once. Bands of rows go to several cores, one band of every
+/// plane per thread, so a frame starts its threads once: a full-length export scales thousands
+/// of frames. A small picture (a thumbnail) is done on this thread.
+fn scale_planes(mut planes: Vec<Plane>) {
+    let bytes: usize = planes.iter().map(|p| p.dst.len()).sum();
+    let threads = if bytes < 1 << 17 { 1 } else { std::thread::available_parallelism().map_or(1, |c| c.get().min(8)) };
+    let cols: Vec<Vec<_>> = planes.iter().map(|p| (0..p.ow).map(|x| pos(x, p.ow, p.crop[2])).collect()).collect();
+    // A band: a plane, its columns, the first output row, and the rows to fill.
+    type Band<'p> = (&'p Plane<'p>, &'p [(usize, u32, usize)], usize, &'p mut [u8]);
+    let mut work: Vec<Vec<Band>> = (0..threads).map(|_| Vec::new()).collect();
+    let rows: Vec<&mut [u8]> = planes.iter_mut().map(|p| std::mem::take(&mut p.dst)).collect();
+    for ((p, cols), dst) in planes.iter().zip(&cols).zip(rows) {
+        let band = p.oh.div_ceil(threads).max(1);
+        for (b, rows) in dst.chunks_mut((band * p.ow * p.n).max(1)).enumerate() {
+            work[b].push((p, cols, b * band, rows));
         }
-        return;
     }
-    // Where an output pixel's centre falls in the crop: the pixel before it, how far on to the
-    // next (0 to 256), and the next.
-    let pos = |i: usize, out: usize, size: usize| {
-        let f = ((i as f64 + 0.5) * size as f64 / out as f64 - 0.5).clamp(0.0, (size - 1) as f64);
-        (f as usize, (f.fract() * 256.0) as u32, (f as usize + 1).min(size - 1))
-    };
-    let cols: Vec<_> = (0..ow).map(|x| pos(x, ow, cw)).collect();
-    // Bands of rows on several cores: a full-length export scales thousands of frames.
-    let band = oh.div_ceil(std::thread::available_parallelism().map_or(1, |c| c.get().min(8)));
-    std::thread::scope(|s| {
-        for (b, rows) in dst.chunks_mut(band * ow * n).enumerate() {
-            let (cols, pos) = (&cols, &pos);
-            s.spawn(move || {
-                for (i, row) in rows.chunks_exact_mut(ow * n).enumerate() {
-                    let (y0, fy, y1) = pos(b * band + i, oh, ch);
-                    let (r0, r1) = (&src[(cy + y0) * stride + cx * n..], &src[(cy + y1) * stride + cx * n..]);
-                    for (px, &(x0, fx, x1)) in row.chunks_exact_mut(n).zip(cols) {
-                        for (c, v) in px.iter_mut().enumerate() {
-                            let mix = |r: &[u8]| r[x0 * n + c] as u32 * (256 - fx) + r[x1 * n + c] as u32 * fx;
-                            *v = ((mix(r0) * (256 - fy) + mix(r1) * fy + (1 << 15)) >> 16) as u8;
-                        }
+    fn run(bands: Vec<Band>) {
+        for (p, cols, first, rows) in bands {
+            let ([cx, cy, cw, ch], n, stride, src) = (p.crop, p.n, p.stride, p.src);
+            for (i, row) in rows.chunks_exact_mut(p.ow * n).enumerate() {
+                let y = first + i;
+                if (cw, ch) == (p.ow, p.oh) {
+                    let at = (cy + y) * stride + cx * n;
+                    row.copy_from_slice(&src[at..at + p.ow * n]);
+                    continue;
+                }
+                let (y0, fy, y1) = pos(y, p.oh, ch);
+                let (r0, r1) = (&src[(cy + y0) * stride + cx * n..], &src[(cy + y1) * stride + cx * n..]);
+                for (px, &(x0, fx, x1)) in row.chunks_exact_mut(n).zip(cols) {
+                    for (c, v) in px.iter_mut().enumerate() {
+                        let mix = |r: &[u8]| r[x0 * n + c] as u32 * (256 - fx) + r[x1 * n + c] as u32 * fx;
+                        *v = ((mix(r0) * (256 - fy) + mix(r1) * fy + (1 << 15)) >> 16) as u8;
                     }
                 }
-            });
+            }
         }
+    }
+    let mut work = work.into_iter();
+    let here = work.next().unwrap_or_default();
+    std::thread::scope(|s| {
+        for bands in work.filter(|w| !w.is_empty()) {
+            s.spawn(move || run(bands));
+        }
+        run(here);
     });
 }
 
@@ -1452,13 +1542,18 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir();
         let (even, lopsided, fixed) = (dir.join("rv-center-even.mp4"), dir.join("rv-center-lopsided.mp4"), dir.join("rv-center-fixed.mp4"));
         synth_clip(&even, 3, [40, 90, 160]);
-        assert!(!center(&even, &fixed, &channel_energy(&even).unwrap()).unwrap());
+        assert!(!center(&even, &fixed, &channel_energy(&even).unwrap(), 0).unwrap());
         rewrite(&even, &lopsided, &[Some(Center::Gains(1.0, 0.25))]).unwrap();
         let (l, r) = channel_energy(&lopsided).unwrap()[0];
         assert!(matches!(centering(l, r), Some(Center::Gains(g, _)) if g == 1.0), "{l} vs {r}");
-        assert!(center(&lopsided, &fixed, &channel_energy(&lopsided).unwrap()).unwrap());
+        assert!(center(&lopsided, &fixed, &channel_energy(&lopsided).unwrap(), 0).unwrap());
         let (l, r) = channel_energy(&fixed).unwrap()[0];
         assert!(centering(l, r).is_none() && (l / r - 1.0).abs() < 0.1, "{l} vs {r}");
+        // With a mic in the track, the loud side is copied: both sides as loud as the left was.
+        let (l0, _) = channel_energy(&lopsided).unwrap()[0];
+        assert!(center(&lopsided, &fixed, &channel_energy(&lopsided).unwrap(), 0b1).unwrap());
+        let (l, r) = channel_energy(&fixed).unwrap()[0];
+        assert!((l / r - 1.0).abs() < 0.01 && (l / l0 - 1.0).abs() < 0.1, "{l} vs {r}, left was {l0}");
         assert_eq!(audio_tracks(&fixed).unwrap(), 1);
         assert!((duration(&fixed).unwrap() - duration(&even).unwrap()).abs() < 0.2);
         for f in [&even, &lopsided, &fixed] {
@@ -1469,8 +1564,12 @@ pub(crate) mod tests {
     /// A made-up clip (no real clip read): `secs` of a colored scene with a moving bar, H.264
     /// 640x360 30 fps and one quiet AAC track.
     pub(crate) fn synth_clip(dst: &Path, secs: u32, rgb: [u8; 3]) {
+        synth(dst, secs, rgb, true, 30);
+    }
+
+    fn synth(dst: &Path, secs: u32, rgb: [u8; 3], sound: bool, fps: u32) {
         init().unwrap();
-        let e = Encode { crop: [0, 0, 640, 360], width: 640, height: 360, fps: 30.0, kbps: 1500, hw: false };
+        let e = Encode { crop: [0, 0, 640, 360], width: 640, height: 360, fps: fps as f64, kbps: 1500, hw: false };
         let yuv = |r: f32, g: f32, b: f32| {
             let y = 16.0 + 0.257 * r + 0.504 * g + 0.098 * b;
             let u = 128.0 - 0.148 * r - 0.291 * g + 0.439 * b;
@@ -1481,11 +1580,14 @@ pub(crate) mod tests {
             let w = sink_writer(dst, false).unwrap();
             let v = w.AddStream(&video_type(&e, true).unwrap()).unwrap();
             w.SetInputMediaType(v, &video_type(&e, false).unwrap(), None).unwrap();
-            let a = w.AddStream(&audio_type(true).unwrap()).unwrap();
-            w.SetInputMediaType(a, &audio_type(false).unwrap(), None).unwrap();
+            let a = sound.then(|| {
+                let a = w.AddStream(&audio_type(true).unwrap()).unwrap();
+                w.SetInputMediaType(a, &audio_type(false).unwrap(), None).unwrap();
+                a
+            });
             w.BeginWriting().unwrap();
             let (ww, hh) = (640usize, 360usize);
-            for f in 0..secs as usize * 30 {
+            for f in 0..(secs * fps) as usize {
                 let mut px = vec![0u8; ww * hh * 3 / 2];
                 let bar = (f * 8) % ww;
                 for y in 0..hh {
@@ -1507,15 +1609,15 @@ pub(crate) mod tests {
                         }
                     }
                 }
-                let t = (f as f64 * SEC / 30.0) as i64;
+                let t = (f as f64 * SEC / fps as f64) as i64;
                 w.WriteSample(v, &nv12_sample(&px, &e, t, 1.0).unwrap()).unwrap();
             }
-            let total = secs as u64 * RATE as u64;
+            let total = if sound { secs as u64 * RATE as u64 } else { 0 };
             let mut at = 0u64;
             while at < total {
                 let k = (total - at).min(4800);
                 let pcm: Vec<f32> = (at..at + k).flat_map(|s| [0.05 * (s as f32 * 440.0 * std::f32::consts::TAU / RATE as f32).sin(); 2]).collect();
-                write_pcm(&w, a, at, &pcm).unwrap();
+                write_pcm(&w, a.unwrap(), at, &pcm).unwrap();
                 at += k;
             }
             w.Finalize().unwrap();
@@ -1838,6 +1940,20 @@ pub(crate) mod tests {
         assert_eq!(uv, [100, 175]);
     }
 
+    /// A clip with no sound exports too, as a copy with no sound.
+    #[test]
+    fn exports_a_clip_with_no_sound() {
+        let (src, dst) = (std::env::temp_dir().join("rv-silent.mp4"), std::env::temp_dir().join("rv-silent-720p.mp4"));
+        synth(&src, 2, [90, 120, 60], false, 30);
+        assert_eq!(audio_tracks(&src).unwrap(), 0);
+        export(&src, &dst, Share::P720, &|_| {}).unwrap();
+        assert_eq!(audio_tracks(&dst).unwrap(), 0);
+        assert!(duration(&dst).unwrap() > 1.5);
+        for f in [&src, &dst] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
     /// Each share preset on ~10 s of a real clip (a trimmed temp copy).
     #[test]
     #[ignore = "slow: encodes every share preset (about 45 s in a debug build)"]
@@ -1956,6 +2072,76 @@ pub(crate) mod tests {
         std::fs::remove_file(&src).unwrap();
     }
 
+    /// A 10 fps clip comes out at its real speed: each frame held for one and a half GIF frames,
+    /// not played at 15 fps.
+    #[test]
+    fn gif_keeps_a_slow_clips_speed() {
+        let (src, dst) = (std::env::temp_dir().join("rv-gif-10fps.mp4"), std::env::temp_dir().join("rv-gif-10fps.gif"));
+        synth(&src, 3, [70, 110, 160], false, 10);
+        let p = probe(&src).unwrap();
+        assert!(p.fps.is_some_and(|f| (f - 10.0).abs() < 0.1) && p.tracks == 0 && p.size == (640, 360), "{p:?}");
+        save_gif(&src, &dst, 0.5, 2.5, &|_| {}).unwrap();
+        let bytes = std::fs::read(&dst).unwrap();
+        let mut opts = gif::DecodeOptions::new();
+        opts.set_color_output(gif::ColorOutput::Indexed);
+        let mut d = opts.read_info(&bytes[..]).unwrap();
+        let (mut frames, mut delay) = (0, 0u32);
+        while let Some(f) = d.read_next_frame().unwrap() {
+            frames += 1;
+            delay += f.delay as u32;
+        }
+        assert_eq!(d.width(), 480);
+        assert!((195..=205).contains(&delay), "{delay} cs for 2 s");
+        assert!((19..=21).contains(&frames), "{frames} frames for 20 in the clip");
+        for f in [&src, &dst] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    /// Thumbnails come out exactly as wide as asked, from a frame of the right colour.
+    #[test]
+    fn thumbnail_of_a_made_up_clip() {
+        let src = std::env::temp_dir().join("rv-thumb.mp4");
+        synth(&src, 1, [200, 40, 40], false, 30);
+        for (f, w) in [(frame(&src, 0.5, 100).unwrap(), 100usize), (keyframe(&src, 0.5, 192).unwrap(), 192), (frame(&src, 0.5, 4000).unwrap(), 640)] {
+            assert_eq!((f.width, f.height, f.rgba.len()), (w, (360 * w).div_ceil(640), w * f.height * 4));
+            // Top right is the red scene, shaded darker there (the moving bar is further left).
+            let px = &f.rgba[(w - 1) * 4..w * 4];
+            assert!(px[0] > 80 && px[1] < 60 && px[2] < 60 && px[3] == 255, "{px:?}");
+        }
+        let _ = std::fs::remove_file(&src);
+    }
+
+    /// Several planes at once, on threads or not, come out pixel for pixel as worked out one at
+    /// a time.
+    #[test]
+    fn scale_planes_matches_one_pixel_at_a_time() {
+        let (w, h) = (640, 362);
+        let src: Vec<u8> = (0..w * h).map(|i| (i * 7 % 251) as u8).collect();
+        // One output value, as scale describes it.
+        let one = |n: usize, [cx, cy, cw, ch]: [usize; 4], ow: usize, oh: usize, x: usize, y: usize, c: usize| {
+            let at = |px: usize, py: usize| src[(cy + py) * w + (cx + px) * n + c] as u32;
+            if (cw, ch) == (ow, oh) {
+                return at(x, y) as u8;
+            }
+            let ((x0, fx, x1), (y0, fy, y1)) = (pos(x, ow, cw), pos(y, oh, ch));
+            let mix = |py: usize| at(x0, py) * (256 - fx) + at(x1, py) * fx;
+            ((mix(y0) * (256 - fy) + mix(y1) * fy + (1 << 15)) >> 16) as u8
+        };
+        for (ow, oh) in [(300, 170), (640, 362), (20, 11), (1280, 720)] {
+            let (luma, colour) = ([0, 0, w, h], [2, 2, w / 2 - 2, h / 2 - 2]);
+            let (cw, ch) = (ow / 2, oh / 2);
+            let (mut a, mut b) = (vec![0u8; ow * oh], vec![0u8; cw * ch * 2]);
+            scale_planes(vec![
+                Plane { src: &src, stride: w, n: 1, crop: luma, dst: &mut a, ow, oh },
+                Plane { src: &src, stride: w, n: 2, crop: colour, dst: &mut b, ow: cw, oh: ch },
+            ]);
+            let luma_ok = (0..oh).all(|y| (0..ow).all(|x| a[y * ow + x] == one(1, luma, ow, oh, x, y, 0)));
+            let colour_ok = (0..ch).all(|y| (0..cw).all(|x| (0..2).all(|c| b[(y * cw + x) * 2 + c] == one(2, colour, cw, ch, x, y, c))));
+            assert!(luma_ok && colour_ok, "{ow}x{oh}");
+        }
+    }
+
     /// The last ~4 s of each of the two newest real clips (or the newest twice), as temp copies.
     fn two_short_clips(tag: &str) -> Option<[std::path::PathBuf; 2]> {
         let folder = crate::config::Config::load().folder;
@@ -2001,7 +2187,7 @@ pub(crate) mod tests {
         eprintln!("joined {la:.2} + {lb:.2} s into {got:.2} s, {}x{}, {:?}", f.width, f.height, took.elapsed());
         assert!((got - (la + lb)).abs() <= 0.1, "{got} s");
         assert_eq!((f.width, f.height), (fa.width, fa.height));
-        assert!((frame_rate(&dst).unwrap() - frame_rate(&a).unwrap()).abs() < 0.1);
+        assert!((probe(&dst).unwrap().fps.unwrap() - probe(&a).unwrap().fps.unwrap()).abs() < 0.1);
         assert_eq!(audio_tracks(&dst).unwrap(), 1);
         assert!(*last.lock().unwrap() > 0.99, "progress reached the end");
         assert!(f.rgba.chunks(4).any(|p| p[0] > 20 || p[1] > 20 || p[2] > 20), "the scaled part isn't blank");

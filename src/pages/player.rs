@@ -27,13 +27,27 @@ pub(crate) struct TrimEdit {
     pub(crate) loud: Option<Vec<f64>>,
 }
 
+/// Cuts and GIFs still being made when their trim closed (Back, Cancel, the clip moved), and
+/// whether each is a GIF, so finish_trim still says how they went and lists the new file.
+static LEFT: std::sync::Mutex<Vec<(Arc<ExportJob>, bool)>> = std::sync::Mutex::new(Vec::new());
+
+impl Drop for TrimEdit {
+    fn drop(&mut self) {
+        // One finished and picked up is let go; the job's thread holds the other link while it runs.
+        let unfinished = |j: &Arc<ExportJob>| Arc::strong_count(j) > 1 || j.done.lock().unwrap().is_some();
+        let jobs = [(self.job.take(), false), (self.gif.take(), true)];
+        let left = jobs.into_iter().filter_map(|(j, gif)| j.filter(unfinished).map(|j| (j, gif)));
+        LEFT.lock().unwrap().extend(left);
+    }
+}
+
 /// Trim controls under the video: the timeline (drag the start or end edge you're over, or drag
 /// anywhere else to scrub), a preview of just the selection, and the cut. Returns false when cancelled.
 pub(crate) fn trim_controls(ui: &mut egui::Ui, p: &mut player::Player, t: &mut TrimEdit, split_on: bool, cfg: &Config) -> bool {
     let len = t.len.max(0.1);
     // Playback stays inside the selection: it stops on the end edge (start_playing begins it on
     // the start edge). Checked every frame while playing, so it overshoots by a frame at most.
-    let playing = p.is_playing() && !p.ended();
+    let playing = p.is_playing();
     if playing {
         if p.position() >= t.end {
             p.pause();
@@ -153,8 +167,6 @@ pub(crate) fn trim_controls(ui: &mut egui::Ui, p: &mut player::Player, t: &mut T
         gif_button(ui, t, busy);
         if cap(ui, !busy, egui::Button::new("Cancel trim")).on_hover_text("Stops trimming without saving anything").clicked() {
             keep = false;
-            // Back to how the clip normally plays.
-            p.set_track_gains(&media::track1(t.gains.len()));
         }
     });
     if let Some(msg) = &t.gif_msg {
@@ -420,7 +432,7 @@ impl App {
         if !ui.ctx().egui_wants_keyboard_input() {
             use egui::Key;
             let [space, j, k, l, back, on] = ui.input_mut(|i| [Key::Space, Key::J, Key::K, Key::L, Key::Comma, Key::Period].map(|key| i.consume_key(egui::Modifiers::NONE, key)));
-            let playing = p.is_playing() && !p.ended();
+            let playing = p.is_playing();
             if space {
                 if playing { p.pause() } else { start_playing(p, range) }
             }
@@ -499,7 +511,7 @@ impl App {
         let len = p.duration().unwrap_or(0.0);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            let playing = p.is_playing() && !p.ended();
+            let playing = p.is_playing();
             let (glyph, text) = if playing { (icon::PAUSE, "Pause") } else { (icon::PLAY, "Play") };
             let keys = "Space plays and pauses. J slower, K stop, L faster. , and . step one frame.";
             if cap(ui, true, icon_button(glyph, text).min_size(egui::vec2(96.0, 32.0))).on_hover_text(keys).clicked() {
@@ -540,8 +552,8 @@ impl App {
             self.begin_trim(&path);
         }
         if close {
+            self.close_trim();
             self.player = None;
-            self.trim = None;
         }
     }
 
@@ -589,12 +601,43 @@ impl App {
             keep = false;
         }
         if !keep {
-            self.trim = None;
+            self.close_trim();
         }
     }
 
-    /// Picks up a finished cut (closes the trim) or GIF, and lists the new file.
+    /// Ends the trim, with the clip playing its usual sound again (track 1) if it's still open.
+    pub(crate) fn close_trim(&mut self) {
+        if let (Some(t), Some((path, p))) = (self.trim.take(), &mut self.player)
+            && *path == t.path
+        {
+            p.set_track_gains(&media::track1(t.gains.len()));
+        }
+    }
+
+    /// Picks up a finished cut (closes the trim) or GIF, and lists the new file. Also one whose
+    /// trim was closed while it was being made.
     pub(crate) fn finish_trim(&mut self) {
+        let left: Vec<_> = {
+            let mut left = LEFT.lock().unwrap();
+            let mut done = Vec::new();
+            left.retain(|(j, gif)| match j.done.lock().unwrap().take() {
+                Some(r) => {
+                    done.push((r, *gif));
+                    false
+                }
+                None => true,
+            });
+            done
+        };
+        for (result, gif) in left {
+            self.clips_msg = Some(match (result, gif) {
+                (Ok(out), true) => saved_note(&out),
+                (Ok(out), false) => format!("Saved {}. The original is kept.", out.file_name().unwrap_or_default().to_string_lossy()),
+                (Err(e), true) => format!("Couldn't make the GIF: {e}"),
+                (Err(e), false) => format!("Trim didn't work: {e}"),
+            });
+            self.rescan_clips();
+        }
         let Some(t) = &mut self.trim else { return };
         // A GIF leaves the trim open, to make another or save the cut too.
         if let Some(done) = t.gif.as_ref().and_then(|g| g.done.lock().unwrap().take()) {
@@ -611,9 +654,10 @@ impl App {
         let done = job.done.lock().unwrap().take();
         match done {
             Some(Ok(out)) => {
+                t.job = None;
                 self.clips_msg = Some(format!("Saved {}. The original is kept.", out.file_name().unwrap_or_default().to_string_lossy()));
                 self.rescan_clips();
-                self.trim = None;
+                self.close_trim();
             }
             Some(Err(e)) => {
                 self.clips_msg = Some(format!("Trim didn't work: {e}"));
@@ -626,7 +670,7 @@ impl App {
     /// Opens `path` in the window's player, or in the default app if it can't be played here.
     pub(crate) fn play(&mut self, path: &std::path::Path) {
         self.player = None; // lets go of the old file first
-        let opened = overlay::raw().ok_or_else(|| anyhow::anyhow!("no window")).and_then(|h| player::Player::open(h, path));
+        let opened = overlay::hwnd().ok_or_else(|| anyhow::anyhow!("no window")).and_then(|h| player::Player::open(h, path));
         match opened {
             Ok(mut p) => {
                 p.play();

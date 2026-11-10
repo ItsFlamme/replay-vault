@@ -91,7 +91,7 @@ pub(crate) fn make_tray(ctx: &egui::Context, cmds: Sender<Cmd>) -> anyhow::Resul
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
-        .with_tooltip(crate::APP_TITLE)
+        .with_tooltip(TrayLook::Off.tooltip())
         .with_icon(tray_icon_image(TrayLook::Off)?)
         .build()?;
     Ok((tray, TrayMenu { status, save, pause, startup, shown: None }))
@@ -119,12 +119,14 @@ impl TrayLook {
         }
     }
 
-    pub(crate) fn tooltip(self) -> &'static str {
-        match self {
-            TrayLook::Off => "Replay Vault: instant replay off",
-            TrayLook::Buffer => "Replay Vault: instant replay on",
-            TrayLook::Recording => "Replay Vault: recording",
-        }
+    /// The app's title (so a dev build says so) and what it's doing.
+    pub(crate) fn tooltip(self) -> String {
+        let doing = match self {
+            TrayLook::Off => "instant replay off",
+            TrayLook::Buffer => "instant replay on",
+            TrayLook::Recording => "recording",
+        };
+        format!("{}: {doing}", crate::APP_TITLE)
     }
 }
 

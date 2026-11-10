@@ -192,10 +192,9 @@ impl App {
             obs_install::set_install_root(&self.cfg.obs_dir);
             log::write(&format!("Private OBS folder set to {}", obs_install::private_dir().display()));
         }
-        // Only for our private copy: the user's own OBS is the same program as their main OBS,
-        // and blocking it could break their remotes or plugins.
+        // Our private copy only (obs_exe is always it): the rule names that exe alone.
         let mut get_fw = false;
-        if let Some(exe) = exe.as_ref().filter(|e| obs_install::is_private(e)) {
+        if let Some(exe) = &exe {
             let fw_ok = *self.firewall_ok.get_or_insert_with(obs_install::firewall_rule_exists);
             if !fw_ok {
                 card(ui, "Firewall (optional)", |ui| {

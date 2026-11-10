@@ -4,11 +4,13 @@
 //!
 //! The engine plays only one audio track and has no per-track volume, so for the sound it stays
 //! muted and a thread of ours decodes every track, mixes them with the per-track gains, and
-//! plays the mix through WASAPI, following the engine's position.
+//! plays the mix through WASAPI, following the engine's position. It moves to a new default
+//! playback device by itself; if its device goes away and none takes over, the engine is
+//! unmuted and plays its own sound (track 1) instead.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -18,7 +20,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject, HBRUSH};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::{CLSCTX_ALL, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
+use windows::Win32::System::Com::{CLSCTX_ALL, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BSTR, Interface, PCWSTR, implement, w};
@@ -34,6 +36,8 @@ const MAX_DRIFT: f64 = 0.1;
 const SETTLE: Duration = Duration::from_millis(500);
 /// WASAPI buffer, in 100 ns units (100 ms). Also how quickly a gain change is heard.
 const BUFFER: i64 = 1_000_000;
+/// How often our sound looks for a new default playback device while playing.
+const DEVICE_CHECK: Duration = Duration::from_secs(1);
 
 pub struct Player {
     engine: IMFMediaEngineEx,
@@ -53,7 +57,8 @@ pub struct Player {
     /// The time a frame step last sent, when, and how many times, until the engine is there.
     pending: Cell<Option<(f64, Instant, u32)>>,
     /// Our own sound output. None for a silent clip, or when it couldn't start (no sound
-    /// device); the engine then plays track 1 itself and track gains do nothing.
+    /// device); the engine then plays track 1 itself and track gains do nothing. The same once
+    /// it has died (see sound).
     audio: Option<Audio>,
 }
 
@@ -84,10 +89,10 @@ struct Audio {
 /// What the UI and the sound thread share.
 struct Shared {
     gains: Mutex<Vec<f32>>,
-    /// Master volume, f32 bits.
-    volume: AtomicU32,
     /// The clip time being heard right now, f64 bits; NaN while stopped.
     heard: AtomicU64,
+    /// The thread gave up (no device would play) and has ended.
+    died: AtomicBool,
 }
 
 impl Audio {
@@ -98,8 +103,8 @@ impl Audio {
         gains[0] = 1.0;
         let shared = Arc::new(Shared {
             gains: Mutex::new(gains),
-            volume: AtomicU32::new(1.0f32.to_bits()),
             heard: AtomicU64::new(f64::NAN.to_bits()),
+            died: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let (ready_tx, ready) = channel();
@@ -141,7 +146,7 @@ impl Drop for Audio {
 }
 
 /// Decodes and plays the mix. Waits while stopped; while playing, tops up the device buffer
-/// every 10 ms with the current gains.
+/// every 10 ms with the current gains, and moves to the default device when that changes.
 fn sound_thread(path: PathBuf, shared: Arc<Shared>, rx: Receiver<Option<f64>>, ready: Sender<anyhow::Result<()>>) {
     let mut out = match Output::open(&path) {
         Ok(o) => {
@@ -154,6 +159,9 @@ fn sound_thread(path: PathBuf, shared: Arc<Shared>, rx: Receiver<Option<f64>>, r
         }
     };
     let mut playing = false;
+    // When the default device was last looked at, and when the sound last had to move to it.
+    let mut checked = Instant::now();
+    let mut moved: Option<Instant> = None;
     loop {
         let cmd = if playing {
             match rx.try_recv() {
@@ -167,7 +175,7 @@ fn sound_thread(path: PathBuf, shared: Arc<Shared>, rx: Receiver<Option<f64>>, r
                 Err(_) => return,
             }
         };
-        let step = match cmd {
+        let mut step = match cmd {
             Some(Some(at)) => {
                 playing = true;
                 out.restart(at, &shared)
@@ -179,11 +187,25 @@ fn sound_thread(path: PathBuf, shared: Arc<Shared>, rx: Receiver<Option<f64>>, r
             }
             None => out.fill(&shared),
         };
+        // Headphones plugged in, or another device picked in Windows: the sound goes there too.
+        if step.is_ok() && playing && checked.elapsed() >= DEVICE_CHECK {
+            checked = Instant::now();
+            if out.default_changed() {
+                step = out.reopen(&shared);
+            }
+        }
         if let Err(e) = step {
+            // Its device went away (unplugged): try the default one, unless that just failed too.
+            // Failing that, the engine's own sound takes over.
+            let retry = playing && moved.is_none_or(|t| t.elapsed() > Duration::from_secs(2));
+            if retry && out.reopen(&shared).is_ok() {
+                crate::log::write(&format!("player sound moved to the default device: {e:#}"));
+                moved = Some(Instant::now());
+                continue;
+            }
             crate::log::write(&format!("player sound stopped: {e:#}"));
             out.stop(&shared);
-            // Keep draining commands so the UI side never blocks, but play nothing.
-            while rx.recv().is_ok() {}
+            shared.died.store(true, Ordering::Relaxed);
             return;
         }
         if playing && cmd.is_none() {
@@ -195,6 +217,9 @@ fn sound_thread(path: PathBuf, shared: Arc<Shared>, rx: Receiver<Option<f64>>, r
 /// The decoder plus a shared-mode WASAPI stream on the default playback device.
 struct Output {
     src: crate::media::AudioSource,
+    devices: IMMDeviceEnumerator,
+    /// Windows' id for the device playing, to notice when the default changes.
+    id: String,
     client: IAudioClient,
     render: IAudioRenderClient,
     /// Device buffer size, in frames.
@@ -209,33 +234,24 @@ impl Output {
         // Sets up COM (multithreaded) for this thread too.
         let src = crate::media::AudioSource::open(path)?;
         unsafe {
-            let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-            let device = en
-                .GetDefaultAudioEndpoint(eRender, eConsole)
-                .map_err(|_| anyhow::anyhow!("there's no sound output device"))?;
-            let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
-            // Our mix format; AUTOCONVERTPCM has Windows convert it to the device's own.
-            let format = WAVEFORMATEX {
-                wFormatTag: 3, // WAVE_FORMAT_IEEE_FLOAT
-                nChannels: 2,
-                nSamplesPerSec: crate::media::RATE,
-                nAvgBytesPerSec: crate::media::RATE * 8,
-                nBlockAlign: 8,
-                wBitsPerSample: 32,
-                cbSize: 0,
-            };
-            client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                BUFFER,
-                0,
-                &format,
-                None,
-            )?;
-            let size = client.GetBufferSize()?;
-            let render: IAudioRenderClient = client.GetService()?;
-            Ok(Output { src, client, render, size, start: 0.0, written: 0 })
+            let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let (id, client, render, size) = stream(&devices)?;
+            Ok(Output { src, devices, id, client, render, size, start: 0.0, written: 0 })
         }
+    }
+
+    /// Windows' default playback device is another one than ours now.
+    fn default_changed(&self) -> bool {
+        unsafe { self.devices.GetDefaultAudioEndpoint(eRender, eConsole) }.is_ok_and(|d| unsafe { device_id(&d) } != self.id)
+    }
+
+    /// Carries on on the default device, from where the sound was.
+    fn reopen(&mut self, shared: &Shared) -> anyhow::Result<()> {
+        let heard = f64::from_bits(shared.heard.load(Ordering::Relaxed));
+        let at = if heard.is_nan() { self.start + self.written as f64 / crate::media::RATE as f64 } else { heard };
+        self.stop(shared);
+        (self.id, self.client, self.render, self.size) = unsafe { stream(&self.devices)? };
+        self.restart(at, shared)
     }
 
     /// Drops whatever is buffered and plays from `at` seconds.
@@ -260,8 +276,7 @@ impl Output {
     /// Tops the device buffer up with freshly mixed sound. Past the end of the clip it writes
     /// nothing, which the device plays as silence.
     fn fill(&mut self, shared: &Shared) -> anyhow::Result<()> {
-        let volume = f32::from_bits(shared.volume.load(Ordering::Relaxed));
-        let gains: Vec<f32> = shared.gains.lock().map(|g| g.iter().map(|x| x * volume).collect()).unwrap_or_default();
+        let gains: Vec<f32> = shared.gains.lock().map(|g| g.clone()).unwrap_or_default();
         unsafe {
             let free = self.size - self.client.GetCurrentPadding()?;
             let pcm = self.src.read(free as usize, &gains)?;
@@ -285,23 +300,66 @@ impl Output {
     }
 }
 
+/// A stream for our mix on the default playback device: the device's id, the client, where to
+/// write, and the buffer size in frames.
+unsafe fn stream(devices: &IMMDeviceEnumerator) -> anyhow::Result<(String, IAudioClient, IAudioRenderClient, u32)> {
+    unsafe {
+        let device = devices
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+            .map_err(|_| anyhow::anyhow!("there's no sound output device"))?;
+        let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+        // Our mix format; AUTOCONVERTPCM has Windows convert it to the device's own.
+        let format = WAVEFORMATEX {
+            wFormatTag: 3, // WAVE_FORMAT_IEEE_FLOAT
+            nChannels: 2,
+            nSamplesPerSec: crate::media::RATE,
+            nAvgBytesPerSec: crate::media::RATE * 8,
+            nBlockAlign: 8,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            BUFFER,
+            0,
+            &format,
+            None,
+        )?;
+        let size = client.GetBufferSize()?;
+        let render: IAudioRenderClient = client.GetService()?;
+        Ok((device_id(&device), client, render, size))
+    }
+}
+
+/// Windows' id for a sound device; empty if it won't say.
+unsafe fn device_id(d: &IMMDevice) -> String {
+    unsafe {
+        let Ok(p) = d.GetId() else { return String::new() };
+        let id = p.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(p.0 as *const _));
+        id
+    }
+}
+
 impl Player {
     /// Loads `path` paused on its first frame. Blocks until that frame is decoded (a few ms for a
     /// local file) so a broken file fails here instead of showing a black box.
-    pub fn open(parent_hwnd: isize, path: &Path) -> anyhow::Result<Player> {
+    pub fn open(parent: HWND, path: &Path) -> anyhow::Result<Player> {
         anyhow::ensure!(path.is_file(), "the clip {} doesn't exist", path.display());
         init()?;
-        let hwnd = child_window(parent_hwnd)?;
+        let hwnd = child_window(parent)?;
         match load(hwnd, path) {
             Ok((engine, video)) => {
-                let tracks = crate::media::audio_tracks(path).unwrap_or(0);
+                let probe = crate::media::probe(path).ok();
+                let tracks = probe.as_ref().map_or(0, |p| p.tracks);
                 let audio = (tracks > 0)
                     .then(|| Audio::open(path, tracks))
                     .and_then(|a| a.map_err(|e| crate::log::write(&format!("player sound: {e:#}"))).ok());
                 if audio.is_some() {
                     unsafe { _ = engine.SetMuted(true) };
                 }
-                let fps = crate::media::frame_rate(path).unwrap_or(60.0);
+                let fps = probe.and_then(|p| p.fps).unwrap_or(60.0);
                 Ok(Player { engine, hwnd, area: (0, 0, 0, 0), video, visible: true, tracks, fps, rate: 1.0, stepped: None, pending: Cell::new(None), audio })
             }
             Err(e) => {
@@ -346,7 +404,7 @@ impl Player {
                 _ = self.engine.SetCurrentTime(0.0);
             }
             _ = self.engine.Play();
-            if let Some(a) = self.audio.as_ref().filter(|_| self.rate == 1.0) {
+            if let Some(a) = self.sound().filter(|_| self.rate == 1.0) {
                 a.start(self.engine.GetCurrentTime());
             }
         }
@@ -364,7 +422,7 @@ impl Player {
             _ = self.engine.SetPlaybackRate(rate);
         }
         // follow() starts or stops our sound to match on the next frame.
-        if let Some(a) = self.audio.as_ref().filter(|a| a.running.get()) {
+        if let Some(a) = self.sound().filter(|a| a.running.get()) {
             a.stop();
         }
     }
@@ -421,7 +479,7 @@ impl Player {
 
     pub fn pause(&mut self) {
         unsafe { _ = self.engine.Pause() };
-        if let Some(a) = &self.audio {
+        if let Some(a) = self.sound() {
             a.stop();
         }
     }
@@ -442,7 +500,7 @@ impl Player {
         self.pending.set(None);
         let secs = self.duration().map_or(secs, |d| secs.min(d)).max(0.0);
         unsafe { _ = self.engine.SetCurrentTime(secs) };
-        if let Some(a) = self.audio.as_ref().filter(|a| a.running.get()) {
+        if let Some(a) = self.sound().filter(|a| a.running.get()) {
             a.start(secs);
         }
     }
@@ -457,7 +515,7 @@ impl Player {
     /// about 100 ms. Tracks without a gain are silent. The default plays only track 1, the full
     /// mix in OBS's split setup, so it sounds the same as before.
     pub fn set_track_gains(&mut self, gains: &[f32]) {
-        if let Some(a) = &self.audio
+        if let Some(a) = self.sound()
             && let Ok(mut g) = a.shared.gains.lock()
         {
             *g = gains.iter().map(|x| x.clamp(0.0, 2.0)).collect();
@@ -473,7 +531,7 @@ impl Player {
     /// (the clip ended), and restarts it at the engine's position if they drifted apart. Runs
     /// whenever the UI asks for the position or play state, which it does every frame.
     fn follow(&self, playing: bool) {
-        let Some(a) = &self.audio else { return };
+        let Some(a) = self.sound() else { return };
         if !playing || self.rate != 1.0 {
             if a.running.get() {
                 a.stop();
@@ -488,6 +546,21 @@ impl Player {
         }
     }
 
+    /// Our sound, while it lives. Once its thread has given up (its device went away and no
+    /// other would play), the engine is unmuted so its own sound (track 1) plays instead.
+    fn sound(&self) -> Option<&Audio> {
+        let a = self.audio.as_ref()?;
+        if !a.shared.died.load(Ordering::Relaxed) {
+            return Some(a);
+        }
+        unsafe {
+            if self.engine.GetMuted().as_bool() {
+                _ = self.engine.SetMuted(false);
+            }
+        }
+        None
+    }
+
     /// The clip's own width and height in pixels; (0, 0) if unknown.
     pub fn video_size(&self) -> (u32, u32) {
         self.video
@@ -497,20 +570,6 @@ impl Player {
     pub fn duration(&self) -> Option<f64> {
         let d = unsafe { self.engine.GetDuration() };
         (d.is_finite() && d > 0.0).then_some(d)
-    }
-
-    /// Volume from 0 to 1.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn set_volume(&mut self, v: f32) {
-        let v = v.clamp(0.0, 1.0);
-        unsafe { _ = self.engine.SetVolume(v as f64) };
-        if let Some(a) = &self.audio {
-            a.shared.volume.store(v.to_bits(), Ordering::Relaxed);
-        }
-    }
-
-    pub fn ended(&self) -> bool {
-        unsafe { self.engine.IsEnded().as_bool() }
     }
 }
 
@@ -581,7 +640,7 @@ fn wait_first_frame(engine: &IMFMediaEngineEx, rx: &Receiver<u32>) -> anyhow::Re
 }
 
 /// A black child window of `parent` that the engine draws into.
-fn child_window(parent: isize) -> anyhow::Result<HWND> {
+fn child_window(parent: HWND) -> anyhow::Result<HWND> {
     unsafe {
         let instance = GetModuleHandleW(None)?.into();
         static REGISTERED: OnceLock<()> = OnceLock::new();
@@ -604,7 +663,7 @@ fn child_window(parent: isize) -> anyhow::Result<HWND> {
             0,
             0,
             0,
-            Some(HWND(parent as _)),
+            Some(parent),
             None,
             Some(instance),
             None,
@@ -646,7 +705,7 @@ mod tests {
         let bad = std::env::temp_dir().join("instant-replay-player-bad.mp4");
         std::fs::write(&bad, b"not a video").unwrap();
         let parent = hidden_window();
-        assert!(Player::open(parent.0 as isize, &bad).is_err());
+        assert!(Player::open(parent, &bad).is_err());
         std::fs::remove_file(&bad).unwrap();
         unsafe { _ = DestroyWindow(parent) };
     }
@@ -659,11 +718,12 @@ mod tests {
         let expected = crate::media::duration(&copy).unwrap();
         let parent = hidden_window();
 
-        let mut p = Player::open(parent.0 as isize, &copy).unwrap();
-        // Silent: our sound plays, but every track at 0 and the master volume at 0.
+        let mut p = Player::open(parent, &copy).unwrap();
+        // Silent: our sound plays, but every track at 0, and the engine (heard only when our
+        // sound can't play) at 0 too.
         assert_eq!(p.audio_tracks(), 3);
         p.set_track_gains(&vec![0.0; p.audio_tracks()]);
-        p.set_volume(0.0);
+        unsafe { _ = p.engine.SetVolume(0.0) };
         p.set_rect(0, 0, 640, 480);
         let d = p.duration().unwrap();
         assert!((d - expected).abs() < 0.5, "duration {d}, expected {expected}");
@@ -702,7 +762,7 @@ mod tests {
         p.pause();
 
         // A frame on and back, at the clip's own frame rate.
-        let fps = crate::media::frame_rate(&copy).unwrap();
+        let fps = crate::media::probe(&copy).unwrap().fps.unwrap();
         assert!((10.0..=500.0).contains(&fps), "frame rate {fps}");
         // Positions settle a moment after a pause or seek, as they have between keypresses.
         // Like the page: window messages handled and position() asked every frame (~60 a
@@ -739,6 +799,16 @@ mod tests {
             }
             let at = settled(&p);
             assert!(!p.is_playing() && frame_of(at) == expect, "after {keys:?}: at {at} = frame {}, expected {expect}", frame_of(at));
+        }
+
+        // Our sound dying (its device gone) hands the sound back to the engine.
+        if let Some(shared) = p.audio.as_ref().map(|a| a.shared.clone()) {
+            assert!(unsafe { p.engine.GetMuted() }.as_bool(), "the engine is muted under our sound");
+            shared.died.store(true, Ordering::Relaxed);
+            p.play();
+            assert!(p.is_playing() && !unsafe { p.engine.GetMuted() }.as_bool(), "the engine is still muted after our sound died");
+            assert!(p.sound().is_none());
+            p.pause();
         }
         drop(p);
 

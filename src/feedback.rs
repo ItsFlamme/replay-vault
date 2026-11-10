@@ -78,7 +78,12 @@ impl Form {
                 self.last_message = std::mem::take(&mut self.message);
                 State::Sent
             }
-            Err(e) => State::Error(e),
+            Err(e) => {
+                // A send that didn't get through doesn't count toward the daily limit.
+                self.sends.pop();
+                let _ = std::fs::write(sends_path(), serde_json::to_string(&self.sends).unwrap_or_default());
+                State::Error(e)
+            }
         };
     }
 

@@ -17,12 +17,18 @@ pub static SAVE_POPUP: AtomicBool = AtomicBool::new(true);
 /// Sort saved clips and screenshots into a folder per game; play a soft sound on save.
 pub static SORT_BY_GAME: AtomicBool = AtomicBool::new(false);
 pub static SAVE_SOUND: AtomicBool = AtomicBool::new(false);
+/// Even out a saved clip that's louder on one side (experimental, off unless turned on).
+pub static CENTER_SOUND: AtomicBool = AtomicBool::new(false);
 
 /// Clips OBS has reported saved, to spot a save request that never lands.
 static SAVED: AtomicU32 = AtomicU32::new(0);
 
 /// Audio tracks the recorder writes into each clip (1 to 6), to check saved clips against.
 static TRACKS: AtomicU8 = AtomicU8::new(1);
+/// The app is quitting or removing itself: a recorder that's gone stays gone.
+pub static QUITTING: AtomicBool = AtomicBool::new(false);
+/// recorder::mic_mixed_tracks of the settings the recorder runs with.
+static MIC_MIXED: AtomicU8 = AtomicU8::new(0);
 
 /// The clips folder of the running config; saved-clip paths from the recorder must be inside it.
 static FOLDER: Mutex<String> = Mutex::new(String::new());
@@ -41,7 +47,7 @@ fn destination(game: &str) -> std::path::PathBuf {
 /// folder; a replay saved during a full recording lands in the Recordings folder at first) and
 /// puts the game in front of its name. Keeps it where it is if the move fails.
 fn place(path: &std::path::Path) -> std::path::PathBuf {
-    let game = clips::game_folder_name();
+    let game = clips::saving_folder_name();
     match clips::move_into(path, &destination(&game), &game) {
         Ok(p) => p,
         Err(e) => {
@@ -261,7 +267,7 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
     let mut save_pending: Option<(Instant, u32)> = None;
     let mut reported_no_connect = false;
     let (mut disk_checked, mut disk_low) = (ago(60), false);
-    let (mut sampler, mut sampled) = (perf::Sampler::new(), Instant::now());
+    let (mut sampler, mut sampled) = (perf::Sampler::recorder_only(), Instant::now());
     let last_state = Cell::new((false, false));
     // Follow the mouse: checked every second, while the health check stays at every 2 s.
     let mut follow: Option<Follow> = None;
@@ -311,16 +317,34 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
         let result: anyhow::Result<Option<String>> = rt.block_on(async {
             match cmd {
                 Some(Cmd::Start(new_cfg)) => {
-                    (client, follow) = (None, None);
+                    // New settings restart OBS: a full recording is finished and kept first.
+                    if let Some(c) = client.take() {
+                        let finished = tokio::time::timeout(Duration::from_secs(15), recorder::finish_recording(&c)).await;
+                        match finished.unwrap_or_else(|_| Err(anyhow::anyhow!("the recorder didn't answer"))) {
+                            Ok(Some(path)) => {
+                                send(Event::Recording(false));
+                                feedback("Recording saved", std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), None);
+                                send(Event::Status(format!("Recording saved before the recorder restarted: {path}")));
+                            }
+                            Ok(None) => {}
+                            Err(e) => log::write(&format!("Couldn't stop the full recording before restarting the recorder: {e:#}")),
+                        }
+                    }
+                    follow = None;
                     send(Event::State { connected: false, buffer: false });
                     begin_session();
                     with_session(recorder_restarted);
                     *FOLDER.lock().unwrap() = new_cfg.folder.clone();
                     TRACKS.store(new_cfg.track_count.clamp(1, 6), Ordering::Relaxed);
-                    recorder::restart(&new_cfg)?;
+                    MIC_MIXED.store(recorder::mic_mixed_tracks(&new_cfg), Ordering::Relaxed);
+                    // Instant replay starts on at first; after that new settings keep it as it
+                    // was (turned off, or paused with no game open).
+                    want_buffer = want_buffer || cfg.is_none();
+                    // Set first, so a start that fails is tried again by the health check, every 20 s.
                     last_launch = Instant::now();
-                    cfg = Some(*new_cfg);
-                    (want_buffer, reported_stuck, reported_no_connect, revive_tries, told_stopped, seen_on) = (true, false, false, 0, false, false);
+                    let new_cfg = cfg.insert(*new_cfg);
+                    recorder::restart(new_cfg)?;
+                    (reported_stuck, reported_no_connect, revive_tries, told_stopped, seen_on) = (false, false, 0, false, false);
                     Ok(Some("Starting the recorder...".into()))
                 }
                 Some(Cmd::Save) => {
@@ -378,7 +402,7 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                 }
                 Some(Cmd::Screenshot) => {
                     let c = client.as_ref().ok_or_else(|| anyhow::anyhow!("The recorder is still starting"))?;
-                    let dir = destination(&clips::game_folder_name());
+                    let dir = destination(&clips::saving_folder_name());
                     std::fs::create_dir_all(&dir)?;
                     let path = dir.join(format!("Screenshot {}.png", clips::stamp(std::time::SystemTime::now())));
                     c.sources()
@@ -529,7 +553,11 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                     }
                     match Client::connect("127.0.0.1", recorder::PORT, Some(cfg.recorder_password.as_str())).await {
                         Ok(c) => {
-                            let buffer = c.replay_buffer().status().await.unwrap_or(false);
+                            let mut buffer = c.replay_buffer().status().await.unwrap_or(false);
+                            // The recorder always starts with instant replay on; it stays off if it was.
+                            if buffer && !want_buffer && c.replay_buffer().stop().await.is_ok() {
+                                buffer = false;
+                            }
                             send(Event::State { connected: true, buffer });
                             client = Some(c);
                             (connected_at, revive_tries) = (Instant::now(), 0);
@@ -540,7 +568,7 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                             Ok(Some("Connected to the recorder.".into()))
                         }
                         // Recorder died (or was closed from its tray icon): bring it back, at most every 20 s.
-                        Err(_) if !recorder::is_running() && last_launch.elapsed() > Duration::from_secs(20) => {
+                        Err(_) if !QUITTING.load(Ordering::Relaxed) && last_launch.elapsed() > Duration::from_secs(20) && !recorder::is_running() => {
                             with_session(|s| {
                                 s.restarts += 1;
                                 recorder_restarted(s);
@@ -549,8 +577,9 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
                                 told_stopped = true;
                                 toast::show("Instant replay stopped", "The recorder closed. Restarting it".into());
                             }
-                            recorder::restart(cfg)?;
+                            // Set first: a restart that fails waits 20 s before the next try.
                             last_launch = Instant::now();
+                            recorder::restart(cfg)?;
                             Ok(Some("Recorder stopped, restarting it...".into()))
                         }
                         // Running but never answering: usually another app holds the port.
@@ -580,6 +609,10 @@ pub fn run(cmds: Receiver<Cmd>, events: Sender<Event>, repaint: Repaint) {
 /// for whoever it's shared with. Stays stereo. On any failure the clip is kept as it was.
 /// `energy` is the clip's channel_energy.
 fn center_clip(path: &std::path::Path, energy: &[(f64, f64)]) {
+    // The fixed copy is an MP4; never put one under another kind's name (our recorder writes MP4).
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4")) {
+        return;
+    }
     let tmp = path.with_extension("centering.mp4");
     // rename replaces the original in one step on Windows, so there's never a moment with neither.
     // Something can hold the new clip for a moment (antivirus, Explorer's thumbnails), so retry.
@@ -595,7 +628,7 @@ fn center_clip(path: &std::path::Path, energy: &[(f64, f64)]) {
             }
         }
     };
-    match media::center(path, &tmp, energy).and_then(|fixed| if fixed { Ok(swap().map(|()| true)?) } else { Ok(false) }) {
+    match media::center(path, &tmp, energy, MIC_MIXED.load(Ordering::Relaxed)).and_then(|fixed| if fixed { Ok(swap().map(|()| true)?) } else { Ok(false) }) {
         Ok(true) => log::write(&format!("Centered a clip's sound (one side was louder): {}", path.display())),
         Ok(false) => {}
         Err(e) => {
@@ -677,7 +710,9 @@ fn watch_saves(password: String, events: Sender<Event>, repaint: Repaint) {
                                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
                                     }
                                     let energy = media::channel_energy(&path).inspect_err(|e| log::write(&format!("Couldn't read a clip's sound: {e:#} ({})", path.display()))).ok();
-                                    if let Some(e) = &energy {
+                                    if let Some(e) = &energy
+                                        && CENTER_SOUND.load(Ordering::Relaxed)
+                                    {
                                         center_clip(&path, e);
                                     }
                                     if let Some(problem) = check_clip(&path, TRACKS.load(Ordering::Relaxed) as usize, energy.as_deref()) {

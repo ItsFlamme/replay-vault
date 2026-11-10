@@ -21,6 +21,8 @@ pub struct Usage {
     pub gpu: f64,
     pub encoder: f64,
     pub ram_mb: f64,
+    /// The first reading of this process: CPU needs two, so it reads 0%.
+    pub first: bool,
 }
 
 /// Average and peak recorder use over a session, kept as running totals.
@@ -32,7 +34,11 @@ pub struct Load {
 }
 
 impl Load {
+    /// Adds a sample; a process's first one is skipped, so its 0% CPU doesn't pull the average down.
     pub fn add(&mut self, u: Usage) {
+        if u.first {
+            return;
+        }
         self.samples += 1;
         for (sum, peak, v) in [(&mut self.sum.cpu, &mut self.peak.cpu, u.cpu), (&mut self.sum.gpu, &mut self.peak.gpu, u.gpu), (&mut self.sum.encoder, &mut self.peak.encoder, u.encoder)] {
             *sum += v;
@@ -59,7 +65,8 @@ impl Load {
     }
 }
 
-/// Samples once a second while the Logs page is open; dropped when it closes.
+/// Takes a sample at most once a second when ticked. The Logs page keeps one while it's open; the
+/// recorder thread (obs.rs) keeps one for the whole run, for the session report.
 pub struct Sampler {
     query: PDH_HQUERY,
     engines: PDH_HCOUNTER,
@@ -68,6 +75,8 @@ pub struct Sampler {
     last: Instant,
     pub recorder: Option<Usage>,
     pub app: Option<Usage>,
+    /// Whether this app's own use is read too (`app`); only the Logs page shows it.
+    own: bool,
 }
 
 impl Sampler {
@@ -80,7 +89,14 @@ impl Sampler {
                 PdhCollectQueryData(query);
             }
         }
-        Self { query, engines, cpu_before: Vec::new(), last: Instant::now() - Duration::from_secs(2), recorder: None, app: None }
+        Self { query, engines, cpu_before: Vec::new(), last: Instant::now() - Duration::from_secs(2), recorder: None, app: None, own: true }
+    }
+
+    /// A sampler for the recorder alone: `app` stays None.
+    pub fn recorder_only() -> Self {
+        let mut s = Self::new();
+        s.own = false;
+        s
     }
 
     /// Takes a new sample if a second has passed. `recorder` is the hidden OBS's process id.
@@ -90,21 +106,23 @@ impl Sampler {
         }
         self.last = Instant::now();
         let engines = self.engines();
-        let me = std::process::id();
-        self.app = self.usage(me, &engines);
+        let me = self.own.then(std::process::id);
+        self.app = me.and_then(|pid| self.usage(pid, &engines));
         self.recorder = recorder.and_then(|pid| self.usage(pid, &engines));
+        // A recorder that restarted has a new pid; the old one's reading is no use any more.
+        self.cpu_before.retain(|&(p, ..)| Some(p) == me || Some(p) == recorder);
     }
 
     fn usage(&mut self, pid: u32, engines: &[(String, f64)]) -> Option<Usage> {
         let (cpu_time, ram_mb) = process_stats(pid)?;
         let now = Instant::now();
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
-        let cpu = match self.cpu_before.iter().find(|(p, ..)| *p == pid) {
+        let (cpu, first) = match self.cpu_before.iter().find(|(p, ..)| *p == pid) {
             Some(&(_, before, at)) => {
                 let wall = now.duration_since(at).as_secs_f64() * 1e7;
-                (cpu_time.saturating_sub(before) as f64 / wall / cores * 100.0).clamp(0.0, 100.0)
+                ((cpu_time.saturating_sub(before) as f64 / wall / cores * 100.0).clamp(0.0, 100.0), false)
             }
-            None => 0.0,
+            None => (0.0, true),
         };
         self.cpu_before.retain(|(p, ..)| *p != pid);
         self.cpu_before.push((pid, cpu_time, now));
@@ -113,7 +131,7 @@ impl Sampler {
         let sum = |kind: &str| -> f64 {
             engines.iter().filter(|(n, _)| n.starts_with(&tag) && n.ends_with(kind)).map(|(_, v)| v).sum::<f64>().min(100.0)
         };
-        Some(Usage { cpu, gpu: sum("engtype_3D"), encoder: sum("engtype_VideoEncode"), ram_mb })
+        Some(Usage { cpu, gpu: sum("engtype_3D"), encoder: sum("engtype_VideoEncode"), ram_mb, first })
     }
 
     /// Every GPU engine instance and its use, in percent.
@@ -174,8 +192,11 @@ mod tests {
     fn load_keeps_average_and_peak() {
         let mut l = Load::default();
         assert_eq!(l.summary(), "not measured");
-        l.add(Usage { cpu: 1.0, gpu: 4.0, encoder: 10.0, ram_mb: 900.0 });
-        l.add(Usage { cpu: 3.0, gpu: 2.0, encoder: 30.0, ram_mb: 900.0 });
+        // A (re)started recorder's first reading, CPU not measured yet: left out.
+        l.add(Usage { cpu: 0.0, gpu: 9.0, encoder: 90.0, ram_mb: 900.0, first: true });
+        assert_eq!(l.summary(), "not measured");
+        l.add(Usage { cpu: 1.0, gpu: 4.0, encoder: 10.0, ram_mb: 900.0, first: false });
+        l.add(Usage { cpu: 3.0, gpu: 2.0, encoder: 30.0, ram_mb: 900.0, first: false });
         assert_eq!(l.summary(), "avg CPU 2.0%, GPU 3.0%, video encoder 20.0%; peak 3.0%, 4.0%, 30.0%");
     }
 
@@ -207,10 +228,24 @@ mod tests {
         std::hint::black_box(x);
         s.tick(None);
         let app = s.app.expect("own process readable");
-        assert!(app.cpu > 0.0, "{app:?}");
+        assert!(app.cpu > 0.0 && !app.first, "{app:?}");
         assert!(app.ram_mb > 1.0, "{app:?}");
         assert!(s.recorder.is_none());
         // The GPU counters exist on this PC (any process using the GPU shows up).
         assert!(!s.engines().is_empty());
+    }
+
+    /// The recorder's sampler skips this app, and forgets pids that are no longer sampled.
+    #[test]
+    fn recorder_only_and_stale_pids() {
+        let mut s = Sampler::recorder_only();
+        let me = std::process::id();
+        s.tick(Some(me));
+        assert!(s.app.is_none() && s.recorder.is_some_and(|u| u.first));
+        assert_eq!(s.cpu_before.len(), 1);
+        // The "recorder" went away (a pid that can't be opened): its reading goes too.
+        s.last = Instant::now() - Duration::from_secs(2);
+        s.tick(Some(0));
+        assert!(s.recorder.is_none() && s.cpu_before.is_empty());
     }
 }

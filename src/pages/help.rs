@@ -56,7 +56,7 @@ impl App {
         } else if !self.buffer {
             (false, "Instant replay is off", pal().amber, "Turn it on with the switch at the bottom left.".to_string())
         } else if !healthy {
-            (false, "Recording, but the last check found a problem", pal().amber, "Make a support zip and send it on the Feedback page.".to_string())
+            (false, "Recording, but the last check found a problem", pal().amber, "Make a support zip and send it to us on Discord or GitHub (links on the Feedback page).".to_string())
         } else {
             (true, "Recording fine", accent_light(), format!("Press {} to save the last {}.", self.saved.hotkey, mmss(self.saved.buffer_secs)))
         };
@@ -249,6 +249,11 @@ impl App {
         if !send {
             return;
         }
+        // The log as it is now, even if Help (which reads it) wasn't opened first.
+        if let Some(t) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5)) {
+            self.log_checked = t;
+        }
+        self.refresh_log();
         let f = &self.feedback;
         let (pc, log) = if f.include {
             let home = dirs::home_dir().map(|h| h.display().to_string());

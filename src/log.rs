@@ -12,16 +12,21 @@ use crate::config;
 const MAX_BYTES: u64 = 1024 * 1024;
 static LOCK: Mutex<()> = Mutex::new(());
 
+/// Tests log to a folder of their own, never into the real app.log.
+fn dir() -> PathBuf {
+    if cfg!(test) { std::env::temp_dir().join("instant-replay-log-test") } else { config::dir() }
+}
+
 pub fn path() -> PathBuf {
-    config::dir().join("app.log")
+    dir().join("app.log")
 }
 
 pub fn write(msg: &str) {
     let _guard = LOCK.lock();
     let path = path();
-    let _ = fs::create_dir_all(config::dir());
+    let _ = fs::create_dir_all(dir());
     if fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
-        let _ = fs::rename(&path, config::dir().join("app.old.log"));
+        let _ = fs::rename(&path, dir().join("app.old.log"));
     }
     let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
     let line = format!(

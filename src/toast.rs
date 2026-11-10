@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -12,14 +13,17 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
+/// The popup's size at 100% scaling; everything in it grows with the monitor's scaling.
 const W: i32 = 320;
 const H: i32 = 64;
 const SHOW: u32 = WM_APP + 1;
 const HIDE_TIMER: usize = 1;
-/// A saved clip's thumbnail: 16:9, left of the text.
+/// A saved clip's thumbnail: 16:9, left of the text, at 100% scaling. Its picture is made at
+/// twice that, so it stays sharp up to 200%.
 const THUMB_W: usize = 84;
 const THUMB_H: usize = 48;
 const THUMB_X: i32 = 14;
+const THUMB_PX: (usize, usize) = (THUMB_W * 2, THUMB_H * 2);
 /// How long a save's popup waits for its thumbnail before showing without it.
 const THUMB_WAIT: Duration = Duration::from_millis(400);
 
@@ -29,6 +33,8 @@ static TEXT: Mutex<(String, String)> = Mutex::new((String::new(), String::new())
 static THUMB: Mutex<Option<(Vec<u8>, String)>> = Mutex::new(None);
 /// The bar's colour (the app's accent), as [r, g, b].
 pub static BAR: Mutex<[u8; 3]> = Mutex::new([132, 72, 240]);
+/// The scaling of the monitor the popup shows on, in DPI (96 is 100%).
+static DPI: AtomicU32 = AtomicU32::new(96);
 
 /// Starts the popup's thread. Call once.
 pub fn start() {
@@ -71,8 +77,8 @@ pub fn show_clip(title: &str, detail: String, clip: &Path) {
 /// moment just saved, and much quicker than an exact frame.
 fn thumbnail(clip: &Path) -> anyhow::Result<(Vec<u8>, String)> {
     let len = crate::media::duration(clip)?;
-    let f = crate::media::keyframe(clip, (len - 1.0).max(0.0), THUMB_W * 2)?;
-    Ok((fit(&f, THUMB_W, THUMB_H), crate::mmss(len.round() as u32)))
+    let f = crate::media::keyframe(clip, (len - 1.0).max(0.0), THUMB_PX.0)?;
+    Ok((fit(&f, THUMB_PX.0, THUMB_PX.1), crate::mmss(len.round() as u32)))
 }
 
 /// `f` scaled to fill `w` x `h` (cropping the overflow evenly), as BGRA for GDI.
@@ -152,8 +158,12 @@ unsafe fn run(tx: mpsc::Sender<u32>) {
                 let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
                 let _ = GetMonitorInfoW(monitor, &mut info);
                 let r = info.rcWork;
+                // The app is per-monitor DPI aware, so these are real pixels: scaled to that monitor.
+                DPI.store(monitor_dpi(monitor), Ordering::Relaxed);
+                let (w, h, gap) = (px(W), px(H), px(24));
+                let _ = SetWindowRgn(hwnd, Some(CreateRoundRectRgn(0, 0, w + 1, h + 1, px(14), px(14))), false);
                 let flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
-                let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), r.right - W - 24, r.top + 24, W, H, flags);
+                let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), r.right - w - gap, r.top + gap, w, h, flags);
                 let _ = InvalidateRect(Some(hwnd), None, true);
                 SetTimer(Some(hwnd), HIDE_TIMER, 2500, None);
             } else {
@@ -161,6 +171,30 @@ unsafe fn run(tx: mpsc::Sender<u32>) {
                 DispatchMessageW(&msg);
             }
         }
+    }
+}
+
+/// `v` (in pixels at 100% scaling) at the popup's monitor's scaling.
+fn px(v: i32) -> i32 {
+    (v as i64 * DPI.load(Ordering::Relaxed) as i64 / 96) as i32
+}
+
+/// A monitor's scaling in DPI (96 is 100%). GetDpiForMonitor is looked up in shcore.dll (Windows
+/// 8.1 and later) when first needed; 96 if it can't be.
+fn monitor_dpi(monitor: HMONITOR) -> u32 {
+    type GetDpiForMonitor = unsafe extern "system" fn(HMONITOR, i32, *mut u32, *mut u32) -> windows::core::HRESULT;
+    static FUNC: OnceLock<Option<GetDpiForMonitor>> = OnceLock::new();
+    let func = FUNC.get_or_init(|| unsafe {
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        let shcore = LoadLibraryW(w!("shcore.dll")).ok()?;
+        let f = GetProcAddress(shcore, windows::core::s!("GetDpiForMonitor"))?;
+        Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, GetDpiForMonitor>(f))
+    });
+    let (mut x, mut y) = (96, 96);
+    // 0: MDT_EFFECTIVE_DPI, the scaling set in Windows' display settings.
+    match func {
+        Some(f) if unsafe { f(monitor, 0, &mut x, &mut y) }.is_ok() && x > 0 => x,
+        _ => 96,
     }
 }
 
@@ -188,32 +222,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// Draws the popup: background, accent bar, the thumbnail if any, and the text.
 unsafe fn paint(hdc: HDC) {
     unsafe {
-        fill(hdc, RECT { left: 0, top: 0, right: W, bottom: H }, rgb(24, 24, 28));
+        let (w, h) = (px(W), px(H));
+        fill(hdc, RECT { left: 0, top: 0, right: w, bottom: h }, rgb(24, 24, 28));
         let [r, g, b] = *BAR.lock().unwrap();
-        fill(hdc, RECT { left: 0, top: 0, right: 6, bottom: H }, rgb(r, g, b));
+        fill(hdc, RECT { left: 0, top: 0, right: px(6), bottom: h }, rgb(r, g, b));
         SetBkMode(hdc, TRANSPARENT);
         let (title, detail) = TEXT.lock().unwrap().clone();
-        let mut left = 20;
-        if let Some((px, len)) = THUMB.lock().unwrap().as_ref() {
-            let (tw, th, top) = (THUMB_W as i32, THUMB_H as i32, (H - THUMB_H as i32) / 2);
+        let mut left = px(20);
+        if let Some((pic, len)) = THUMB.lock().unwrap().as_ref() {
+            let (x, tw, th) = (px(THUMB_X), px(THUMB_W as i32), px(THUMB_H as i32));
+            let top = (h - th) / 2;
+            let (pw, ph) = (THUMB_PX.0 as i32, THUMB_PX.1 as i32);
             let header = BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: tw,
-                biHeight: -th,
+                biWidth: pw,
+                biHeight: -ph,
                 biPlanes: 1,
                 biBitCount: 32,
                 ..Default::default()
             };
             let bmi = BITMAPINFO { bmiHeader: header, ..Default::default() };
-            SetDIBitsToDevice(hdc, THUMB_X, top, tw as u32, th as u32, 0, 0, 0, th as u32, px.as_ptr().cast(), &bmi, DIB_RGB_COLORS);
+            SetStretchBltMode(hdc, HALFTONE);
+            StretchDIBits(hdc, x, top, tw, th, 0, 0, pw, ph, Some(pic.as_ptr().cast()), &bmi, DIB_RGB_COLORS, SRCCOPY);
             // The length in a dark tag in the thumbnail's corner, like a video player's.
-            let tag = RECT { left: THUMB_X + tw - 34, top: top + th - 17, right: THUMB_X + tw - 2, bottom: top + th - 2 };
+            let tag = RECT { left: x + tw - px(34), top: top + th - px(17), right: x + tw - px(2), bottom: top + th - px(2) };
             fill(hdc, tag, rgb(16, 16, 20));
-            text(hdc, len, 13, FW_SEMIBOLD.0 as i32, rgb(240, 240, 240), RECT { left: tag.left + 3, ..tag });
-            left = THUMB_X + tw + 12;
+            text(hdc, len, px(13), FW_SEMIBOLD.0 as i32, rgb(240, 240, 240), RECT { left: tag.left + px(3), ..tag });
+            left = x + tw + px(12);
         }
-        text(hdc, &title, 20, FW_SEMIBOLD.0 as i32, rgb(240, 240, 240), RECT { left, top: 9, right: W - 12, bottom: 34 });
-        text(hdc, &detail, 15, FW_NORMAL.0 as i32, rgb(160, 160, 165), RECT { left, top: 35, right: W - 12, bottom: 56 });
+        text(hdc, &title, px(20), FW_SEMIBOLD.0 as i32, rgb(240, 240, 240), RECT { left, top: px(9), right: w - px(12), bottom: px(34) });
+        text(hdc, &detail, px(15), FW_NORMAL.0 as i32, rgb(160, 160, 165), RECT { left, top: px(35), right: w - px(12), bottom: px(56) });
     }
 }
 
@@ -307,7 +345,7 @@ mod tests {
         let start = std::time::Instant::now();
         let (px, _) = thumbnail(&clip.path).unwrap();
         let took = start.elapsed();
-        assert_eq!(px.len(), THUMB_W * THUMB_H * 4);
+        assert_eq!(px.len(), THUMB_PX.0 * THUMB_PX.1 * 4);
         assert!(px.chunks(4).any(|p| p[..3] != [0, 0, 0]), "thumbnail is all black");
         println!("thumbnail in {took:?}");
     }

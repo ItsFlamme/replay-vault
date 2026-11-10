@@ -43,6 +43,8 @@ pub(crate) struct ClipActions {
     pub(crate) play: Option<std::path::PathBuf>,
     pub(crate) trim: Option<std::path::PathBuf>,
     pub(crate) recycle: Option<std::path::PathBuf>,
+    /// With Delete in the grid: the card to highlight once `recycle` is gone.
+    pub(crate) recycle_next: Option<std::path::PathBuf>,
     pub(crate) star: Option<std::path::PathBuf>,
     pub(crate) export: Option<(std::path::PathBuf, media::Share)>,
     /// A tag put on (true) or taken off a clip.
@@ -280,14 +282,14 @@ impl App {
             (ClipsView::Archive, None) => "Looking at the archive...".to_string(),
             _ => {
                 let mut info = count(self.clip_list.len(), "clip");
-                if let Some(free) = clips::free_space(&self.saved.folder) {
+                if let Some(free) = self.clips_free {
                     info.push_str(&format!("  ·  {} free", clips::size(free)));
                 }
                 info
             }
         };
         ui.add(egui::Label::new(RichText::new(info).color(pal().muted)).truncate())
-            .on_hover_text("Click a clip to pick it, or use the arrow keys. Enter plays it, F2 renames it, Delete moves it to the Recycle Bin. Ctrl+click, Shift+click or Ctrl+A picks several; Esc lets them go.");
+            .on_hover_text("Click a clip to pick it, or use the arrow keys. Enter plays it, F2 renames it, Delete asks, then moves it to the Recycle Bin. Ctrl+click, Shift+click or Ctrl+A picks several; Esc lets them go.");
         // One chip per game folder (and Recordings), when there are any.
         let mut groups: Vec<String> = self.clip_list.iter().filter_map(|c| c.group.clone()).collect();
         groups.sort_by_key(|g| g.to_lowercase());
@@ -475,7 +477,7 @@ impl App {
         // A search looks through everything, from the games too.
         if self.view == ClipsView::Games && words.is_empty() {
             let mut act = ClipActions::default();
-            self.recent_row(ui, &mut act);
+            let recent = self.recent_row(ui, &mut act);
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.label(heading("Your games", 18.0).color(pal().text));
@@ -487,10 +489,13 @@ impl App {
             });
             ui.add_space(10.0);
             self.games_grid(ui);
-            // Home's row picks one clip at a time, as it doesn't take the keys either.
+            // Home's row picks one clip at a time, and only Delete works on it.
             self.picked.clear();
             if let Some((path, _)) = act.select.take() {
                 self.selected = Some(path);
+            }
+            if keys && self.selected.as_ref().is_some_and(|s| recent.contains(s)) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)) {
+                act.recycle = self.selected.clone();
             }
             self.clip_actions(act);
             return;
@@ -594,9 +599,10 @@ impl App {
                 // Not in the archive: on a NAS there's no Recycle Bin to get it back from.
                 if archive.is_none() && pressed(egui::Key::Delete) {
                     act.recycle = Some(item.path.clone());
-                    // The next card along (or the one before the last), so Delete can be pressed again.
+                    // The next card along (or the one before the last), so Delete can be pressed
+                    // again. Highlighted once the clip is gone, not if the question is cancelled.
                     let next = [egui::Key::ArrowRight, egui::Key::ArrowLeft].map(|k| grid_step(&lens, (r, c), k)).into_iter().find(|&n| n != (r, c));
-                    self.selected = next.map(|(r, c)| rows[r][c].path.clone());
+                    act.recycle_next = next.map(|(r, c)| rows[r][c].path.clone());
                 }
             }
         }
@@ -642,11 +648,10 @@ impl App {
                 None => m.clips.push(path),
             }
         }
+        // Asks first, like several clips do.
         if let Some(path) = act.recycle {
-            self.clips_msg = Some(match self.recycle(&path) {
-                Ok(()) => format!("Moved {} to the Recycle Bin.", path.file_name().unwrap_or_default().to_string_lossy()),
-                Err(e) => format!("Couldn't recycle it: {e:#}"),
-            });
+            self.confirm_recycle = Some(vec![path]);
+            self.recycle_next = act.recycle_next;
         }
         if let Some(path) = act.trim {
             self.begin_trim(&path);
@@ -700,7 +705,10 @@ impl App {
         if r.is_ok() {
             self.clip_moved(path, None);
         } else {
-            self.follow_clip(path, None);
+            // Still there (open in another app): it stays in the montage, picks and queue.
+            if !path.exists() {
+                self.follow_clip(path, None);
+            }
             self.rescan_clips();
         }
         r
@@ -758,13 +766,21 @@ impl App {
         }
         self.clips_msg = Some(msg);
         self.picked.clear();
-        self.selected = None;
+        // Delete in the grid on one clip goes on to the next card.
+        let next = self.recycle_next.take();
+        if self.selected.as_ref().is_some_and(|s| paths.contains(s) && failed.len() < paths.len()) {
+            self.selected = next;
+        }
     }
 
     /// The selection after a Ctrl+click on a card (toggles it) or a Shift+click (`range`) on it,
     /// done in `pick_after_click`, with the clip picked last as the anchor.
     pub(crate) fn select_click(&mut self, path: &std::path::Path, range: bool, shown: &[std::path::PathBuf]) {
         self.picked = pick_after_click(&self.picked, self.selected.as_deref(), path, range, shown);
+        // One left picked is the one Enter, F2 and Delete act on, as its highlight shows.
+        if let [one] = self.picked.as_slice() {
+            self.selected = Some(one.clone());
+        }
         // Shift+clicks keep the anchor, so the range can be changed from the same clip.
         if (!range || self.selected.is_none()) && self.picked.iter().any(|p| p == path) {
             self.selected = Some(path.to_path_buf());
@@ -783,6 +799,37 @@ impl App {
             tags: self.tags.get(&key).map(|t| t.iter().cloned().collect()).unwrap_or_default(),
             note: self.notes.get(&key).cloned(),
         }
+    }
+
+    /// Picks up the last read of the clips folder, and every 3 s (or right away after
+    /// rescan_clips) reads it again on another thread, so a big library or a NAS never holds up
+    /// the window. Tests read it in place.
+    pub(crate) fn scan_clips(&mut self, ctx: &egui::Context) {
+        if let Some((folder, list, free)) = self.clips_scan.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.clips_scan = None;
+            if folder == self.saved.folder {
+                (self.clip_list, self.clips_free) = (list, free);
+                self.refind_marked();
+            }
+        }
+        if self.clips_scan.is_some() || self.clips_checked.elapsed() < std::time::Duration::from_secs(3) {
+            return;
+        }
+        self.clips_checked = std::time::Instant::now();
+        let folder = self.saved.folder.clone();
+        if cfg!(test) {
+            (self.clip_list, self.clips_free) = (clips::list(&folder, usize::MAX), clips::free_space(&folder));
+            self.refind_marked();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let (list, free) = (clips::list(&folder, usize::MAX), clips::free_space(&folder));
+            let _ = tx.send((folder, list, free));
+            ctx.request_repaint();
+        });
+        self.clips_scan = Some(rx);
     }
 
     /// Finds starred, tagged and noted clips again after a rename or move outside the app, in the
@@ -872,7 +919,8 @@ impl App {
     }
 
     /// "Recent clips": the 12 newest in one row of wide cards, moved along with the arrows.
-    pub(crate) fn recent_row(&mut self, ui: &mut egui::Ui, act: &mut ClipActions) {
+    /// Returns the clips shown.
+    pub(crate) fn recent_row(&mut self, ui: &mut egui::Ui, act: &mut ClipActions) -> Vec<std::path::PathBuf> {
         const GAP: f32 = 16.0;
         let avail = ui.available_width();
         let (cols, w) = grid_cols(avail, 260.0, GAP);
@@ -898,6 +946,7 @@ impl App {
                 self.clip_card(ui, item, w, act);
             }
         });
+        items.into_iter().map(|i| i.path).collect()
     }
 
     /// A game folder (None: clips not in any) with its clips counted, played last first.
@@ -1112,6 +1161,9 @@ impl App {
             }
             egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 10 }).show(ui, |ui| {
                 ui.set_width(w - 24.0);
+                // Text that can be selected takes the click, so a click on the name or the line
+                // under it wouldn't pick the card (and Delete then had nothing to act on).
+                ui.style_mut().interaction.selectable_labels = false;
                 // Without ".mp4": a cut name ends in "...", not "....".
                 let title = std::path::Path::new(&item.name).file_stem().map_or(item.name.as_str().into(), |s| s.to_string_lossy());
                 ui.add(egui::Label::new(heading(title, 14.0).color(pal().text)).truncate()).on_hover_text(&item.name);
@@ -1181,7 +1233,7 @@ impl App {
                             })
                             .response
                             .on_hover_text("Labels like Aces or Funny, to find clips later");
-                            if upload::is_discord_webhook(&self.cfg.discord_webhook)
+                            if upload::is_discord_webhook(&self.saved.discord_webhook)
                                 && !self.uploads.contains_key(path)
                                 && button(ui, "Post to Discord").on_hover_text("Sends the file to your webhook's channel (up to 10 MB)").clicked()
                             {
@@ -1194,7 +1246,7 @@ impl App {
                                 self.uploads.insert(path.clone(), upload::delete(path, move || c.request_repaint()));
                             }
                             if self.can_recycle()
-                                && ui.add(egui::Button::new("Move to Recycle Bin").shortcut_text("Del")).on_hover_text("Deletes the clip; you can get it back from the Recycle Bin").clicked()
+                                && ui.add(egui::Button::new("Move to Recycle Bin").shortcut_text("Del")).on_hover_text("Deletes the clip, after asking; you can get it back from the Recycle Bin").clicked()
                             {
                                 act.recycle = Some(path.clone());
                             }
@@ -1444,7 +1496,8 @@ impl App {
     /// The tags on clips in the clips folder, sorted. Tags of clips that are gone (auto-cleanup,
     /// archive) stay in tags.json but aren't offered.
     pub(crate) fn tags_in_use(&self) -> Vec<String> {
-        let listed = |p: &String| self.clip_list.iter().any(|c| c.path.as_os_str() == p.as_str());
+        let paths: std::collections::HashSet<&std::ffi::OsStr> = self.clip_list.iter().map(|c| c.path.as_os_str()).collect();
+        let listed = |p: &String| paths.contains(std::ffi::OsStr::new(p.as_str()));
         let mut tags: Vec<String> = self.tags.iter().filter(|(p, _)| listed(p)).flat_map(|(_, t)| t).cloned().collect();
         tags.sort_by_key(|t| t.to_lowercase());
         tags.dedup();

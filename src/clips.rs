@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use crate::media;
 
+#[derive(Clone)]
 pub struct Clip {
     pub path: PathBuf,
     pub name: String,
@@ -34,8 +35,7 @@ pub fn list(folder: &str, max: usize) -> Vec<Clip> {
             let path = e.path();
             let ext = path.extension()?.to_string_lossy().to_lowercase();
             let is_picture = is_picture(&path);
-            // Skips a clip still being cut down by a short save.
-            if !(is_picture || matches!(ext.as_str(), "mp4" | "mkv" | "mov")) || path.to_string_lossy().contains(".cutting.") {
+            if !(is_picture || matches!(ext.as_str(), "mp4" | "mkv" | "mov")) {
                 return None;
             }
             let m = e.metadata().ok()?;
@@ -60,15 +60,24 @@ pub fn is_picture(path: &Path) -> bool {
 /// The folder name for whatever is in front (by its window title only; the game's process is
 /// never opened, so anti-cheats have nothing to see), or "Desktop".
 pub fn game_folder_name() -> String {
+    folder_name_from_title(&title_in_front())
+}
+
+/// The folder name a clip or screenshot being saved goes into. Also remembers when it was named
+/// after a browser tab or a document, so that folder is never looked up on Steam.
+pub fn saving_folder_name() -> String {
+    let title = title_in_front();
+    let name = folder_name_from_title(&title);
+    crate::covers::note_title(&name, &title);
+    name
+}
+
+fn title_in_front() -> String {
     use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
     let window = crate::overlay::window_in_front();
     let mut buf = [0u16; 256];
     let n = if window.is_invalid() { 0 } else { unsafe { GetWindowTextW(window, &mut buf) } };
-    let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-    let name = folder_name_from_title(&title);
-    // A folder named after a browser tab or a document is never looked up on Steam.
-    crate::covers::note_title(&name, &title);
-    name
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
 /// "VALORANT  " -> "VALORANT", "Elden Ring - v1.2" -> "Elden Ring"; nothing usable -> "Desktop".
@@ -76,7 +85,8 @@ pub(crate) fn folder_name_from_title(title: &str) -> String {
     let title = [" - ", " | ", " \u{2014} ", ": "].iter().fold(title, |t, sep| t.split(sep).next().unwrap_or(t));
     let clean = windows_safe(title);
     let clean = clean.as_str();
-    if clean.is_empty() || clean == "Program Manager" {
+    // Only dots ("..") would name a folder outside the clips folder.
+    if clean.chars().all(|c| c == '.' || c.is_whitespace()) || clean == "Program Manager" {
         return "Desktop".into();
     }
     clean.chars().take(60).collect::<String>().trim().to_string()
@@ -174,20 +184,33 @@ fn copy_then_remove(path: &Path, dest: &Path) -> std::io::Result<()> {
 /// Carries a clip's star, tags, note, fingerprint and share link to where it went (renamed or
 /// archived), or with `new` None (recycled) drops its star, tags, note and fingerprint; the share
 /// link stays, to be deleted. Saves whatever changed.
+/// Anything already filed under the new path is dropped first: it was a clip deleted outside the
+/// app, and the clip that has that name now isn't the same one.
 pub fn moved(favs: &mut std::collections::BTreeSet<String>, tags: &mut Tags, notes: &mut Notes, old: &Path, new: Option<&Path>) {
+    if new == Some(old) {
+        return;
+    }
+    let to = new.map(|n| n.display().to_string());
+    let stale = to.as_ref().is_some_and(|k| favs.remove(k));
     if favs.remove(&old.display().to_string()) {
-        favs.extend(new.map(|n| n.display().to_string()));
+        favs.extend(to.clone());
+        save_favorites(favs);
+    } else if stale {
         save_favorites(favs);
     }
-    if move_tags(tags, old, new) {
+    let stale = to.as_ref().is_some_and(|k| tags.remove(k).is_some());
+    if move_tags(tags, old, new) || stale {
         save_tags(tags);
     }
-    if move_note(notes, old, new) {
+    let stale = to.as_ref().is_some_and(|k| notes.remove(k).is_some());
+    if move_note(notes, old, new) || stale {
         save_notes(notes);
     }
+    // A print already at the new path is only replaced, never just dropped: the archive thread
+    // and the window both report the same move, and the second must keep what the first carried.
     let mut p = prints();
     if let Some(print) = p.remove(&old.display().to_string()) {
-        p.extend(new.map(|n| (n.display().to_string(), print)));
+        p.extend(to.map(|n| (n, print)));
         save_prints(&p);
     }
     if let Some(new) = new {
@@ -218,25 +241,65 @@ pub fn recycle(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Stars, tags, notes and fingerprints: read from the file, or from its backup when the file is
+/// missing or can't be read.
+pub(crate) fn load_json<T: serde::de::DeserializeOwned + Default>(file: &Path) -> T {
+    let read = |f: &Path| std::fs::read_to_string(f).ok().and_then(|s| serde_json::from_str(&s).ok());
+    read(file).or_else(|| read(&file.with_extension("json.bak"))).unwrap_or_default()
+}
+
+/// Written to a new file that then replaces the old one, so a crash or full disk mid-write never
+/// leaves half a file. The old one is kept as `.json.bak` once a day, so a bad day can be undone.
+pub(crate) fn save_json<T: serde::Serialize>(file: &Path, value: &T) {
+    // The window, the archive and the cleanup threads can save at once: one at a time.
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock();
+    let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")));
+    let (tmp, bak) = (file.with_extension("json.tmp"), file.with_extension("json.bak"));
+    let Ok(text) = serde_json::to_string_pretty(value) else { return };
+    if std::fs::write(&tmp, text).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    let bak_age = std::fs::metadata(&bak).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+    // Only a file that reads back is worth keeping as the backup.
+    let readable = std::fs::read_to_string(file).ok().is_some_and(|s| serde_json::from_str::<serde_json::Value>(&s).is_ok());
+    if readable && bak_age.is_none_or(|a| a > std::time::Duration::from_secs(86_400)) && std::fs::copy(file, &bak).is_ok() {
+        // copy keeps the old file's time; the backup's age is from now.
+        let _ = std::fs::File::options().write(true).open(&bak).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    }
+    // Antivirus or a reader can hold the file for a moment.
+    for tries in 0.. {
+        match std::fs::rename(&tmp, file) {
+            Ok(()) => break,
+            Err(_) if tries < 5 => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(e) => {
+                crate::log::write(&format!("Couldn't save {}: {e}", file.display()));
+                let _ = std::fs::remove_file(&tmp);
+                break;
+            }
+        }
+    }
+}
+
 fn favorites_file() -> PathBuf {
-    crate::config::dir().join("favorites.json")
+    if cfg!(test) { std::env::temp_dir().join("instant-replay-favorites-test.json") } else { crate::config::dir().join("favorites.json") }
 }
 
 /// Starred clips, by path.
 pub fn favorites() -> std::collections::BTreeSet<String> {
-    std::fs::read_to_string(favorites_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    load_json(&favorites_file())
 }
 
 pub fn save_favorites(favs: &std::collections::BTreeSet<String>) {
-    let _ = std::fs::create_dir_all(crate::config::dir());
-    let _ = std::fs::write(favorites_file(), serde_json::to_string_pretty(favs).unwrap_or_default());
+    save_json(&favorites_file(), favs);
 }
 
 /// Tags ("Aces", "Funny") by clip path.
 pub type Tags = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
 
 fn tags_file() -> PathBuf {
-    crate::config::dir().join("tags.json")
+    if cfg!(test) { std::env::temp_dir().join("instant-replay-tags-test.json") } else { crate::config::dir().join("tags.json") }
 }
 
 pub fn tags() -> Tags {
@@ -248,12 +311,11 @@ pub fn save_tags(tags: &Tags) {
 }
 
 fn read_tags(file: &Path) -> Tags {
-    std::fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    load_json(file)
 }
 
 fn write_tags(file: &Path, tags: &Tags) {
-    let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")));
-    let _ = std::fs::write(file, serde_json::to_string_pretty(tags).unwrap_or_default());
+    save_json(file, tags);
 }
 
 /// Puts `tag` on a clip or takes it off. A new tag that matches one in use but for case takes
@@ -305,12 +367,11 @@ pub fn save_notes(notes: &Notes) {
 }
 
 fn read_notes(file: &Path) -> Notes {
-    std::fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    load_json(file)
 }
 
 fn write_notes(file: &Path, notes: &Notes) {
-    let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")));
-    let _ = std::fs::write(file, serde_json::to_string_pretty(notes).unwrap_or_default());
+    save_json(file, notes);
 }
 
 /// Sets a clip's note: one line (line breaks become spaces), trimmed, at most NOTE_MAX characters.
@@ -345,13 +406,11 @@ fn prints_file() -> PathBuf {
 }
 
 pub fn prints() -> Prints {
-    std::fs::read_to_string(prints_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    load_json(&prints_file())
 }
 
 pub fn save_prints(prints: &Prints) {
-    let file = prints_file();
-    let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")));
-    let _ = std::fs::write(file, serde_json::to_string_pretty(prints).unwrap_or_default());
+    save_json(&prints_file(), prints);
 }
 
 /// A file's size and a hash of its first and last 64 KB, as "size:hash": quick to work out even
@@ -374,8 +433,9 @@ pub fn fingerprint(path: &Path) -> Option<String> {
 /// Finds starred, tagged and noted clips (`marked`) again after a rename or move outside the app.
 /// First fingerprints the marked clips in `scanned` that have none yet. Then each marked path with a
 /// fingerprint that's gone from under `roots` is looked for in `scanned` (only clips of the same
-/// size are read). Returns the moves (old, new), for `moved` to carry the star, tags, note and
-/// share link, and whether `prints` changed (it gets the new fingerprints, and the found ones re-keyed).
+/// size are read). Returns the moves (old, new), for `moved` to carry the star, tags, note,
+/// fingerprint and share link, and whether `prints` changed (it gets the new fingerprints; the
+/// found ones stay under their old path until `moved` carries them).
 pub fn refind(marked: &std::collections::BTreeSet<String>, prints: &mut Prints, scanned: &[&Clip], roots: &[&Path]) -> (Vec<(PathBuf, PathBuf)>, bool) {
     let mut changed = false;
     for c in scanned {
@@ -401,10 +461,7 @@ pub fn refind(marked: &std::collections::BTreeSet<String>, prints: &mut Prints, 
             Some(c.bytes) == size && !marked.contains(&c.path.display().to_string()) && !moves.iter().any(|(_, n)| *n == c.path) && fingerprint(&c.path).as_ref() == Some(&print)
         });
         if let Some(c) = found {
-            prints.remove(&old);
-            prints.insert(c.path.display().to_string(), print);
             moves.push((PathBuf::from(old), c.path.clone()));
-            changed = true;
         }
     }
     (moves, changed)
@@ -444,10 +501,7 @@ static CLEANUP: Mutex<Option<(String, Cleanup)>> = Mutex::new(None);
 
 /// The folder and limits auto-cleanup works with (from the saved settings).
 pub fn set_cleanup(folder: &str, rule: Cleanup) {
-    let mut c = CLEANUP.lock().unwrap();
-    if c.as_ref().is_none_or(|(f, r)| f != folder || *r != rule) {
-        *c = Some((folder.to_string(), rule));
-    }
+    *CLEANUP.lock().unwrap() = Some((folder.to_string(), rule));
 }
 
 /// Once a minute, moves what `cleanup_plan` picks to the Recycle Bin. A clip that can't be moved
@@ -761,9 +815,12 @@ pub fn size(bytes: u64) -> String {
 }
 
 /// A free name next to `src` for a copy marked `tag`: "Clip (trim).mp4", "Clip (trim 2).mp4", ...
+/// Always .mp4 except for a GIF: Windows writes the file in the container its extension names,
+/// and it has no writer for .mkv or .mov, so a copy of one of those is made as an .mp4.
 pub fn copy_name(src: &Path, tag: &str) -> PathBuf {
     let stem = src.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = src.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mp4".into());
+    let gif = src.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif"));
+    let ext = if gif { "gif" } else { "mp4" };
     (1..)
         .map(|n| src.with_file_name(if n == 1 { format!("{stem} ({tag}).{ext}") } else { format!("{stem} ({tag} {n}).{ext}") }))
         .find(|p| !p.exists())
@@ -824,6 +881,9 @@ mod tests {
         std::fs::write(dir.join("Replay 1 (trim).mp4"), b"x").unwrap();
         assert_eq!(copy_name(&src, "trim").file_name().unwrap(), "Replay 1 (trim 2).mp4");
         assert_eq!(copy_name(&src, "Discord 10MB").file_name().unwrap(), "Replay 1 (Discord 10MB).mp4");
+        // Windows can't write .mkv or .mov, so their copies are .mp4.
+        assert_eq!(copy_name(&dir.join("Replay 1.mkv"), "trim").file_name().unwrap(), "Replay 1 (trim 2).mp4");
+        assert_eq!(copy_name(&dir.join("Old.MOV"), "720p").file_name().unwrap(), "Old (720p).mp4");
         // A GIF of it gets the .gif extension, and is listed as a picture.
         let gif = copy_name(&src.with_extension("gif"), "GIF");
         assert_eq!(gif.file_name().unwrap(), "Replay 1 (GIF).gif");
@@ -888,10 +948,44 @@ mod tests {
         std::fs::rename(&a, &moved_to).unwrap();
         std::fs::write(dir.join("decoy.mp4"), &other).unwrap();
         prints.insert(key(elsewhere), prints[&key(&a)].clone());
-        assert_eq!(scan(&mut prints), (vec![(a.clone(), moved_to.clone())], true));
-        assert!(prints.contains_key(&key(&moved_to)) && !prints.contains_key(&key(&a)));
+        assert_eq!(scan(&mut prints), (vec![(a.clone(), moved_to.clone())], false));
+        assert!(prints.contains_key(&key(&a)) && !prints.contains_key(&key(&moved_to)), "left for moved to carry");
         assert!(prints.contains_key(&key(elsewhere)), "outside the clips folder: not looked for");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A clip renamed to the name of one deleted outside the app keeps its own star, tags, note and
+    /// fingerprint, not the gone clip's leftovers. Uses the test copies of the files.
+    #[test]
+    fn moved_drops_leftovers_at_the_new_name() {
+        let dir = std::env::temp_dir().join("instant-replay-moved-leftovers");
+        let (old, new, gone) = (dir.join("a.mp4"), dir.join("b.mp4"), dir.join("c.mp4"));
+        let key = |p: &Path| p.display().to_string();
+        let mut favs: std::collections::BTreeSet<String> = [key(&new)].into();
+        let mut t = Tags::new();
+        set_tag(&mut t, &old, "Aces", true);
+        set_tag(&mut t, &new, "Funny", true);
+        let mut n = Notes::new();
+        set_note(&mut n, &new, "someone else's clip");
+        set_note(&mut n, &gone, "stays");
+        let mut p = prints();
+        p.insert(key(&old), "1:aa".into());
+        p.insert(key(&new), "2:bb".into());
+        save_prints(&p);
+        moved(&mut favs, &mut t, &mut n, &old, Some(&new));
+        assert!(favs.is_empty(), "the old clip had no star; the leftover one goes");
+        assert_eq!(t.get(&key(&new)).map(|s| s.iter().cloned().collect::<Vec<_>>()), Some(vec!["Aces".to_string()]));
+        assert!(!t.contains_key(&key(&old)));
+        assert_eq!(n.keys().collect::<Vec<_>>(), [&key(&gone)], "the leftover note goes, others stay");
+        let p = prints();
+        assert_eq!(p.get(&key(&new)).map(String::as_str), Some("1:aa"));
+        assert!(!p.contains_key(&key(&old)));
+        // Renamed to its own name: nothing is dropped.
+        moved(&mut favs, &mut t, &mut n, &new, Some(&new));
+        assert!(t.contains_key(&key(&new)) && prints().contains_key(&key(&new)));
+        let mut p = prints();
+        p.retain(|k, _| !k.starts_with(&key(&dir)));
+        save_prints(&p);
     }
 
     /// Notes save and load (in a temp file, not the real notes.json), stay one line and short, and
@@ -1058,6 +1152,25 @@ mod tests {
         assert!(day_label(t).starts_with("Thu, Jan 15"), "{}", day_label(t));
     }
 
+    /// A save replaces the file whole and keeps the one before as a backup, which is read when
+    /// the file is broken.
+    #[test]
+    fn tags_file_survives_a_bad_write() {
+        let dir = std::env::temp_dir().join("instant-replay-tags-safe");
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("tags.json");
+        let mut tags = Tags::new();
+        set_tag(&mut tags, Path::new("a.mp4"), "Aces", true);
+        write_tags(&file, &tags);
+        set_tag(&mut tags, Path::new("b.mp4"), "Funny", true);
+        write_tags(&file, &tags);
+        assert_eq!(read_tags(&file), tags);
+        assert!(!dir.join("tags.json.tmp").exists());
+        std::fs::write(&file, b"{\"a.mp4\": [\"Ac").unwrap();
+        assert_eq!(read_tags(&file).len(), 1, "the backup, from before the second save");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn game_folder_names() {
         assert_eq!(folder_name_from_title("VALORANT  "), "VALORANT");
@@ -1066,6 +1179,9 @@ mod tests {
         assert_eq!(folder_name_from_title(""), "Desktop");
         assert_eq!(folder_name_from_title("Program Manager"), "Desktop");
         assert_eq!(folder_name_from_title("a?b*c"), "abc");
+        // Never a folder outside the clips folder.
+        assert_eq!(folder_name_from_title(".. . - Google Chrome"), "Desktop");
+        assert_eq!(folder_name_from_title("."), "Desktop");
     }
 
     #[test]

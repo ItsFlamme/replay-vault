@@ -64,7 +64,8 @@ fn hdr_white(cfg: &Config, mon: &Monitor) -> Option<u32> {
     if cfg.follows_mouse() { display::list().iter().find_map(|m| m.hdr) } else { mon.hdr }
 }
 
-/// Copies the main OBS's version stamps so the hidden copy never shows "What's new" dialogs.
+/// Copies the main OBS's version stamps so the hidden copy never shows "What's new" dialogs. Only
+/// used when our copy's version.txt is missing.
 fn version_lines(main_ini: &Path) -> String {
     fs::read_to_string(main_ini)
         .unwrap_or_default()
@@ -205,8 +206,9 @@ pub fn buffer_cap_mb() -> u64 {
 pub fn plan(cfg: &Config, mon: &Monitor) -> Plan {
     // Canvas = the monitor; the clip is only ever scaled down, keeping the aspect ratio.
     let (base_w, base_h) = (mon.width, mon.height);
-    let out_h = if cfg.out_height == 0 { base_h } else { cfg.out_height.min(base_h) };
-    let out_w = (base_w * out_h / base_h) & !1; // encoders want an even width
+    // Encoders want even sizes.
+    let out_h = (if cfg.out_height == 0 { base_h } else { cfg.out_height.min(base_h) }) & !1;
+    let out_w = (base_w * out_h / base_h) & !1;
     let fps = if cfg.fps == 0 { mon.hz.max(1) } else { cfg.fps };
     // Bitrate scales with pixels per second, then by the quality preset; HEVC and AV1 need less.
     let quality = [1.5, 1.0, 0.7, 0.45][cfg.quality.min(3) as usize];
@@ -230,6 +232,26 @@ pub fn plan(cfg: &Config, mon: &Monitor) -> Plan {
 pub fn max_secs(cfg: &Config, mon: &Monitor) -> u32 {
     let longest = Config { buffer_secs: 1200, ..cfg.clone() };
     plan(&longest, mon).fits_secs.map_or(1200, |s| (s / 10 * 10).clamp(10, 1200))
+}
+
+/// The tracks (bit 0 = track 1) holding a mic together with other sound. Centering raises one
+/// side of a track, which would move the mic (mono, so already in the middle) off to that side;
+/// these tracks get the loud side copied instead (media::center).
+pub fn mic_mixed_tracks(cfg: &Config) -> u8 {
+    let n = cfg.tracks();
+    let ticked = |mic: bool| -> u8 {
+        let devices = cfg.devices.iter().filter(|(k, _)| k.starts_with("in:") == mic);
+        let mut mask = devices.fold(0u8, |m, (_, d)| (0..n).filter(|&i| d.tracks[i]).fold(m, |m, i| m | 1 << i));
+        if !mic {
+            mask |= (0..n).filter(|&i| cfg.chat_tracks[i]).fold(0, |m, i| m | 1 << i);
+            // Only these apps with no playback track ticked: the apps go on track 1.
+            if cfg.only_apps && !cfg.apps.is_empty() && mask == 0 {
+                mask = 1;
+            }
+        }
+        mask
+    };
+    ticked(true) & ticked(false)
 }
 
 /// OBS's RecTracks: one bit per recorded audio track, tracks 1 to `count` (1 to 6).
@@ -263,14 +285,64 @@ pub fn write_config(cfg: &Config) -> anyhow::Result<()> {
     let exe = obs_exe()?;
     let mon = chosen_monitor(cfg).ok_or_else(|| anyhow::anyhow!("no monitor found"))?;
     let main_root = dirs::config_dir().unwrap_or_default().join("obs-studio");
-    // Version stamps stop "what's new" dialogs: our private copy knows its own version, a
-    // shared install matches the user's main OBS settings.
-    let private_stamp = obs_install::is_private(&exe)
-        .then(obs_install::private_version)
-        .flatten()
-        .and_then(|v| obs_install::last_version_stamp(&v));
+    // Version stamps stop "what's new" dialogs: our private copy knows its own version (its
+    // version.txt); without it, the user's main OBS settings are only read for theirs.
+    let private_stamp = obs_install::private_version().and_then(|v| obs_install::last_version_stamp(&v));
     log::write(&write_files(cfg, &portable_root(&exe), &mon, &main_root, private_stamp)?);
     Ok(())
+}
+
+/// The recorder's encoder ID and its settings (recordEncoder.json) for `gpu` at `kbps`.
+fn encoder_settings(gpu: Gpu, cfg: &Config, kbps: u64) -> (&'static str, serde_json::Value) {
+    // Encoder IDs and setting names are OBS's own (obs-nvenc, obs-ffmpeg's AMF, obs-qsv11).
+    let max = kbps * 3 / 2;
+    let enc_profile = if cfg.codec == "h264" { "high" } else { "main" };
+    // Encoder effort: 0 best quality (the original settings), 1 balanced, 2 max FPS. Lighter
+    // levels do less work per frame, so clips look a little worse at the same bitrate.
+    let effort = cfg.encoder_effort.min(2) as usize;
+    let (nv_preset, nv_multipass) = [("p5", "qres"), ("p4", "disabled"), ("p1", "disabled")][effort];
+    let amf_preset = ["quality", "balanced", "speed"][effort];
+    let qsv_usage = ["TU4", "TU5", "TU7"][effort];
+    let x264_preset = ["veryfast", "superfast", "ultrafast"][effort];
+    let (encoder, mut enc_settings) = match (gpu, cfg.codec.as_str()) {
+        // obs-nvenc (OBS 30.2+) reads "preset" and "adaptive_quantization"; "preset2" and
+        // "psycho_aq" are the old names, which it only carries over for its old encoder IDs.
+        // Both are written so either kind of OBS gets the same settings.
+        (Gpu::Nvidia, codec) => (
+            match codec { "hevc" => "obs_nvenc_hevc_tex", "av1" => "obs_nvenc_av1_tex", _ => "obs_nvenc_h264_tex" },
+            json!({
+                "rate_control": "VBR", "bitrate": kbps, "max_bitrate": max,
+                "preset": nv_preset, "preset2": nv_preset, "tune": "hq", "multipass": nv_multipass,
+                "profile": enc_profile, "bf": 2, "keyint_sec": 2,
+            }),
+        ),
+        (Gpu::Amd, codec) => (
+            match codec { "hevc" => "h265_texture_amf", "av1" => "av1_texture_amf", _ => "h264_texture_amf" },
+            json!({
+                "rate_control": "VBR", "bitrate": kbps, "max_bitrate": max,
+                "preset": amf_preset, "profile": enc_profile, "keyint_sec": 2,
+            }),
+        ),
+        (Gpu::Intel, codec) => (
+            match codec { "hevc" => "obs_qsv11_hevc", "av1" => "obs_qsv11_av1", _ => "obs_qsv11_v2" },
+            json!({
+                "rate_control": "VBR", "bitrate": kbps, "max_bitrate": max,
+                "target_usage": qsv_usage, "profile": enc_profile, "keyint_sec": 2,
+            }),
+        ),
+        // No hardware encoder: H.264 on the CPU, light preset to leave the game its frames.
+        (Gpu::None, _) => (
+            "obs_x264",
+            json!({ "rate_control": "VBR", "bitrate": kbps, "preset": x264_preset, "keyint_sec": 2 }),
+        ),
+    };
+    // Psycho-visual tuning (adaptive quantization) runs on the GPU's CUDA cores, which games use too. Left at OBS's own
+    // default for best quality.
+    if gpu == Gpu::Nvidia && effort > 0 {
+        enc_settings["adaptive_quantization"] = json!(false);
+        enc_settings["psycho_aq"] = json!(false);
+    }
+    (encoder, enc_settings)
 }
 
 /// Writes the recorder's settings, profile and scene collection under `root`. Returns the
@@ -304,50 +376,7 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
     fs::write(root.join(r"plugin_config\obs-websocket\config.json"), ws.to_string())?;
 
     let Plan { base_w, base_h, out_w, out_h, fps, kbps, mb, .. } = plan(cfg, mon);
-    // Encoder IDs and setting names are OBS's own (obs-nvenc, obs-ffmpeg's AMF, obs-qsv11).
-    let max = kbps * 3 / 2;
-    let enc_profile = if cfg.codec == "h264" { "high" } else { "main" };
-    // Encoder effort: 0 best quality (the original settings), 1 balanced, 2 max FPS. Lighter
-    // levels do less work per frame, so clips look a little worse at the same bitrate.
-    let effort = cfg.encoder_effort.min(2) as usize;
-    let (nv_preset, nv_multipass) = [("p5", "qres"), ("p4", "disabled"), ("p1", "disabled")][effort];
-    let amf_preset = ["quality", "balanced", "speed"][effort];
-    let qsv_usage = ["TU4", "TU5", "TU7"][effort];
-    let x264_preset = ["veryfast", "superfast", "ultrafast"][effort];
-    let (encoder, mut enc_settings) = match (gpu(), cfg.codec.as_str()) {
-        (Gpu::Nvidia, codec) => (
-            match codec { "hevc" => "obs_nvenc_hevc_tex", "av1" => "obs_nvenc_av1_tex", _ => "obs_nvenc_h264_tex" },
-            json!({
-                "rate_control": "VBR", "bitrate": kbps, "max_bitrate": max,
-                "preset2": nv_preset, "tune": "hq", "multipass": nv_multipass,
-                "profile": enc_profile, "bf": 2, "keyint_sec": 2,
-            }),
-        ),
-        (Gpu::Amd, codec) => (
-            match codec { "hevc" => "h265_texture_amf", "av1" => "av1_texture_amf", _ => "h264_texture_amf" },
-            json!({
-                "rate_control": "VBR", "bitrate": kbps, "max_bitrate": max,
-                "preset": amf_preset, "profile": enc_profile, "keyint_sec": 2,
-            }),
-        ),
-        (Gpu::Intel, codec) => (
-            match codec { "hevc" => "obs_qsv11_hevc", "av1" => "obs_qsv11_av1", _ => "obs_qsv11_v2" },
-            json!({
-                "rate_control": "VBR", "bitrate": kbps, "max_bitrate": max,
-                "target_usage": qsv_usage, "profile": enc_profile, "keyint_sec": 2,
-            }),
-        ),
-        // No hardware encoder: H.264 on the CPU, light preset to leave the game its frames.
-        (Gpu::None, _) => (
-            "obs_x264",
-            json!({ "rate_control": "VBR", "bitrate": kbps, "preset": x264_preset, "keyint_sec": 2 }),
-        ),
-    };
-    // Psycho-visual tuning runs on the GPU's CUDA cores, which games use too. Left at OBS's own
-    // default for best quality.
-    if gpu() == Gpu::Nvidia && effort > 0 {
-        enc_settings["psycho_aq"] = json!(false);
-    }
+    let (encoder, enc_settings) = encoder_settings(gpu(), cfg, kbps);
     let summary = format!("Encoder: {} ({encoder}), {out_w}x{out_h} at {fps} fps, {kbps} kbps.", gpu().label());
     let mask = track_mask(cfg.track_count);
     // OBS won't start the replay buffer if the clip folder is missing ("bad output path").
@@ -532,10 +561,55 @@ fn all_recorders() -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// Stops the hidden recorder(s). Safe to kill: OBS skips its crash check for `--multi` copies.
+/// The running recorder's WebSocket password, so `stop` can reach it to finish a recording.
+static PASSWORD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Stops a full recording if one is running and waits (up to 10 s) for OBS to finish writing the
+/// file, so the recorder can then be killed without leaving an MP4 that won't play. Returns the
+/// recording's path if there was one.
+pub async fn finish_recording(c: &obws::Client) -> anyhow::Result<Option<String>> {
+    if !c.recording().status().await?.active {
+        return Ok(None);
+    }
+    let path = c.recording().stop().await?;
+    // OBS answers before it has closed the file; it's done once the recording shows as stopped.
+    for _ in 0..40 {
+        if !c.recording().status().await.is_ok_and(|s| s.active) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Ok(Some(path))
+}
+
+/// `finish_recording` for `stop`, on a thread of its own (stop is also called from inside the
+/// recorder thread's runtime). Gives up after 15 s, so a recorder that hangs can't hold up quitting.
+fn finish_recording_now() {
+    use std::time::Duration;
+    let password = PASSWORD.lock().unwrap().clone();
+    if password.is_empty() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+        let path = rt.block_on(async {
+            let c = tokio::time::timeout(Duration::from_secs(3), obws::Client::connect("127.0.0.1", PORT, Some(password.as_str()))).await.ok()?.ok()?;
+            tokio::time::timeout(Duration::from_secs(12), finish_recording(&c)).await.ok()?.ok().flatten()
+        });
+        let _ = tx.send(path);
+    });
+    if let Ok(Some(path)) = rx.recv_timeout(Duration::from_secs(15)) {
+        log::write(&format!("Stopped the full recording before closing the recorder: {path}"));
+    }
+}
+
+/// Stops the hidden recorder(s), after finishing a full recording if one is running. Safe to
+/// kill then: OBS skips its crash check for `--multi` copies.
 /// Only processes launched with our flags are killed: a saved PID alone could by now belong to the
 /// user's own OBS (Windows reuses PIDs).
 pub fn stop() {
+    finish_recording_now();
     for pid in all_recorders() {
         let _ = Command::new(windows_exe("taskkill.exe"))
             .args(["/PID", &pid.to_string(), "/F"])
@@ -551,22 +625,47 @@ pub fn restart(cfg: &Config) -> anyhow::Result<()> {
     stop();
     write_config(cfg)?;
     let exe = obs_exe()?;
-    // Only for our private copy: the user's own OBS exe keeps whatever they chose for it.
-    if obs_install::is_private(&exe)
-        && let Err(e) = crate::tweaks::set_gpu_high(&exe, cfg.gpu_high) {
+    if let Err(e) = crate::tweaks::set_gpu_high(&exe, cfg.gpu_high) {
         log::write(&format!("Couldn't set the recorder's graphics preference: {e:#}"));
     }
+    *PASSWORD.lock().unwrap() = cfg.recorder_password.clone();
+    let front = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
     let child = Command::new(&exe)
         .args(["--portable", "--multi", "--minimize-to-tray", "--startreplaybuffer", "--disable-updater"])
         .current_dir(exe.parent().unwrap())
-        // The user's OBS is set to run as admin; run this copy as a normal user so the app can stop it.
+        // Always as a normal user, even if a compatibility setting asks for admin, so the app can stop it.
         .env("__COMPAT_LAYER", "RunAsInvoker")
         .spawn()?;
     let _ = tie_to_app(&child);
+    keep_focus(front, child.id());
     PID.store(child.id(), std::sync::atomic::Ordering::Relaxed);
     fs::create_dir_all(config::dir())?;
     fs::write(pid_file(), child.id().to_string())?;
     Ok(())
+}
+
+/// OBS's hidden window takes the foreground as it starts when this app had it (after Save on a
+/// settings page), so typing went nowhere until something was clicked. For 10 s, if the recorder
+/// holds the foreground, it goes back to `front`. Anything else the user switches to is left alone.
+fn keep_focus(front: windows::Win32::Foundation::HWND, pid: u32) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow};
+    if front.is_invalid() {
+        return;
+    }
+    // HWND isn't Send; the number is.
+    let front = front.0 as isize;
+    std::thread::spawn(move || {
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let mut owner = 0;
+            unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut owner)) };
+            if owner == pid {
+                let _ = unsafe { SetForegroundWindow(HWND(front as *mut _)) };
+                return;
+            }
+        }
+    });
 }
 
 /// Puts the recorder in a job that Windows closes when this app's process ends, however it ends
@@ -780,6 +879,20 @@ mod tests {
         assert_eq!(source(&scene, "wasapi_input_capture")[0]["flags"], 2);
     }
 
+    /// Only tracks with a mic and other sound count as mixed.
+    #[test]
+    fn mic_mixed_tracks_found() {
+        let mut cfg = Config { track_count: 3, ..Config::default() };
+        cfg.devices.insert("out:default".into(), DeviceSel { name: "Speakers".into(), tracks: [true, true, false, false, false, false] });
+        cfg.devices.insert("in:default".into(), DeviceSel { name: "Mic".into(), tracks: [true, false, true, false, true, false] });
+        cfg.chat_tracks = [false; 6];
+        assert_eq!(mic_mixed_tracks(&cfg), 0b001, "track 1 mixed, 2 game only, 3 mic only, 5 past the count");
+        cfg.chat_tracks = [false, false, true, false, false, false];
+        assert_eq!(mic_mixed_tracks(&cfg), 0b101, "voice chat on the mic's track");
+        cfg.devices.remove("in:default");
+        assert_eq!(mic_mixed_tracks(&cfg), 0);
+    }
+
     /// RecTracks has one bit per track, 1 to 6, and a hand-edited count can't overflow it.
     #[test]
     fn track_bitmask() {
@@ -837,6 +950,21 @@ mod tests {
             let light = Config { quality: 3, out_height: 720, fps: 30, ..Config::default() };
             assert_eq!(max_secs(&light, &test_monitor()), 1200);
         }
+    }
+
+    /// NVENC gets its preset under both the current key and the old one, at every effort.
+    #[test]
+    fn nvenc_preset_under_both_keys() {
+        for (effort, preset, aq) in [(0, "p5", None), (1, "p4", Some(false)), (2, "p1", Some(false))] {
+            let cfg = Config { encoder_effort: effort, ..Config::default() };
+            let (id, s) = encoder_settings(Gpu::Nvidia, &cfg, 20_000);
+            assert_eq!(id, "obs_nvenc_h264_tex");
+            assert_eq!((s["preset"].as_str(), s["preset2"].as_str()), (Some(preset), Some(preset)), "effort {effort}");
+            assert_eq!((s["adaptive_quantization"].as_bool(), s["psycho_aq"].as_bool()), (aq, aq), "effort {effort}");
+        }
+        // The others keep their own keys.
+        let (_, amd) = encoder_settings(Gpu::Amd, &Config::default(), 20_000);
+        assert!(amd.get("preset2").is_none() && amd["preset"].is_string());
     }
 
     #[test]

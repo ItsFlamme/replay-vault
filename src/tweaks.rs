@@ -25,8 +25,9 @@ const GPU_KEY: &str = r"Software\Microsoft\DirectX\UserGpuPreferences";
 const NVIDIA_KEY: &str = r"Software\NVIDIA Corporation\Global\ShadowPlay\NVSPCAPS";
 const NVIDIA_OVERLAY: [&str; 2] = ["IsShadowPlayEnabled", "IsShadowPlayEnabledUser"];
 
+/// Tests use a file of their own, never the real record of what to give back.
 fn file() -> std::path::PathBuf {
-    crate::config::dir().join("tweaks.json")
+    if cfg!(test) { std::env::temp_dir().join("instant-replay-tweaks-test.json") } else { crate::config::dir().join("tweaks.json") }
 }
 
 /// "key|value" -> the original data (see `read`), or null if it wasn't set. A damaged file is

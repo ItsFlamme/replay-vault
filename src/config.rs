@@ -22,7 +22,6 @@ pub struct Config {
     pub hotkey: String,
     /// Shows or hides the overlay.
     pub overlay_hotkey: String,
-    /// Save only the last 30 seconds / 1 minute; empty means not set.
     /// Start/stop a full recording, take a screenshot, turn instant replay on/off, mute the mic.
     pub hotkey_record: String,
     pub hotkey_screenshot: String,
@@ -82,6 +81,9 @@ pub struct Config {
     /// (OBS application audio capture), on the tracks the playback devices use.
     pub only_apps: bool,
     pub apps: Vec<AppSel>,
+    /// Experimental: a saved clip whose sound is louder on one side all the way through is
+    /// evened out (obs::center_clip). Off: clips stay exactly as recorded.
+    pub center_sound: bool,
     /// WebSocket password of the hidden recorder OBS (generated, never shown).
     pub recorder_password: String,
     /// Pages whose "More options" are open. A view choice: kept without Save.
@@ -157,7 +159,7 @@ impl Default for Config {
             devices.insert(key.to_string(), DeviceSel { name: name.into(), tracks: [true, false, false, false, false, false] });
         }
         Self {
-            folder: dirs::video_dir().unwrap_or_default().join("Replay Vault Clips").display().to_string(),
+            folder: local_data().map_or_else(|| dirs::video_dir().unwrap_or_default().join("Replay Vault Clips"), |d| d.join("clips")).display().to_string(),
             buffer_secs: 180,
             track_count: 1,
             track_names: Default::default(),
@@ -197,6 +199,7 @@ impl Default for Config {
             devices,
             only_apps: false,
             apps: Vec::new(),
+            center_sound: false,
             recorder_password: String::new(),
             more_open: Vec::new(),
             setup_done: false,
@@ -216,11 +219,27 @@ impl Default for Config {
     }
 }
 
-/// %APPDATA%\replay-vault. Settings from before the rename (obs-instant-replay) move here the first
-/// time; if they can't be moved (an old copy still running), the old folder keeps being used.
+/// A copy's own data folder: `replay-vault-data` next to the exe, if there is one (a folder you
+/// make yourself, for a self-contained test copy). Settings, logs, the private OBS and new clips then stay in
+/// it, so deleting the copy's folder takes everything it made. Installs never have one.
+pub fn local_data() -> Option<PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::current_exe().ok()?.parent()?.join("replay-vault-data");
+        (!cfg!(test) && dir.is_dir()).then_some(dir)
+    })
+    .clone()
+}
+
+/// %APPDATA%\replay-vault (or local_data's settings folder). Settings from before the rename
+/// (obs-instant-replay) move here the first time; if they can't be moved (an old copy still
+/// running), the old folder keeps being used.
 pub fn dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
+        if let Some(d) = local_data() {
+            return d.join("settings");
+        }
         let root = dirs::config_dir().unwrap_or_default();
         let (new, old) = (root.join("replay-vault"), root.join("obs-instant-replay"));
         if !new.exists() && old.exists() && fs::rename(&old, &new).is_err() {
@@ -315,19 +334,23 @@ impl Config {
         self.archive_days = self.archive_days.min(3650);
     }
 
-    /// Whether the capture follows the mouse: never with game capture.
     /// How many audio tracks clips have, 1 to 6, whatever the file says.
     pub fn tracks(&self) -> usize {
         self.track_count.clamp(1, 6) as usize
     }
 
+    /// Whether the capture follows the mouse: never with game capture.
     pub fn follows_mouse(&self) -> bool {
         self.follow_mouse && self.capture != "game"
     }
 
+    /// Written to a new file that then replaces the old one, so a crash mid-save, or another
+    /// thread reading it (autopause, the tray), never sees half a file.
     pub fn save(&self) -> anyhow::Result<()> {
         fs::create_dir_all(dir())?;
-        fs::write(path(), serde_json::to_string_pretty(self)?)?;
+        let tmp = path().with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        fs::rename(&tmp, path())?;
         Ok(())
     }
 }
@@ -406,6 +429,7 @@ pub const FIELDS: &[(&str, Option<Page>, bool, Kind)] = {
         ("devices", Some(Audio), true, Setting),
         ("only_apps", Some(Audio), true, Setting),
         ("apps", Some(Audio), true, Setting),
+        ("center_sound", Some(Audio), false, Setting),
         ("recorder_password", None, true, Secret),
         ("more_open", None, false, View),
         ("setup_done", None, true, Local),
@@ -725,6 +749,14 @@ mod tests {
             ]
         );
         assert!(changes(&here, &cfg).is_empty(), "shown with values, not again by name");
+    }
+
+    /// Centering is experimental: off for a new install and for a settings file from before it.
+    #[test]
+    fn centering_starts_off() {
+        assert!(!Config::default().center_sound);
+        let old: Config = serde_json::from_str(r#"{"buffer_secs": 120}"#).unwrap();
+        assert!(!old.center_sound);
     }
 
     /// Every setting in config.json is in `FIELDS` once, and copying by it loses nothing.

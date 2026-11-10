@@ -266,6 +266,18 @@ fn poll_capture(held: &[u16]) {
     if !c.active {
         return;
     }
+    // Only keys pressed in our own window count: switching away (Alt+Tab to the game) cancels.
+    let ours = crate::overlay::hwnd().is_none_or(|h| unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } == h);
+    let alt_tab = down(0x12) && down(0x09);
+    if !ours || alt_tab {
+        c.active = false;
+        c.ended = Some(std::time::Instant::now());
+        c.result = None;
+        if let Some(f) = &c.on_done {
+            f();
+        }
+        return;
+    }
     for vk in 0x08u16..=0xFE {
         let modifier = matches!(vk, 0x10..=0x12 | 0x5B | 0x5C | 0xA0..=0xA5);
         if modifier || held.contains(&vk) || !down(vk) {
