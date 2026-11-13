@@ -65,9 +65,9 @@ pub(crate) fn make_tray(ctx: &egui::Context, cmds: Sender<Cmd>) -> anyhow::Resul
             match autopause::count_last_window(std::path::Path::new(&Config::load().folder)) {
                 Ok(name) => {
                     log::write(&format!("{name} now counts as a game."));
-                    toast::show("Counts as a game now", format!("{name}: replay stays on while it's in front"));
+                    toast::show(toast::Kind::Info, "Counts as a game now", format!("{name}: replay stays on while it's in front"));
                 }
-                Err(e) => toast::show("Couldn't count it as a game", format!("{e:#}")),
+                Err(e) => toast::show(toast::Kind::Warning, "Couldn't count it as a game", format!("{e:#}")),
             }
         } else if e.id == startup_id {
             if let Err(e) = startup::set_enabled(!startup::is_enabled()) {

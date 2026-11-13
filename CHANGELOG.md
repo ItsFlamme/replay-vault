@@ -2,6 +2,77 @@
 
 Notable changes in each release. The app's What's new page is built from this file.
 
+## 0.2.2
+
+### Changed
+
+- The sidebar, the Clips page and the settings pages have a cleaner layout, and the Retro theme now reaches every screen.
+- Your games are listed under Clips in the sidebar, each with its clip count. Click one to see only its clips.
+- Help, What's new and Feedback are small links at the bottom of the sidebar. Settings holds General, Keybinds, Video and Audio.
+- The box at the bottom of the sidebar has a labeled Instant replay switch, how much is being kept, and a Save clip button with its key. The search box and Save clip no longer sit at the top of every page.
+- In a short window the sidebar packs its rows closer, so Save clip stays in view.
+- Clips is one page: chips for All games, each game with its picture and count, Starred and your tags, with the sort on the right. Clips are grouped by day: Today, Yesterday, then the date.
+- Open folder moved into the ··· menu next to Montage.
+- Settings rows line up: a label, the setting, then Clear or Set at the right. On Keybinds every key but Save clip can be cleared or set from the same place.
+- Restore defaults moved to the bottom of each settings page.
+- The explanations under settings moved into the hover text of the setting they explain. Warnings and statuses still show.
+- In Retro, clip cards show PLAY and the length on the picture with a VCR-style title, each game has its own tape color, buttons and chips look like remote-control keys, and settings headings and dialog titles are tape labels.
+- In Retro, the player shows PLAY or PAUSE next to the controls for a moment, with a VCR counter, and the Clip saved popup reads like a VCR display.
+- Popups about a problem, like Clip not saved or Low disk space, have an amber title. In Retro they also go without the red light, so they don't read as a saved clip.
+- In light Retro, the sidebar tapes no longer have a grey frame.
+
+### Removed
+
+- The tip boxes at the top of each page and the Show tips and explanations setting.
+- The Recent clips row, the Your games cards and the Recent / All chips on the Clips page.
+
+### Fixed
+
+- On the days the clocks change, Yesterday now shows the right day's clips.
+- Replay Vault only ever stops its own recorder, never one started by another copy of the app.
+- Opening Replay Vault while another copy of it is running now says so, instead of doing nothing. Opening it while it's still closing, or restarting after an update, waits up to 30 seconds and then opens; if it's still closing by then, it says so. Opening the copy that's running through another path to it (a link, say) brings up its window.
+- The app no longer closes when you delete, archive or clean up many clips in the first minutes after starting the PC.
+- Changing the clips folder keeps your stars, tags, notes and share links: they follow your clips to the new folder, also when only the folder's spelling changed. If starred clips can't be found there, auto-cleanup waits and says so on General > Storage, so they're never removed by mistake.
+- Auto-cleanup and the archive no longer run when the clips folder is your Videos, Pictures, Desktop, Documents, Downloads or user folder, or the top of a drive, where they would also take your own videos and pictures. General says so under the clips folder and on the Storage cards.
+- A clip still being saved when you quit or change settings is finished first (up to 10 seconds), instead of being cut off.
+- A full recording stays playable if the app, the recorder or the PC stops in the middle of it. It's saved as hybrid MP4, which needs OBS 30.2 or later; older copies of OBS keep plain MP4.
+- Settings survive a power cut while they're being saved. If the settings file is ever damaged, your settings come back from its daily backup instead of starting over, the app says so, and the damaged file is kept.
+- A full recording running when Windows shuts down, restarts or signs you out, or when you uninstall the app or a later update's installer closes it, is finished and saved first, as far as Windows gives it time, instead of being lost. Uninstalling also works when your Windows user name has an apostrophe in it.
+- If your clips folder is one where auto-cleanup and the archive stay off (a whole drive kept for clips, say), Use this folder anyway on General > Storage turns them back on for that folder after you Save. Setup also warns when the clips folder you pick is one of those.
+- Starred clips left behind when you changed the clips folder in an earlier version are looked for in your clips too, and auto-cleanup waits for them the same way.
+- When auto-cleanup waits for starred clips it can't find, Go on without it (or them) on General > Storage lets it run again.
+- A clip or recording still being written no longer shows up on the Clips page before it's done.
+- A recorder that stops answering no longer freezes Save clip, the switch and your keys. After a minute it's closed and started again, once any clip it was saving is finished.
+- If instant replay stops and won't turn back on, the recorder is restarted instead of giving up after three tries, and it keeps trying, further apart each time. You're told again if it fails again after coming back.
+- A mic muted with its key stays muted when the recorder restarts (after a settings change, say), and the box at the bottom of the sidebar says Mic muted. Click it to unmute. The mic starts unmuted each time you open the app.
+- A clip saved with the save key that never shows up now gets a Clip not saved popup, the same as with the Save clip button, and a missing clips folder is made again for the next press. Pressing the save key while instant replay is off says Instant replay is paused instead of doing nothing.
+- Auto-cleanup never pops up Windows' "permanently delete?" question in the middle of a game. A clip the Recycle Bin can't take (too big for it, or on a network or removable drive) is left alone and the log says why, and a clip you star while cleanup is running is kept.
+- Share links no longer get lost. A clip renamed or archived while it uploads keeps its link. Moving clips with a link to the Recycle Bin asks whether to delete their links too (on by default), and auto-cleanup deletes the link of a clip it removes. Links of clips deleted some other way are listed on General > Sharing, with Delete all.
+- Clips always show the whole screen or game, scaled to fit with bars at the edges if its shape differs (a 4:3 game on a widescreen monitor, say), instead of being cut off or filling only part of the clip. When you change the resolution, plug in or unplug the monitor you record, or turn HDR on or off, the recorder restarts to match within a minute, but never during a full recording or while a game is in front.
+- Sound is no longer doubled when the headset or mic you picked is also your Windows default and Default playback device or Default microphone is ticked too: it's recorded once, on the tracks of both. Use recommended settings no longer ticks Default playback device when you already record another playback device.
+- A key changed on the Keybinds page takes effect when you Save, like every other setting. Before, it worked at once and then went back to the old key without telling you if you didn't Save.
+- A key another program holds no longer wakes the app every 3 seconds for as long as it runs. It's tried less and less often, up to once a minute, and again soon after you open the window.
+- Downloading a new version can be cancelled with the Cancel button under its progress bar. A download that gets nothing for a minute stops and says so, instead of keeping the popup up for as long as an hour, and a slow one that keeps coming is no longer cut off. The OBS download in setup also stops after a minute without data.
+- Start with Windows shows as off, with "Turned off in Task Manager" next to it, when it was turned off in Task Manager's Startup apps. Ticking it turns it back on there too, so the app really starts with Windows.
+- Opening General no longer shows Unsaved changes by itself when the clip length is longer than fits at your video settings. Save shortens it to what fits, and the recorder keeps only as long as fits either way.
+- A star, tag or note set while the archive or auto-cleanup is moving clips is no longer lost, and a clip moved by both the archive and the window keeps its star, tags and note.
+- The window no longer freezes every few seconds while it looks for starred, tagged or noted clips renamed outside the app, with clips on a NAS or a disk that's asleep. Opening a clip there now says Opening... and waits for the file without freezing the window.
+- A clip given the name of one you deleted or renamed no longer shows that clip's thumbnail or length, and a renamed clip no longer comes back under its old name for a moment.
+- The Clips page stays smooth with a big library or many starred clips: only the clips in view are drawn, their thumbnails are made first, ones scrolled past are skipped, and hover previews no longer wait behind a queue of thumbnails. Thumbnails not seen for a while are let go, so a long scroll doesn't keep adding to the memory used.
+- Stopping a full recording no longer leaves the app showing Recording when the recorder is slow to switch back. A recording that fails to start no longer sends your clips to the Recordings folder.
+- Turning instant replay on when the recorder already has it on (or off when it's off) no longer shows an error, and the app keeps it the way you set it.
+- A clip saved while the recorder was reconnecting now gets its popup and is sorted like any other, instead of being left unnamed in the clips folder, and no longer gets a Clip not saved popup when it did land.
+- Pause instant replay when no game is open no longer pauses a game played in a window. A window as big as the screen bar the taskbar counts as a game, and so does any window you saved a clip or screenshot from in the last hour it was in front. Instant replay you turn off yourself, after it was paused, now stays off when a game opens.
+- A montage of clips with different shapes (a 4:3 or ultrawide clip next to a 16:9 one) keeps each clip's shape, with black bars at the edges, instead of stretching it.
+- Trimming a .mkv or .mov clip works: subtitles and other extra tracks are left out, a clip whose sound or video can't be copied into an MP4 is re-encoded instead (with track 1's sound), and the track volume sliders of a .mkv control the right tracks.
+- The window no longer opens off-screen after the monitor it was on is unplugged while the app is in the tray: it comes up in the middle of the screen you're on, no bigger than that screen. Its saved size also stays right when the screen's scaling changes.
+- Auto-cleanup leaves a clip alone, and the log says why, when it can't be sure the clip's drive has a Recycle Bin (a SUBST or other virtual drive, say, or a folder that's a link or junction to a NAS or another drive), so it never deletes one for good there.
+- Auto-cleanup and the archive also stay off when the clips folder only leads to your Videos or another of your own folders, through a link, a SUBST or mapped drive, a short name or "..", and Use this folder anyway counts for that same folder however it's written.
+- While the clips folder can't be reached (a NAS asleep, a drive unplugged), General > Sharing no longer offers the share links of its clips for deleting as if the clips were gone.
+- Stars, tags, notes and share links also follow a clips folder changed outside the app (a settings file edited or restored from its backup, say), so auto-cleanup never takes a starred clip because of it.
+- Pressing the show / hide key while you set a key on Keybinds no longer freezes the app for 2 seconds and says "The hotkey listener didn't answer."
+- While NVIDIA's overlay is on, Keybinds warns when one of your keys is also one of its shortcuts, and names it, even when the key works in Replay Vault, since NVIDIA reacts to it too.
+
 ## 0.2.1
 
 ### Changed

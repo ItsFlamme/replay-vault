@@ -15,22 +15,6 @@ pub(crate) fn folder_field(ui: &mut egui::Ui, value: &mut String, hint: &str) {
     });
 }
 
-/// "Show tips and explanations" (General), for `note`.
-pub(crate) static NOTES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Whether explanations show ("Show tips and explanations" under General). Grey text that only
-/// explains goes through this or `note`; data, statuses and warnings always show.
-pub(crate) fn tips_on() -> bool {
-    NOTES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The small grey explanation under a setting; left out when tips and explanations are off.
-pub(crate) fn note(ui: &mut egui::Ui, text: impl Into<String>) {
-    if tips_on() {
-        ui.label(RichText::new(text.into()).small().color(pal().muted));
-    }
-}
-
 /// Glyphs in Segoe MDL2 Assets.
 pub(crate) mod icon {
     pub const CLIPS: char = '\u{E8B2}'; // MovieClapper
@@ -58,8 +42,6 @@ pub(crate) mod icon {
     pub const UP: char = '\u{E74A}';
     pub const DOWN: char = '\u{E74B}';
     pub const MUSIC: char = '\u{E8D6}'; // MusicNote
-    pub const TIP: char = '\u{E82F}'; // Lightbulb
-    pub const LEFT: char = '\u{E76B}'; // ChevronLeft
     pub const RIGHT: char = '\u{E76C}'; // ChevronRight
     pub const CHEVRON_DOWN: char = '\u{E70D}'; // ChevronDown
     pub const CHECK: char = '\u{E73E}'; // CheckMark
@@ -123,34 +105,37 @@ pub(crate) fn strong(text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text).family(egui::FontFamily::Name("strong".into())).size(size)
 }
 
-/// A heading or a name: bold in Retro; regular in Minimalist, where size and color carry the
-/// hierarchy and bold is kept for page titles.
+/// A heading or a name, in the look's heading face (Minimalist keeps bold for page titles and lets
+/// size and color carry the hierarchy).
 pub(crate) fn heading(text: impl Into<String>, size: f32) -> RichText {
-    if retro() { strong(text, size) } else { RichText::new(text).size(size) }
+    RichText::new(text).family(look().heading.family()).size(size)
 }
 
-/// Text in the VCR on-screen display font in Retro; small bold text in Minimalist.
+/// A readout, like the setup step counter: the VCR on-screen display font in Retro, small bold
+/// text in Minimalist.
 pub(crate) fn osd(text: impl Into<String>, size: f32) -> RichText {
-    if retro() { RichText::new(text).family(egui::FontFamily::Name("osd".into())).size(size) } else { strong(text, (size * 0.72).round()) }
+    look().readout.text(text, size)
 }
 
-/// A sidebar section heading: the VCR font in capitals in Retro, quiet small text in Minimalist.
+/// A sidebar section heading, as the look draws it.
 pub(crate) fn side_heading(ui: &mut egui::Ui, text: &str) {
+    let h = look().side_heading;
     ui.horizontal(|ui| {
-        ui.add_space(if retro() { 4.0 } else { 12.0 });
-        let label = if retro() { osd(text.to_uppercase(), 17.0) } else { RichText::new(text).size(12.0) };
-        ui.label(label.color(pal().muted));
+        ui.add_space(h.indent);
+        let text = if h.caps { text.to_uppercase() } else { text.to_string() };
+        ui.label(RichText::new(text).family(h.face.family()).size(h.size).color(pal().muted));
     });
 }
 
-/// A big title. Retro: the VCR font with the site's faint orange and teal fringes, like a TV
-/// picture. Minimalist: plain bold text.
+/// A big title in the look's title type. With fringes (and effects on), the site's faint orange
+/// and teal fringes sit behind it, like a TV picture.
 pub(crate) fn retro_title(ui: &mut egui::Ui, text: &str, size: f32) {
-    if !retro() {
-        ui.label(strong(text, (size * 0.72).round()).color(pal().text));
+    let title = look().title;
+    if !look().title_fringe {
+        ui.label(title.text(text, size).color(pal().text));
         return;
     }
-    let galley = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::new(size, egui::FontFamily::Name("osd".into())), pal().text);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), title.face.font(title.size(size)), pal().text);
     let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
     let p = ui.painter();
     if effects() {
@@ -182,15 +167,16 @@ pub(crate) fn brand(ui: &mut egui::Ui) {
 }
 
 /// Keys drawn as keycaps ("Alt+F10" is [Alt] + [F10]), starting at `at`'s x and centered on its y.
-/// Minimalist: flat caps like its buttons, with a thin darker edge under them. Retro: chunky accent
-/// caps on a deep lip, like its main buttons. Returns the width taken.
+/// Minimalist: flat caps like its buttons, with a thin darker edge under them. Retro: a VCR
+/// remote's dark buttons on a lip, in the VCR font. Returns the width taken.
 pub(crate) fn keycaps(painter: &egui::Painter, at: egui::Pos2, keys: &str) -> f32 {
-    let font = egui::FontId::new(13.0, egui::FontFamily::Name("strong".into()));
-    let (fill, edge, ink, radius, depth) = if retro() {
-        (accent(), accent().lerp_to_gamma(Color32::BLACK, 0.45), on_accent(), R_SMALL, 4.0)
-    } else {
-        (pal().raised, pal().edge, pal().text, R_KEY, 2.0)
+    let k = look().keycap;
+    let font = k.face.font(k.size);
+    let (fill, edge, ink) = match k.fill {
+        KeyFill::Raised => (pal().raised, pal().edge, pal().text),
+        KeyFill::Remote => (pal().key, pal().lip, pal().text),
     };
+    let (radius, depth) = (k.radius, k.depth);
     let mut x = at.x;
     for (i, key) in keys.split('+').enumerate() {
         if i > 0 {
@@ -198,7 +184,8 @@ pub(crate) fn keycaps(painter: &egui::Painter, at: egui::Pos2, keys: &str) -> f3
             painter.galley(egui::pos2(x + 5.0, at.y - plus.size().y / 2.0), plus.clone(), pal().muted);
             x += plus.size().x + 10.0;
         }
-        let g = painter.layout_no_wrap(key.trim().to_string(), font.clone(), ink);
+        let key = if k.caps { key.trim().to_uppercase() } else { key.trim().to_string() };
+        let g = painter.layout_no_wrap(key, font.clone(), ink);
         let cap = egui::Rect::from_min_size(egui::pos2(x, at.y - (22.0 + depth) / 2.0), egui::vec2(g.size().x.max(10.0) + 14.0, 22.0));
         painter.rect_filled(cap.translate(egui::vec2(0.0, depth)), radius, edge);
         painter.rect_filled(cap, radius, fill);
@@ -229,7 +216,9 @@ pub(crate) fn primary(ui: &mut egui::Ui, enabled: bool, text: RichText, min: egu
     let under = ui.painter().add(egui::Shape::Noop);
     // No stroke: the theme's control outline and hover outline would ring the painted shape.
     // Disabled: a plain raised slab with grey text, still readable.
-    let text = text.family(egui::FontFamily::Name("strong".into())).color(if enabled { on_accent() } else { pal().muted });
+    let words = text.text().to_string();
+    let text = if look().key_text.is_some() { key_label(&words) } else { text.family(egui::FontFamily::Name("strong".into())) };
+    let text = text.color(if enabled { on_accent() } else { pal().muted });
     let button = egui::Button::new(text).fill(Color32::TRANSPARENT).stroke(egui::Stroke::NONE).min_size(min.max(egui::vec2(110.0, H_BIG)));
     // Not faded further, as egui does to disabled widgets.
     let r = ui
@@ -238,10 +227,13 @@ pub(crate) fn primary(ui: &mut egui::Ui, enabled: bool, text: RichText, min: egu
             ui.add_enabled(enabled, button)
         })
         .inner;
+    key_named(&r, enabled, &words);
     let pressed = r.is_pointer_button_down_on();
-    let radius = R_SMALL;
-    // Minimalist: flat, the fill alone says it's the main action.
-    let (lip, edge) = if retro() { (if pressed { 1.0 } else { 4.0 }, accent().lerp_to_gamma(Color32::BLACK, 0.45)) } else { (0.0, Color32::TRANSPARENT) };
+    // Flat: the fill alone says it's the main action.
+    let (lip, edge, radius) = match look().button {
+        Button::Chunky { lip, radius } => (if pressed { 1.0 } else { lip }, accent().lerp_to_gamma(Color32::BLACK, 0.45), radius),
+        Button::Flat => (0.0, Color32::TRANSPARENT, R_SMALL),
+    };
     let mut shapes = Vec::new();
     if enabled && lip > 0.0 {
         shapes.push(egui::Shape::rect_filled(r.rect.translate(egui::vec2(0.0, lip)), radius, edge));
@@ -260,19 +252,106 @@ pub(crate) fn primary(ui: &mut egui::Ui, enabled: bool, text: RichText, min: egu
 }
 
 /// Adds `button`. In Minimalist it's a flat raised surface with a hairline, not the theme's
-/// stronger control outline (that one is for text boxes and checkboxes). Frameless buttons (in
-/// menus) stay flat.
+/// stronger control outline (that one is for text boxes and checkboxes). Chunky: a remote-control
+/// key on a dark lip. Frameless buttons (in menus) stay flat.
 pub(crate) fn cap(ui: &mut egui::Ui, enabled: bool, button: egui::Button) -> egui::Response {
-    let flat = !retro() && ui.visuals().button_frame;
-    ui.add_enabled(enabled, if flat { button.stroke(egui::Stroke::new(1.0, pal().border)) } else { button })
+    match look().button {
+        Button::Flat if ui.visuals().button_frame => ui.add_enabled(enabled, button.stroke(egui::Stroke::new(1.0, pal().border))),
+        Button::Chunky { lip, radius } if ui.visuals().button_frame => on_lip(ui, lip, radius, pal().lip, |ui| ui.add_enabled(enabled, button.corner_radius(radius))),
+        _ => ui.add_enabled(enabled, button),
+    }
 }
 
-/// A button that opens a menu of `content`, flat with a hairline in Minimalist (see `cap`).
-/// Returns what `content` gave, while the menu is open.
+/// A button that opens a menu of `content`, flat with a hairline in Minimalist, a key on a lip
+/// when chunky (see `cap`). Returns what `content` gave, while the menu is open.
 pub(crate) fn cap_menu<R>(ui: &mut egui::Ui, button: egui::Button, content: impl FnOnce(&mut egui::Ui) -> R) -> (egui::Response, Option<R>) {
-    let flat = !retro() && ui.visuals().button_frame;
-    let (r, inner) = egui::containers::menu::MenuButton::from_button(if flat { button.stroke(egui::Stroke::new(1.0, pal().border)) } else { button.frame_when_inactive(ui.visuals().button_frame) }).ui(ui, content);
+    let framed = ui.visuals().button_frame;
+    let (r, inner) = match look().button {
+        Button::Flat if framed => egui::containers::menu::MenuButton::from_button(button.stroke(egui::Stroke::new(1.0, pal().border))).ui(ui, content),
+        Button::Chunky { lip, radius } if framed => {
+            let mut out = None;
+            let r = on_lip(ui, lip, radius, pal().lip, |ui| {
+                let (r, inner) = egui::containers::menu::MenuButton::from_button(button.corner_radius(radius).frame_when_inactive(true)).ui(ui, content);
+                out = inner;
+                r
+            });
+            (r, out)
+        }
+        _ => egui::containers::menu::MenuButton::from_button(button.frame_when_inactive(framed)).ui(ui, content),
+    };
     (r, inner.map(|i| i.inner))
+}
+
+/// Adds a widget with a key's lip under it: `lip` tall in `color`, sunk to 1 while it's pressed.
+pub(crate) fn on_lip(ui: &mut egui::Ui, lip: f32, radius: u8, color: Color32, add: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
+    let under = ui.painter().add(egui::Shape::Noop);
+    let r = add(ui);
+    let lip = if r.is_pointer_button_down_on() { 1.0 } else { lip };
+    ui.painter().set(under, egui::Shape::rect_filled(r.rect.translate(egui::vec2(0.0, lip)), radius, color));
+    r
+}
+
+/// `text` as the look writes it on keys (VCR capitals in Retro), or plain.
+pub(crate) fn key_label(text: &str) -> RichText {
+    match look().key_text {
+        Some(k) => RichText::new(if k.caps { text.to_uppercase() } else { text.to_string() }).family(k.face.family()).size(k.size).extra_letter_spacing(k.spacing),
+        None => RichText::new(text),
+    }
+}
+
+/// A key whose words `key_label` may have put in capitals keeps its plain name, for screen
+/// readers (and tests that find it by name).
+pub(crate) fn key_named(r: &egui::Response, enabled: bool, text: &str) {
+    if look().key_text.is_some() && !text.is_empty() {
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, text));
+    }
+}
+
+/// A tape label across `rect`: the cream paper, a color `stripe` down its left and `text` in the
+/// marker font (wrapped when it's too long). The text is a real label, so it's read out like any
+/// heading.
+pub(crate) fn tape_label(ui: &mut egui::Ui, rect: egui::Rect, text: &str, stripe: Color32, radius: egui::CornerRadius) {
+    let p = ui.painter();
+    p.rect_filled(rect, radius, PAPER);
+    p.rect_filled(rect.with_max_x(rect.left() + 6.0), egui::CornerRadius { nw: radius.nw, sw: radius.sw, ne: 0, se: 0 }, stripe);
+    let words = egui::Rect::from_min_max(egui::pos2(rect.left() + 16.0, rect.top()), egui::pos2(rect.right() - 8.0, rect.bottom()));
+    let label = egui::Label::new(RichText::new(text).family(Face::Marker.family()).size(17.0).color(INK)).wrap().selectable(false);
+    // In a child of its own, so it takes no room in `ui` (the room is the caller's to give).
+    ui.new_child(egui::UiBuilder::new().max_rect(words).layout(egui::Layout::left_to_right(egui::Align::Center))).add(label);
+}
+
+/// The stripe color of the cards on the page being drawn (the page's own tape), set before it's
+/// drawn; the accent until then.
+pub(crate) fn set_card_tape(ctx: &egui::Context, color: Color32) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::NULL.with("card tape"), color));
+}
+
+fn card_tape(ctx: &egui::Context) -> Color32 {
+    ctx.data(|d| d.get_temp(egui::Id::NULL.with("card tape"))).unwrap_or_else(accent)
+}
+
+/// A dialog's title: bold text, or a tape label across the top of the dialog.
+pub(crate) fn dialog_title(ui: &mut egui::Ui, title: &str) {
+    if look().labels == Labels::Plain {
+        ui.label(RichText::new(title).strong().size(16.0));
+        return;
+    }
+    // Out to the dialog's edges, over its margin.
+    let m = ui.style().spacing.menu_margin;
+    // Tall enough for a title that takes two lines (see `tape_label` for the 24 px of padding).
+    let wrap = ui.available_width() + (m.left + m.right) as f32 - 24.0;
+    let height = ui.painter().layout(title.to_string(), Face::Marker.font(17.0), INK, wrap).size().y + 12.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height.max(30.0)), egui::Sense::hover());
+    let strip = egui::Rect::from_min_max(rect.min - egui::vec2(m.left as f32, m.top as f32), egui::pos2(rect.right() + m.right as f32, rect.bottom()));
+    let r = look().card_radius;
+    tape_label(ui, strip, title, accent(), egui::CornerRadius { nw: r, ne: r, sw: 0, se: 0 });
+    ui.add_space(4.0);
+}
+
+/// A dialog in the look's frame (Minimalist keeps egui's own).
+pub(crate) fn dialog(ctx: &egui::Context, id: &str) -> egui::Modal {
+    let m = egui::Modal::new(egui::Id::unique(id));
+    if look().labels == Labels::Plain { m } else { m.frame(egui::Frame::popup(&ctx.global_style()).corner_radius(look().card_radius)) }
 }
 
 /// A plain button, flat with a hairline in Minimalist (see `cap`).
@@ -292,9 +371,9 @@ pub(crate) struct Confirm<'a> {
 /// once confirmed, Some(false) once cancelled or clicked away, None while it stays up.
 pub(crate) fn modal(ctx: &egui::Context, id: &str, width: f32, title: &str, confirm: Confirm, cancel: &str, body: impl FnOnce(&mut egui::Ui) -> (bool, bool)) -> Option<bool> {
     let mut done = None;
-    let r = egui::Modal::new(egui::Id::unique(id)).show(ctx, |ui| {
+    let r = dialog(ctx, id).show(ctx, |ui| {
         ui.set_max_width(width);
-        ui.label(RichText::new(title).strong().size(16.0));
+        dialog_title(ui, title);
         let (ok, enter) = body(ui);
         ui.horizontal(|ui| {
             let text = RichText::new(confirm.label).strong();
@@ -318,14 +397,29 @@ pub(crate) fn focus_enter(ui: &egui::Ui, edit: &egui::Response) -> bool {
     edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }
 
-/// A titled card on the page.
+/// A titled card on the page. With tape labels, the title is a tape label across its top, striped
+/// in the page's color (see `set_card_tape`).
 pub(crate) fn card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::new().fill(pal().card).corner_radius(R_CARD).inner_margin(16).show(ui, |ui| {
+    let (r, tape) = (look().card_radius, look().labels == Labels::Tape);
+    let margin = if tape { egui::Margin { left: 16, right: 16, top: 0, bottom: 16 } } else { egui::Margin::same(16) };
+    // The label's room, filled in once the card's width is known.
+    let mut label = egui::Rect::NOTHING;
+    let shown = egui::Frame::new().fill(pal().card).corner_radius(r).inner_margin(margin).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(heading(title, if retro() { 15.0 } else { 16.0 }).color(pal().text));
-        ui.add_space(4.0);
+        if tape {
+            label = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover()).0;
+            ui.add_space(6.0);
+        } else {
+            ui.label(heading(title, look().card_title).color(pal().text));
+            ui.add_space(4.0);
+        }
         body(ui);
     });
+    if tape {
+        let card = shown.response.rect;
+        let strip = egui::Rect::from_x_y_ranges(card.x_range(), card.top()..=label.bottom());
+        tape_label(ui, strip, title, card_tape(ui.ctx()), egui::CornerRadius { nw: r, ne: r, sw: 0, se: 0 });
+    }
     ui.add_space(12.0);
 }
 
@@ -343,13 +437,57 @@ pub(crate) fn column<R>(ui: &mut egui::Ui, max: f32, body: impl FnOnce(&mut egui
     .inner
 }
 
-/// Two-column label / control grid.
-pub(crate) fn form(ui: &mut egui::Ui, id: &str, body: impl FnOnce(&mut egui::Ui)) {
-    egui::Grid::new(id).num_columns(2).spacing([14.0, 10.0]).min_col_width(110.0).show(ui, body);
+/// Settings rows share one grid, so they line up within a card and across a page's cards: a label
+/// column this wide, the control, then a slot this wide at the right edge (for Clear / Set or a
+/// small status), with this gap between them.
+const ROW_LABEL: f32 = 170.0;
+const ROW_SLOT: f32 = 72.0;
+const ROW_GAP: f32 = 12.0;
+
+/// A settings row with its slot left empty: `label`, then `control`.
+pub(crate) fn row<R>(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>, control: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    row_slot(ui, label, control, |_| {})
 }
 
-/// A button that selects `value`, filled with the accent when selected: a pill in Retro, a keycap
-/// in Minimalist.
+/// A settings row: `label`, then `control`, then `slot` at the right edge. A row is at least H
+/// tall, with the label and the slot centered beside the control however many lines it takes.
+pub(crate) fn row_slot<R>(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>, control: impl FnOnce(&mut egui::Ui) -> R, slot: impl FnOnce(&mut egui::Ui)) -> R {
+    let gap = ui.spacing().item_spacing.x;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = ROW_GAP;
+        let top = ui.cursor().min.y;
+        // The label is placed once the row's height is known.
+        let left = ui.allocate_space(egui::vec2(ROW_LABEL, H)).1.left();
+        let width = (ui.available_width() - ROW_SLOT - ROW_GAP).max(0.0);
+        let control = ui.allocate_ui_with_layout(egui::vec2(width, H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_size(egui::vec2(width, H));
+            ui.spacing_mut().item_spacing.x = gap;
+            control(ui)
+        });
+        let height = control.response.rect.height();
+        ui.allocate_ui_with_layout(egui::vec2(ROW_SLOT, height), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.set_min_size(egui::vec2(ROW_SLOT, height));
+            ui.spacing_mut().item_spacing.x = gap;
+            slot(ui);
+        });
+        let rect = egui::Rect::from_x_y_ranges(left..=left + ROW_LABEL, top..=ui.min_rect().bottom());
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            ui.add(egui::Label::new(label).truncate());
+        });
+        control.inner
+    })
+    .inner
+}
+
+/// The quiet button in a settings row's slot (Clear, Set): muted text, framed on hover.
+pub(crate) fn slot_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
+    let label = if look().key_text.is_some() { key_label(text) } else { RichText::new(text).size(13.0) };
+    let r = ui.add_enabled(enabled, egui::Button::new(label.color(pal().muted)).frame_when_inactive(false).min_size(egui::vec2(0.0, H)));
+    key_named(&r, enabled, text);
+    r
+}
+
+/// A button that selects `value`, marked when selected (see `chip_with`).
 pub(crate) fn chip<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: impl Into<String>) -> egui::Response {
     let r = chip_look(ui, *current == value, text.into());
     if r.clicked() {
@@ -368,20 +506,45 @@ pub(crate) fn toggle_chip(ui: &mut egui::Ui, on: &mut bool, text: &str) -> egui:
     r
 }
 
-/// Retro: the picked chip filled with the accent. Minimalist: every chip a quiet raised surface,
-/// the picked one ringed in the accent with its text in the accent's text color, so a page full
-/// of choices doesn't turn into a wall of accent.
+/// A checkbox for something this copy may not be allowed to do (see `instance`). Not allowed, it's
+/// greyed and unticked whatever `on` says, as this copy doesn't do it, with `why` under it. `on`
+/// only changes on a click, so just looking at the page never changes a setting.
+pub(crate) fn allowed_checkbox(ui: &mut egui::Ui, allowed: bool, on: &mut bool, text: &str, why: &str) -> egui::Response {
+    let mut shown = allowed && *on;
+    let r = ui.add_enabled(allowed, egui::Checkbox::new(&mut shown, text));
+    if r.changed() {
+        *on = shown;
+    }
+    if !allowed {
+        ui.label(RichText::new(why).small().color(pal().muted));
+    }
+    r
+}
+
 fn chip_look(ui: &mut egui::Ui, selected: bool, text: String) -> egui::Response {
-    let button = if retro() {
-        let (fill, color) = if selected { (accent(), on_accent()) } else { (pal().raised, pal().text) };
-        let b = egui::Button::new(RichText::new(text).color(color)).fill(fill).corner_radius(R_PILL);
-        // Filled with the accent, it needs no outline (the theme's hairline or hover one).
-        if selected { b.stroke(egui::Stroke::NONE) } else { b }
-    } else {
-        let (color, stroke) = if selected { (accent_light(), egui::Stroke::new(1.5, accent())) } else { (pal().text, egui::Stroke::new(1.0, pal().border)) };
-        egui::Button::new(RichText::new(text).color(color)).fill(pal().raised).stroke(stroke).corner_radius(R_SMALL)
+    chip_with(ui, selected, &text, |ink| key_label(&text).color(ink))
+}
+
+/// A chip of `atoms`, made in the chip's text color by `atoms(ink)`; `name` is what it's called
+/// to screen readers. Remote-control keys: on a dark lip, the picked one filled with the accent on
+/// a darker accent lip. Minimalist: every chip a quiet raised surface, the picked one ringed in the
+/// accent with its text in the accent's text color, so a page full of choices doesn't turn into a
+/// wall of accent.
+pub(crate) fn chip_with<'a, A: egui::IntoAtoms<'a>>(ui: &mut egui::Ui, selected: bool, name: &str, atoms: impl FnOnce(Color32) -> A) -> egui::Response {
+    let r = match look().chip {
+        Chip::Key { lip, radius } => {
+            let (fill, ink, edge) = if selected { (accent(), on_accent(), accent().lerp_to_gamma(Color32::BLACK, 0.45)) } else { (pal().key, pal().text, pal().lip) };
+            // The lip is its edge: no outline (the theme's hairline or hover one).
+            let b = egui::Button::new(atoms(ink)).fill(fill).stroke(egui::Stroke::NONE).corner_radius(radius).min_size(egui::vec2(0.0, H));
+            on_lip(ui, lip, radius, edge, |ui| ui.add(b))
+        }
+        Chip::Ring => {
+            let (ink, stroke) = if selected { (accent_light(), egui::Stroke::new(1.5, accent())) } else { (pal().text, egui::Stroke::new(1.0, pal().border)) };
+            ui.add(egui::Button::new(atoms(ink)).fill(pal().raised).stroke(stroke).corner_radius(R_SMALL).min_size(egui::vec2(0.0, H)))
+        }
     };
-    ui.add(button.min_size(egui::vec2(0.0, H)))
+    key_named(&r, true, name);
+    r
 }
 
 /// A clip's tags as small pills, in a row.
@@ -412,5 +575,32 @@ pub(crate) fn toggle(on: &mut bool) -> impl egui::Widget + '_ {
         let off = if pal().light { pal().muted } else { Color32::WHITE };
         ui.painter().circle_filled(egui::pos2(x, rect.center().y), 8.0, off.lerp_to_gamma(on_accent(), t));
         response
+    }
+}
+
+/// For the pages' own tests: one page of a fresh app, drawn in a harness.
+#[cfg(test)]
+pub(crate) mod testing {
+    use crate::*;
+
+    /// A harness drawing `show` for an app with default settings, nothing running and nothing
+    /// looked up (`setup` can change it first). The keys are never checked against other programs
+    /// (that tries them for a moment), and no graphics card overlay is found.
+    pub(crate) fn page(setup: impl FnOnce(&mut App), mut show: impl FnMut(&mut egui::Ui, &mut App) + 'static) -> egui_kittest::Harness<'static, App> {
+        let (cmds, _) = std::sync::mpsc::channel();
+        let (_, events) = std::sync::mpsc::channel();
+        let hw = profile::Hardware { gpu: recorder::Gpu::Nvidia, gpu_name: "Test GPU".into(), vram_mb: 8192, ram_mb: 16384, integrated: false };
+        let mut app = App::base(Config::default(), cmds, events, hw, clips::Previews::new(|| {}));
+        app.saved = app.cfg.clone();
+        (app.nvidia, app.amd) = (Some((false, false)), Some(None));
+        setup(&mut app);
+        // The look follows this test's settings, not whatever the thread drew last.
+        crate::store_look(&app.cfg);
+        let frame = move |ui: &mut egui::Ui, app: &mut App| {
+            app.conflicts_keys = Target::ALL.into_iter().map(|t| app.hotkey_of(t).clone()).collect();
+            app.conflicts_checked = Some(std::time::Instant::now());
+            show(ui, app);
+        };
+        egui_kittest::Harness::builder().with_size([1000.0, 900.0]).with_accessibility_check(false).with_context_setup(apply_theme).build_ui_state(frame, app)
     }
 }

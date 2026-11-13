@@ -3,7 +3,7 @@
 
 use std::path::Path;
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -28,13 +28,27 @@ const THUMB_PX: (usize, usize) = (THUMB_W * 2, THUMB_H * 2);
 const THUMB_WAIT: Duration = Duration::from_millis(400);
 
 static THREAD: OnceLock<u32> = OnceLock::new();
-static TEXT: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+static TEXT: Mutex<(Kind, String, String)> = Mutex::new((Kind::Saved, String::new(), String::new()));
 /// The thumbnail (BGRA, top-down) and length ("0:30") of the clip the popup is for.
 static THUMB: Mutex<Option<(Vec<u8>, String)>> = Mutex::new(None);
 /// The bar's colour (the app's accent), as [r, g, b].
 pub static BAR: Mutex<[u8; 3]> = Mutex::new([132, 72, 240]);
+/// Drawn like a VCR's display (the look's `vcr_popup`): the VCR font, a red light for a save, the
+/// title and length in capitals in the display's green (amber for a warning).
+pub static VCR: AtomicBool = AtomicBool::new(false);
 /// The scaling of the monitor the popup shows on, in DPI (96 is 100%).
 static DPI: AtomicU32 = AtomicU32::new(96);
+
+/// What a popup is about, so a problem doesn't look like a saved clip on the VCR's display.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Kind {
+    /// A clip, screenshot or recording saved (or a recording started): the red light.
+    Saved,
+    /// Something changed and nothing is wrong: no light.
+    Info,
+    /// Something failed or stopped: no light, the title in amber.
+    Warning,
+}
 
 /// Starts the popup's thread. Call once.
 pub fn start() {
@@ -46,13 +60,13 @@ pub fn start() {
 }
 
 /// Shows the popup for a few seconds: `title` (e.g. "Clip saved") over `detail` (e.g. the file name).
-pub fn show(title: &str, detail: String) {
-    post(title, detail, None);
+pub fn show(kind: Kind, title: &str, detail: String) {
+    post(kind, title, detail, None);
 }
 
-fn post(title: &str, detail: String, thumb: Option<(Vec<u8>, String)>) {
+fn post(kind: Kind, title: &str, detail: String, thumb: Option<(Vec<u8>, String)>) {
     *THUMB.lock().unwrap() = thumb;
-    *TEXT.lock().unwrap() = (title.to_string(), detail);
+    *TEXT.lock().unwrap() = (kind, title.to_string(), detail);
     if let Some(&id) = THREAD.get() {
         unsafe {
             let _ = PostThreadMessageW(id, SHOW, WPARAM(0), LPARAM(0));
@@ -60,8 +74,8 @@ fn post(title: &str, detail: String, thumb: Option<(Vec<u8>, String)>) {
     }
 }
 
-/// `show` with the clip's thumbnail and length, if they're decoded within THUMB_WAIT; blocks
-/// the caller that long at most.
+/// `show` for a saved clip, with its thumbnail and length if they're decoded within THUMB_WAIT;
+/// blocks the caller that long at most.
 pub fn show_clip(title: &str, detail: String, clip: &Path) {
     let (tx, rx) = mpsc::channel();
     let clip = clip.to_path_buf();
@@ -70,7 +84,7 @@ pub fn show_clip(title: &str, detail: String, clip: &Path) {
             let _ = tx.send(t);
         }
     });
-    post(title, detail, rx.recv_timeout(THUMB_WAIT).ok());
+    post(Kind::Saved, title, detail, rx.recv_timeout(THUMB_WAIT).ok());
 }
 
 /// A clip's thumbnail for the popup and its length ("0:30"). The keyframe near the end: the
@@ -181,7 +195,7 @@ fn px(v: i32) -> i32 {
 
 /// A monitor's scaling in DPI (96 is 100%). GetDpiForMonitor is looked up in shcore.dll (Windows
 /// 8.1 and later) when first needed; 96 if it can't be.
-fn monitor_dpi(monitor: HMONITOR) -> u32 {
+pub(crate) fn monitor_dpi(monitor: HMONITOR) -> u32 {
     type GetDpiForMonitor = unsafe extern "system" fn(HMONITOR, i32, *mut u32, *mut u32) -> windows::core::HRESULT;
     static FUNC: OnceLock<Option<GetDpiForMonitor>> = OnceLock::new();
     let func = FUNC.get_or_init(|| unsafe {
@@ -219,15 +233,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
+/// The VCR font (bundled, as the app uses), added for this process only the first time it's needed.
+fn vcr_font() {
+    static ADDED: OnceLock<()> = OnceLock::new();
+    ADDED.get_or_init(|| unsafe {
+        let font = crate::ui::theme::VT323;
+        // Windows writes how many fonts it added here.
+        let mut count = 0u32;
+        AddFontMemResourceEx(font.as_ptr().cast(), font.len() as u32, None, std::ptr::addr_of_mut!(count));
+    });
+}
+
 /// Draws the popup: background, accent bar, the thumbnail if any, and the text.
 unsafe fn paint(hdc: HDC) {
     unsafe {
         let (w, h) = (px(W), px(H));
-        fill(hdc, RECT { left: 0, top: 0, right: w, bottom: h }, rgb(24, 24, 28));
+        let vcr = VCR.load(Ordering::Relaxed);
+        fill(hdc, RECT { left: 0, top: 0, right: w, bottom: h }, if vcr { rgb(10, 10, 13) } else { rgb(24, 24, 28) });
         let [r, g, b] = *BAR.lock().unwrap();
         fill(hdc, RECT { left: 0, top: 0, right: px(6), bottom: h }, rgb(r, g, b));
         SetBkMode(hdc, TRANSPARENT);
-        let (title, detail) = TEXT.lock().unwrap().clone();
+        let (kind, title, detail) = TEXT.lock().unwrap().clone();
         let mut left = px(20);
         if let Some((pic, len)) = THUMB.lock().unwrap().as_ref() {
             let (x, tw, th) = (px(THUMB_X), px(THUMB_W as i32), px(THUMB_H as i32));
@@ -244,15 +270,52 @@ unsafe fn paint(hdc: HDC) {
             let bmi = BITMAPINFO { bmiHeader: header, ..Default::default() };
             SetStretchBltMode(hdc, HALFTONE);
             StretchDIBits(hdc, x, top, tw, th, 0, 0, pw, ph, Some(pic.as_ptr().cast()), &bmi, DIB_RGB_COLORS, SRCCOPY);
-            // The length in a dark tag in the thumbnail's corner, like a video player's.
-            let tag = RECT { left: x + tw - px(34), top: top + th - px(17), right: x + tw - px(2), bottom: top + th - px(2) };
-            fill(hdc, tag, rgb(16, 16, 20));
-            text(hdc, len, px(13), FW_SEMIBOLD.0 as i32, rgb(240, 240, 240), RECT { left: tag.left + px(3), ..tag });
+            // The length in a dark tag in the thumbnail's corner, like a video player's (on the
+            // VCR's display it's in the title line instead).
+            if !vcr {
+                let tag = RECT { left: x + tw - px(34), top: top + th - px(17), right: x + tw - px(2), bottom: top + th - px(2) };
+                fill(hdc, tag, rgb(16, 16, 20));
+                text(hdc, len, px(13), FW_SEMIBOLD.0 as i32, rgb(240, 240, 240), RECT { left: tag.left + px(3), ..tag }, w!("Segoe UI"));
+            }
             left = x + tw + px(12);
         }
-        text(hdc, &title, px(20), FW_SEMIBOLD.0 as i32, rgb(240, 240, 240), RECT { left, top: px(9), right: w - px(12), bottom: px(34) });
-        text(hdc, &detail, px(15), FW_NORMAL.0 as i32, rgb(160, 160, 165), RECT { left, top: px(35), right: w - px(12), bottom: px(56) });
+        if vcr {
+            // "● CLIP SAVED  0:15" over "VALORANT 2026-11-09 ...", like the VCR's display. Only a
+            // save gets the red light; a warning's title is amber.
+            vcr_font();
+            let len = THUMB.lock().unwrap().as_ref().map(|(_, len)| format!("  {len}")).unwrap_or_default();
+            let (light, color) = vcr_title(kind);
+            let mut title_left = left;
+            if light {
+                let dot = RECT { left, top: px(15), right: left + px(9), bottom: px(24) };
+                let brush = CreateSolidBrush(rgb(239, 68, 68));
+                let old = SelectObject(hdc, brush.into());
+                let pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+                let _ = Ellipse(hdc, dot.left, dot.top, dot.right, dot.bottom);
+                SelectObject(hdc, pen);
+                SelectObject(hdc, old);
+                let _ = DeleteObject(brush.into());
+                title_left += px(15);
+            }
+            let title = format!("{}{len}", title.to_uppercase());
+            text(hdc, &title, px(26), FW_NORMAL.0 as i32, color, RECT { left: title_left, top: px(6), right: w - px(12), bottom: px(34) }, w!("VT323"));
+            text(hdc, &detail.to_uppercase(), px(20), FW_NORMAL.0 as i32, rgb(200, 196, 212), RECT { left, top: px(34), right: w - px(12), bottom: px(58) }, w!("VT323"));
+            return;
+        }
+        text(hdc, &title, px(20), FW_SEMIBOLD.0 as i32, if kind == Kind::Warning { amber() } else { rgb(240, 240, 240) }, RECT { left, top: px(9), right: w - px(12), bottom: px(34) }, w!("Segoe UI"));
+        text(hdc, &detail, px(15), FW_NORMAL.0 as i32, rgb(160, 160, 165), RECT { left, top: px(35), right: w - px(12), bottom: px(56) }, w!("Segoe UI"));
     }
+}
+
+/// Whether the VCR's display shows the red light for a popup, and its title's color: the light
+/// only for a save, the title in amber for a warning and in the display's green otherwise.
+fn vcr_title(kind: Kind) -> (bool, COLORREF) {
+    (kind == Kind::Saved, if kind == Kind::Warning { amber() } else { rgb(95, 227, 208) })
+}
+
+/// Retro's amber (the dark palette's), for a warning's title.
+fn amber() -> COLORREF {
+    rgb(230, 170, 40)
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
@@ -267,7 +330,7 @@ unsafe fn fill(hdc: HDC, rect: RECT, color: COLORREF) {
     }
 }
 
-unsafe fn text(hdc: HDC, s: &str, height: i32, weight: i32, color: COLORREF, mut rect: RECT) {
+unsafe fn text(hdc: HDC, s: &str, height: i32, weight: i32, color: COLORREF, mut rect: RECT, face: windows::core::PCWSTR) {
     // DrawTextW crashes on an empty string (the window paints once at creation, before any save).
     if s.is_empty() {
         return;
@@ -275,7 +338,7 @@ unsafe fn text(hdc: HDC, s: &str, height: i32, weight: i32, color: COLORREF, mut
     unsafe {
         let font = CreateFontW(
             -height, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, 0, w!("Segoe UI"),
+            CLEARTYPE_QUALITY, 0, face,
         );
         let old = SelectObject(hdc, font.into());
         SetTextColor(hdc, color);
@@ -304,15 +367,35 @@ mod tests {
         assert_eq!(&out[8..16], &out[0..8]);
     }
 
-    /// Paints the popup for a real clip into an off-screen bitmap (no window) and saves it as
-    /// target\screens\toast.png to look at. cargo test toast_screen -- --ignored
+    /// On the VCR's display only a save gets the red light, and a failure isn't in the save's green.
+    #[test]
+    fn vcr_title_marks_only_a_save_and_warns_in_amber() {
+        assert_eq!(vcr_title(Kind::Saved), (true, rgb(95, 227, 208)));
+        assert_eq!(vcr_title(Kind::Info), (false, rgb(95, 227, 208)));
+        assert_eq!(vcr_title(Kind::Warning), (false, amber()));
+    }
+
+    /// Paints the popup for a real clip (from SCREENS_FOLDER, else the clips folder) into an
+    /// off-screen bitmap (no window) and saves it as target\screens\toast.png to look at, and as
+    /// the VCR's display as toast-vcr.png; then a warning on the VCR's display as
+    /// toast-vcr-warning.png. cargo test toast_screen -- --ignored
     #[test]
     #[ignore]
     fn toast_screen() {
-        let folder = crate::config::Config::load().folder;
+        let folder = std::env::var("SCREENS_FOLDER").unwrap_or_else(|_| crate::config::Config::load().folder);
         let clip = crate::clips::list(&folder, 5).into_iter().find(|c| !c.is_picture).expect("a clip");
         *THUMB.lock().unwrap() = Some(thumbnail(&clip.path).unwrap());
-        *TEXT.lock().unwrap() = ("Clip saved".into(), clip.name.clone());
+        *TEXT.lock().unwrap() = (Kind::Saved, "Clip saved".into(), clip.name.clone());
+        for (vcr, name) in [(false, "toast.png"), (true, "toast-vcr.png")] {
+            VCR.store(vcr, Ordering::Relaxed);
+            save_toast(name);
+        }
+        *THUMB.lock().unwrap() = None;
+        *TEXT.lock().unwrap() = (Kind::Warning, "Clip not saved".into(), "Open Replay Vault to see why".into());
+        save_toast("toast-vcr-warning.png");
+    }
+
+    fn save_toast(name: &str) {
         let mut rgba = vec![0u8; (W * H * 4) as usize];
         unsafe {
             let dc = CreateCompatibleDC(None);
@@ -332,7 +415,7 @@ mod tests {
             p.swap(0, 2);
             p[3] = 255;
         });
-        let out = std::env::var("SCREENS_OUT").map(std::path::PathBuf::from).unwrap_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(r"target\screens")).join("toast.png");
+        let out = std::env::var("SCREENS_OUT").map(std::path::PathBuf::from).unwrap_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(r"target\screens")).join(name);
         std::fs::create_dir_all(out.parent().unwrap()).unwrap();
         image::save_buffer(&out, &rgba, W as u32, H as u32, image::ColorType::Rgba8).unwrap();
     }

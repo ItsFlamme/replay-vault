@@ -2,7 +2,8 @@
 //! Replay and hotkeys off (untested), and the
 //! high-performance GPU for the private OBS copy. Each value's original is saved the first time it's changed (tweaks.json in the app's
 //! settings folder), so turning the option off, or Remove, puts it back exactly. All per-user
-//! (HKCU), no admin needed.
+//! (HKCU), no admin needed. A copy that may not change Game Bar, NVIDIA and AMD (see `instance`)
+//! leaves them alone; its GPU preference names its own OBS exe.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -24,6 +25,11 @@ const GPU_KEY: &str = r"Software\Microsoft\DirectX\UserGpuPreferences";
 /// and comparing the registry): both values go from 1 to 0, as 4-byte binary.
 const NVIDIA_KEY: &str = r"Software\NVIDIA Corporation\Global\ShadowPlay\NVSPCAPS";
 const NVIDIA_OVERLAY: [&str; 2] = ["IsShadowPlayEnabled", "IsShadowPlayEnabledUser"];
+
+/// Whether this copy may change Game Bar, NVIDIA's overlay and AMD Software's settings.
+pub fn shared_allowed() -> bool {
+    crate::instance::current().may_change_windows_settings()
+}
 
 /// Tests use a file of their own, never the real record of what to give back.
 fn file() -> std::path::PathBuf {
@@ -129,6 +135,9 @@ fn restore(key: &str, value: &str) -> anyhow::Result<()> {
 /// Game Bar's background capture fights the recorder for the GPU encoder; some players also get
 /// more FPS with it off. `off = false` puts the user's own setting back.
 pub fn set_game_bar_off(off: bool) -> anyhow::Result<()> {
+    if !shared_allowed() {
+        return Ok(());
+    }
     for (key, value) in GAME_BAR {
         if off { change(key, value, json!({ "dword": 0 }))? } else { restore(key, value)? }
     }
@@ -146,6 +155,9 @@ pub fn nvidia_overlay_on() -> bool {
 /// `close_nvidia_overlay`. `off = false` puts the user's own setting back (it shows again once
 /// switched on in the NVIDIA app, or after a restart).
 pub fn set_nvidia_overlay_off(off: bool) -> anyhow::Result<()> {
+    if !shared_allowed() {
+        return Ok(());
+    }
     for value in NVIDIA_OVERLAY {
         if !off {
             restore(NVIDIA_KEY, value)?;
@@ -202,17 +214,21 @@ const NVIDIA_SHORTCUTS: [(&str, &str); 10] = [
 /// switched off, and NVIDIA restarts it if it's closed.
 const NVIDIA_HELPER_EXE: &str = "nvsphelper64.exe";
 
-/// The NVIDIA shortcut that uses `c`, while NVIDIA's helper is running and holding them.
-pub fn nvidia_shortcut_for(c: crate::hotkey::Combo) -> Option<&'static str> {
+/// NVIDIA's shortcuts and their names, while NVIDIA's helper is running and listening for them
+/// (none otherwise). Read once per look, not per key.
+pub fn nvidia_shortcuts() -> Vec<(crate::hotkey::Combo, &'static str)> {
     if !programs().iter().any(|(_, _, name)| name.eq_ignore_ascii_case(NVIDIA_HELPER_EXE)) {
-        return None;
+        return Vec::new();
     }
     let byte = |value: String| read(NVIDIA_KEY, &value)["binary"].get(0).and_then(Value::as_u64);
-    NVIDIA_SHORTCUTS.iter().find_map(|(name, label)| {
-        let count = byte(format!("{name}Count")).unwrap_or(0);
-        let vks: Vec<u64> = (0..count).filter_map(|i| byte(format!("{name}{i}"))).collect();
-        (nvidia_combo(&vks) == Some(c)).then_some(*label)
-    })
+    NVIDIA_SHORTCUTS
+        .iter()
+        .filter_map(|(name, label)| {
+            let count = byte(format!("{name}Count")).unwrap_or(0);
+            let vks: Vec<u64> = (0..count).filter_map(|i| byte(format!("{name}{i}"))).collect();
+            Some((nvidia_combo(&vks)?, *label))
+        })
+        .collect()
 }
 
 /// NVIDIA's key list (modifiers first, e.g. [18, 112] for Alt+F1) as keys, or None if it's empty.
@@ -248,8 +264,11 @@ fn overlay_and_host(list: &[(u32, u32, String)]) -> Vec<u32> {
 /// without a restart: NVIDIA starts the host again by itself, and with the switch off the host no
 /// longer starts the overlay (tried on 2026-11-07, NVIDIA app 11.0). Both run as the user, so no
 /// admin is needed. NVIDIA's capture helper (nvsphelper64) runs under a system service and is left
-/// alone. True if nothing of the overlay is left running.
+/// alone. True if nothing of the overlay is left running. A copy that may not change it closes nothing.
 pub fn close_nvidia_overlay() -> bool {
+    if !shared_allowed() {
+        return !nvidia_overlay_running();
+    }
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
     for id in overlay_and_host(&programs()) {
@@ -274,7 +293,7 @@ pub fn close_nvidia_overlay() -> bool {
 /// hands over to the NVIDIA host, which then runs the overlay as usual, same as the NVIDIA app's
 /// switch does (tried on 2026-11-07, NVIDIA app 11.0).
 pub fn start_nvidia_overlay() {
-    if !nvidia_overlay_on() || nvidia_overlay_running() {
+    if !shared_allowed() || !nvidia_overlay_on() || nvidia_overlay_running() {
         return;
     }
     let exe = Path::new(&std::env::var("ProgramFiles").unwrap_or(r"C:\Program Files".into())).join(r"NVIDIA Corporation\NVIDIA App\CEF").join(NVIDIA_OVERLAY_EXE);
@@ -287,7 +306,7 @@ pub fn start_nvidia_overlay() {
 /// starts the overlay again, so NVIDIA's keys work while the app isn't running. The next start
 /// switches it off again.
 pub fn give_back_nvidia_overlay() {
-    if saved().keys().any(|k| k.starts_with(&format!("{NVIDIA_KEY}|"))) && set_nvidia_overlay_off(false).is_ok() {
+    if shared_allowed() && saved().keys().any(|k| k.starts_with(&format!("{NVIDIA_KEY}|"))) && set_nvidia_overlay_off(false).is_ok() {
         start_nvidia_overlay();
     }
 }
@@ -304,6 +323,9 @@ const AMD_OFF: [(&str, u32); 2] = [("InstantReplayEnabled", 0), ("HotkeysDisable
 /// when it next starts (a PC restart). Unlike NVIDIA's it stays off while the app is closed: put
 /// back only when unticked or on Remove. `off = false` puts the user's own values back.
 pub fn set_amd_off(off: bool) -> anyhow::Result<()> {
+    if !shared_allowed() {
+        return Ok(());
+    }
     for (value, data) in AMD_OFF {
         if off { change(AMD_KEY, value, json!({ "dword": data }))? } else { restore(AMD_KEY, value)? }
     }
@@ -311,15 +333,24 @@ pub fn set_amd_off(off: bool) -> anyhow::Result<()> {
 }
 
 /// Windows' per-app graphics preference (Settings > Display > Graphics) for `exe`: "High
-/// performance" on a PC with two GPUs, so the recorder encodes on the one the game runs on.
+/// performance" on a PC with two GPUs, so the recorder encodes on the one the game runs on. Kept
+/// per exe path, so another copy's (its own private OBS) is its own.
 pub fn set_gpu_high(exe: &Path, on: bool) -> anyhow::Result<()> {
     let value = exe.display().to_string();
     if on { change(GPU_KEY, &value, json!({ "string": "GpuPreference=2;" })) } else { restore(GPU_KEY, &value) }
 }
 
-/// Puts back every value this app ever changed (for Remove).
+/// Whether Remove puts back the value saved as `id` ("key|value"). A copy that may not change the
+/// shared settings only puts back GPU preferences: originals of Game Bar, NVIDIA or AMD saved there
+/// earlier would undo what another copy set.
+fn restorable(id: &str, shared_allowed: bool) -> bool {
+    shared_allowed || id.split_once('|').is_some_and(|(key, _)| key == GPU_KEY)
+}
+
+/// Puts back every value this app ever changed (for Remove), or only its GPU preferences (`restorable`).
 pub fn restore_all() -> anyhow::Result<()> {
-    for id in saved().keys() {
+    let shared = shared_allowed();
+    for id in saved().keys().filter(|id| restorable(id, shared)) {
         if let Some((key, value)) = id.split_once('|') {
             restore(key, value)?;
         }
@@ -341,6 +372,19 @@ mod tests {
         assert_eq!(nvidia_combo(&[192]), Some(Combo { vk: 192, ctrl: false, alt: false, shift: false, win: false }));
         assert_eq!(nvidia_combo(&[]), None);
         assert_eq!(nvidia_combo(&[18]), None);
+    }
+
+    #[test]
+    fn without_shared_settings_only_gpu_preferences_go_back() {
+        let gpu = format!(r"{GPU_KEY}|G:\Portable\Replay Vault\replay-vault-data\obs\obs-studio\bin\64bit\obs64.exe");
+        let others = [format!("{}|{}", GAME_BAR[0].0, GAME_BAR[0].1), format!("{NVIDIA_KEY}|{}", NVIDIA_OVERLAY[0]), format!("{AMD_KEY}|InstantReplayEnabled")];
+        assert!(restorable(&gpu, true) && restorable(&gpu, false));
+        for id in &others {
+            assert!(restorable(id, true), "{id}");
+            assert!(!restorable(id, false), "{id}");
+        }
+        // Only that key itself, not one that starts the same.
+        assert!(!restorable(&format!("{GPU_KEY}Other|x"), false));
     }
 
     /// Round trip on a value of our own under HKCU, never a real Windows setting.

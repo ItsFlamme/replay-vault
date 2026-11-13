@@ -32,30 +32,39 @@ fn file() -> PathBuf {
     if cfg!(test) { std::env::temp_dir().join("instant-replay-uploads-test.json") } else { crate::config::dir().join("uploads.json") }
 }
 
-/// Clip path -> its share link.
+/// Clip path -> its share link, with the paths in one form (clips::tidy_keys). The same clip
+/// written two ways keeps the first link.
 pub fn links() -> BTreeMap<String, Link> {
-    crate::clips::load_json(&file())
+    crate::clips::tidy_keys(crate::clips::load_json(&file()), |_, _| {})
 }
 
 /// Changes the saved links. One change at a time, so two uploads ending together both stay; the
 /// file is replaced whole (clips::save_json), so a crash never loses the delete keys.
 fn edit_links(change: impl FnOnce(&mut BTreeMap<String, Link>)) {
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK.lock();
-    let mut map = links();
-    change(&mut map);
-    crate::clips::save_json(&file(), &map);
+    rekeyed(|map| {
+        change(map);
+        true
+    });
 }
 
 /// Keeps a clip's share link after it's renamed.
 pub fn renamed(old: &Path, new: &Path) {
-    if links().contains_key(&old.display().to_string()) {
+    if crate::clips::stored_key(links().keys(), old).is_some() {
         edit_links(|map| {
-            if let Some(l) = map.remove(&old.display().to_string()) {
-                map.insert(new.display().to_string(), l);
+            if let Some(l) = crate::clips::stored_key(map.keys(), old).cloned().and_then(|k| map.remove(&k)) {
+                map.insert(crate::clips::tidy(&new.display().to_string()), l);
             }
         });
     }
+}
+
+/// Changes the saved links with `change`, saving them if it says something changed (`edit_links`
+/// always does; the clips folder moving may not). False if the save failed.
+pub fn rekeyed(change: impl FnOnce(&mut BTreeMap<String, Link>) -> bool) -> bool {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock();
+    let mut map = links();
+    !change(&mut map) || crate::clips::save_json(&file(), &map)
 }
 
 /// Counts bytes as they're read, for the progress bar.
@@ -163,24 +172,128 @@ fn send(path: &Path, job: &Arc<Job>) -> anyhow::Result<String> {
 
 /// Takes the uploaded copy of `path` off kappa.lol and forgets the link.
 pub fn delete(path: &Path, repaint: impl Fn() + Send + 'static) -> Arc<Job> {
-    let id = path.display().to_string();
-    spawn(repaint, move |_| {
-        let Some(l) = links().get(&id).cloned() else { return Ok("deleted".into()) };
-        let mut resp = agent()
-            .get(format!("{API}delete"))
-            .query("key", &l.key)
-            .header("User-Agent", "replay-vault")
-            .call()
-            .map_err(|e| anyhow::anyhow!("Couldn't reach kappa.lol. The link still works. ({e})"))?;
-        let status = resp.status().as_u16();
-        let text = resp.body_mut().read_to_string().unwrap_or_default();
-        let ok = serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| v["success"] == true);
-        // 404: already gone from the host.
-        anyhow::ensure!(ok || status == 404, "Couldn't delete it, try again in a bit. The link still works.");
-        edit_links(|map| _ = map.remove(&id));
-        crate::log::write(&format!("Deleted the share link for {id}"));
-        Ok("deleted".into())
-    })
+    let path = path.to_path_buf();
+    spawn(repaint, move |_| delete_link(&path).map(|_| "deleted".into()))
+}
+
+/// Takes the uploaded copy of `path` off kappa.lol and forgets the link, right here (a network
+/// call: only on the user's say, or for a clip auto-cleanup recycled). False if it had none.
+pub fn delete_link(path: &Path) -> anyhow::Result<bool> {
+    let map = links();
+    let Some((id, l)) = crate::clips::stored_key(map.keys(), path).and_then(|k| Some((k.clone(), map.get(k)?.clone()))) else { return Ok(false) };
+    let mut resp = agent()
+        .get(format!("{API}delete"))
+        .query("key", &l.key)
+        .header("User-Agent", "replay-vault")
+        .call()
+        .map_err(|e| anyhow::anyhow!("Couldn't reach kappa.lol. The link still works. ({e})"))?;
+    let status = resp.status().as_u16();
+    let text = resp.body_mut().read_to_string().unwrap_or_default();
+    let ok = serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| v["success"] == true);
+    // 404: already gone from the host.
+    anyhow::ensure!(ok || status == 404, "Couldn't delete it, try again in a bit. The link still works.");
+    // Found again by its delete key: the clip may have been renamed or archived meanwhile.
+    let mut at = None;
+    rekeyed(|map| {
+        at = forget_link(map, &l.key);
+        at.is_some()
+    });
+    crate::log::write(&format!("Deleted the share link for {}", at.as_deref().unwrap_or(&id)));
+    Ok(true)
+}
+
+/// Forgets the link with delete key `key` in `map`, wherever it's filed now. The path it was
+/// filed under, if it was there.
+fn forget_link(map: &mut BTreeMap<String, Link>, key: &str) -> Option<String> {
+    let at = map.iter().find(|(_, l)| l.key == key).map(|(k, _)| k.clone())?;
+    map.remove(&at);
+    Some(at)
+}
+
+/// Deletes the share links of the clips in `paths`, one after another, skipping any clip that's
+/// there (its link still shows on it) or that can't be told to be gone (`clip_gone`). Done is
+/// Ok(how many were deleted), or the last error, or what was kept, with how many went.
+pub fn delete_gone(paths: Vec<PathBuf>, repaint: impl Fn() + Send + 'static) -> Arc<Job> {
+    spawn(repaint, move |_| delete_each(&paths, clip_gone, delete_link))
+}
+
+/// Whether the clip at `path` is gone: Some(true) when its file isn't there yet the folder it was
+/// in can be read, Some(false) when it's there, None when that folder can't be read (a drive
+/// unplugged, a NAS asleep), so there's no telling. A link deleted can't be put back.
+fn clip_gone(path: &Path) -> Option<bool> {
+    match path.try_exists() {
+        Ok(true) => Some(false),
+        Ok(false) if path.parent().is_some_and(|d| std::fs::read_dir(d).is_ok()) => Some(true),
+        _ => None,
+    }
+}
+
+/// `delete_gone`'s work: deletes the link of each clip in `paths` that `gone` says is gone with
+/// `delete` (true if it had one). The ones `gone` can't judge are kept and said.
+fn delete_each(paths: &[PathBuf], gone: impl Fn(&Path) -> Option<bool>, mut delete: impl FnMut(&Path) -> anyhow::Result<bool>) -> anyhow::Result<String> {
+    let (mut deleted, mut kept, mut failed) = (0, 0, None);
+    for p in paths {
+        match gone(p) {
+            Some(true) => match delete(p) {
+                Ok(had) => deleted += usize::from(had),
+                Err(e) => failed = Some(e),
+            },
+            Some(false) => {}
+            None => kept += 1,
+        }
+    }
+    let kept = match kept {
+        0 => String::new(),
+        n => format!(" Kept {}: couldn't reach the folder their clips are in, so they may still be there.", crate::count(n, "share link")),
+    };
+    match failed {
+        Some(e) if deleted > 0 => anyhow::bail!("Deleted {deleted} share links; the rest didn't go. {e:#}{kept}"),
+        Some(e) => anyhow::bail!("{e:#}{kept}"),
+        None if kept.is_empty() => Ok(deleted.to_string()),
+        None if deleted == 0 => anyhow::bail!("{}", kept.trim_start()),
+        None => anyhow::bail!("Deleted {}.{kept}", crate::count(deleted, "share link")),
+    }
+}
+
+/// Files the share link `link` (just uploaded) under `path`, where its clip is now: it was
+/// filed under where the clip was when the upload began, and the clip may have been renamed or
+/// archived meanwhile.
+pub fn keep_at(link: &str, path: &Path) {
+    rekeyed(|map| rekey_link(map, link, path));
+}
+
+/// `keep_at` on `map`. True if it moved.
+fn rekey_link(map: &mut BTreeMap<String, Link>, link: &str, path: &Path) -> bool {
+    let to = crate::clips::tidy(&path.display().to_string());
+    let Some(from) = map.iter().find(|(_, l)| l.link == link).map(|(k, _)| k.clone()) else { return false };
+    if from == to {
+        return false;
+    }
+    if let Some(l) = map.remove(&from) {
+        map.insert(to, l);
+    }
+    true
+}
+
+/// The keys in `links` whose clip is gone: filed in the clips folder `folder` (or a game folder
+/// in it), yet not among `listed`, the clips just read from it. Only where the folder the clip
+/// was in was read in full (`read`, see `clips::list_read`): with the clips folder unreachable (a
+/// NAS asleep, a drive unplugged) its clips aren't gone. That's also what `delete_gone` asks
+/// (`clip_gone`), so a whole game folder deleted isn't judged either. Links filed anywhere else
+/// (the archive, an earlier clips folder) aren't judged: that would mean looking at the disk.
+pub fn orphans<'a>(links: impl Iterator<Item = &'a String>, folder: &str, listed: &[crate::clips::Clip], read: &[PathBuf]) -> Vec<String> {
+    if folder.trim().is_empty() || read.is_empty() {
+        return Vec::new();
+    }
+    let inside: Vec<&String> = links.filter(|k| crate::clips::relative(k, folder).is_some_and(|r| r.components().count() <= 2)).collect();
+    if inside.is_empty() {
+        return Vec::new();
+    }
+    let fold = |p: &Path| crate::clips::fold(&p.display().to_string());
+    let have: std::collections::HashSet<String> = listed.iter().map(|c| fold(&c.path)).collect();
+    let read: std::collections::HashSet<String> = read.iter().map(|d| fold(d)).collect();
+    let judged = |k: &String| Path::new(k).parent().is_some_and(|p| read.contains(&fold(p)));
+    inside.into_iter().filter(|k| judged(k) && !have.contains(&crate::clips::fold(k))).cloned().collect()
 }
 
 /// Discord's upload limit for webhooks on servers without boosts.
@@ -251,6 +364,96 @@ mod tests {
         ] {
             assert!(!is_discord_webhook(bad), "{bad}");
         }
+    }
+
+    /// An upload that ends after its clip was renamed or archived files its link where the clip
+    /// is now; one already there stays.
+    #[test]
+    fn a_finished_upload_follows_its_clip() {
+        let link = |s: &str| Link { link: s.into(), key: "k".into() };
+        let mut map = BTreeMap::from([(r"D:\Clips\a.mp4".to_string(), link("https://kappa.lol/a")), (r"D:\Clips\b.mp4".to_string(), link("https://kappa.lol/b"))]);
+        assert!(rekey_link(&mut map, "https://kappa.lol/a", Path::new("E:/Archive/VALORANT/a.mp4")));
+        assert_eq!(map.keys().collect::<Vec<_>>(), [r"D:\Clips\b.mp4", r"E:\Archive\VALORANT\a.mp4"]);
+        assert!(!rekey_link(&mut map, "https://kappa.lol/b", Path::new(r"D:\Clips\b.mp4")), "already there");
+        assert!(!rekey_link(&mut map, "https://kappa.lol/gone", Path::new(r"D:\Clips\c.mp4")));
+        assert_eq!(map.len(), 2);
+    }
+
+    /// A deleted link is forgotten where it's filed now, even if its clip was renamed while the
+    /// host was deleting it; the others stay.
+    #[test]
+    fn a_deleted_link_is_forgotten_after_a_rename() {
+        let link = |s: &str, k: &str| Link { link: s.into(), key: k.into() };
+        let mut map = BTreeMap::from([(r"D:\Clips\a.mp4".to_string(), link("https://kappa.lol/a", "ka")), (r"D:\Clips\b.mp4".to_string(), link("https://kappa.lol/b", "kb"))]);
+        // Renamed between reading the links and the host's answer.
+        assert!(rekey_link(&mut map, "https://kappa.lol/a", Path::new(r"D:\Clips\Ace.mp4")));
+        assert_eq!(forget_link(&mut map, "ka").as_deref(), Some(r"D:\Clips\Ace.mp4"));
+        assert_eq!(map.keys().collect::<Vec<_>>(), [r"D:\Clips\b.mp4"]);
+        assert_eq!(forget_link(&mut map, "ka"), None, "already forgotten");
+        assert_eq!(map.len(), 1);
+    }
+
+    /// A clip is gone only when its file is missing from a folder that can be read; a missing
+    /// folder (a drive unplugged, a NAS asleep) can't tell.
+    #[test]
+    fn a_clip_is_gone_only_from_a_folder_that_reads() {
+        let dir = std::env::temp_dir().join(format!("instant-replay-clip-gone-{}", crate::config::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("here.mp4"), b"x").unwrap();
+        assert_eq!(clip_gone(&dir.join("gone.mp4")), Some(true));
+        assert_eq!(clip_gone(&dir.join("here.mp4")), Some(false));
+        assert_eq!(clip_gone(&dir.join("missing").join("a.mp4")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(clip_gone(&dir.join("here.mp4")), None, "the whole folder went");
+    }
+
+    /// Only links of clips surely gone are deleted; the ones that can't be told are kept and said.
+    #[test]
+    fn delete_gone_keeps_links_it_cant_judge() {
+        let paths: Vec<PathBuf> = ["gone1", "gone2", "here", "unknown"].map(PathBuf::from).into();
+        let gone = |p: &Path| match p.to_str().unwrap() {
+            "here" => Some(false),
+            "unknown" => None,
+            _ => Some(true),
+        };
+        let mut asked = Vec::new();
+        let err = delete_each(&paths, gone, |p| {
+            asked.push(p.to_path_buf());
+            Ok(true)
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(asked, [PathBuf::from("gone1"), PathBuf::from("gone2")]);
+        assert_eq!(err, "Deleted 2 share links. Kept 1 share link: couldn't reach the folder their clips are in, so they may still be there.");
+        let err = delete_each(&paths[2..], gone, |_| unreachable!()).unwrap_err().to_string();
+        assert!(err.starts_with("Kept 1 share link:"), "{err}");
+        assert_eq!(delete_each(&paths[..3], gone, |_| Ok(true)).unwrap(), "2");
+        let err = delete_each(&paths, gone, |_| anyhow::bail!("Couldn't delete it.")).unwrap_err().to_string();
+        assert_eq!(err, "Couldn't delete it. Kept 1 share link: couldn't reach the folder their clips are in, so they may still be there.");
+    }
+
+    /// Links of clips missing from the clips folder's list are orphans; links filed elsewhere,
+    /// deeper than a game folder, or in a folder that wasn't read in full, aren't judged.
+    #[test]
+    fn orphaned_links() {
+        let clip = |p: &str| crate::clips::Clip { path: p.into(), name: String::new(), bytes: 1, modified: std::time::SystemTime::now(), group: None, is_picture: false };
+        let listed = [clip(r"D:\Clips\here.mp4"), clip(r"D:\Clips\VALORANT\Ace.mp4")];
+        let keys = [
+            r"D:\Clips\here.mp4",
+            r"d:\clips\valorant\ace.mp4",
+            r"D:\Clips\gone.mp4",
+            r"D:\Clips\VALORANT\gone.mp4",
+            r"D:\Clips\a\b\deep.mp4",
+            r"E:\Archive\VALORANT\x.mp4",
+            r"D:\Clips2\x.mp4",
+        ]
+        .map(String::from);
+        let read = [PathBuf::from(r"D:\Clips"), PathBuf::from(r"D:\Clips\VALORANT")];
+        assert_eq!(orphans(keys.iter(), "D:/Clips/", &listed, &read), [r"D:\Clips\gone.mp4", r"D:\Clips\VALORANT\gone.mp4"]);
+        assert!(orphans(keys[5..].iter(), r"D:\Clips", &[], &read).is_empty());
+        assert!(orphans(keys.iter(), "", &[], &read).is_empty(), "no clips folder set");
+        assert!(orphans(keys.iter(), r"D:\Clips", &[], &[]).is_empty(), "the clips folder couldn't be read");
+        assert_eq!(orphans(keys.iter(), r"D:\Clips", &listed, &read[..1]), [r"D:\Clips\gone.mp4"], "VALORANT couldn't be read");
     }
 
     /// A one-request server on 127.0.0.1 that answers `status`; hands back what it was sent.

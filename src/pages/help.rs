@@ -114,8 +114,18 @@ impl App {
                 ui.label(RichText::new(v.unwrap_or("-".into())).color(pal().text));
             };
             egui::Grid::new("perf").num_columns(5).spacing([28.0, 8.0]).min_col_width(70.0).show(ui, |ui| {
-                for head in ["", "CPU", "GPU", "Video encoder", "Memory"] {
-                    ui.label(RichText::new(head).small().color(pal().muted));
+                // What each number means, on hover.
+                for (head, about) in [
+                    ("", ""),
+                    ("CPU", "A share of all cores, live while this page is open"),
+                    ("GPU", "Live while this page is open"),
+                    ("Video encoder", "A separate chip on the GPU that games don't use, live while this page is open"),
+                    ("Memory", "The recorder's memory is mostly the last few minutes it keeps for the next clip"),
+                ] {
+                    let r = ui.label(RichText::new(head).small().color(pal().muted));
+                    if !about.is_empty() {
+                        r.on_hover_text(about);
+                    }
                 }
                 ui.end_row();
                 for (name, u) in [("Recorder (OBS)", rec), ("Replay Vault", app)] {
@@ -127,15 +137,9 @@ impl App {
                     ui.end_row();
                 }
             });
-            ui.add_space(2.0);
-            let note = if rec.is_none() {
-                "The recorder isn't running."
-            } else {
-                "Live, while this page is open. CPU is a share of all cores. The video encoder is a separate chip on the GPU that games don't use. The recorder's memory is mostly the last few minutes it keeps for the next clip."
-            };
-            // The explanation is a tip; "isn't running" is a status and always shows.
-            if rec.is_none() || tips_on() {
-                ui.label(RichText::new(note).small().color(pal().muted));
+            if rec.is_none() {
+                ui.add_space(2.0);
+                ui.label(RichText::new("The recorder isn't running.").small().color(pal().muted));
             }
         });
 

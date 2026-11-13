@@ -39,6 +39,11 @@ pub struct Config {
     /// drive or a NAS.
     pub archive_days: u32,
     pub archive_folder: String,
+    /// The clips folder the user said auto-cleanup and the archive may work in although it's one
+    /// they'd stay out of (`clips::shared_folder`: Videos, a drive's top), with Use this folder
+    /// anyway on General > Storage. Only that folder (compared without case or slashes): another
+    /// one asks again. Empty: none.
+    pub shared_folder_ok: String,
     /// "desktop" (whole monitor, never touches the game) or "game" (OBS game capture, which
     /// hooks into the game; some anti-cheats object).
     pub capture: String,
@@ -94,10 +99,6 @@ pub struct Config {
     pub discord_webhook: String,
     /// Where the private OBS copy is installed; empty means %LOCALAPPDATA%\replay-vault (obs-instant-replay on older installs).
     pub obs_dir: String,
-    /// Pages whose first-run tip was closed. A view choice: kept without Save.
-    pub tips_seen: Vec<String>,
-    /// Tip boxes and the grey explanations under settings (General).
-    pub show_tips: bool,
     /// Look for a newer Replay Vault on GitHub once a day (General).
     pub check_updates: bool,
     /// Stop instant replay after 2 minutes with no game in front, and start it again when one
@@ -180,6 +181,7 @@ impl Default for Config {
             keep_days: 0,
             archive_days: 0,
             archive_folder: String::new(),
+            shared_folder_ok: String::new(),
             capture: "desktop".into(),
             save_sound: false,
             game_bar_off: false,
@@ -205,8 +207,6 @@ impl Default for Config {
             setup_done: false,
             discord_webhook: String::new(),
             obs_dir: String::new(),
-            tips_seen: Vec::new(),
-            show_tips: true,
             check_updates: true,
             pause_without_game: false,
             accent: 0,
@@ -220,7 +220,7 @@ impl Default for Config {
 }
 
 /// A copy's own data folder: `replay-vault-data` next to the exe, if there is one (a folder you
-/// make yourself, for a self-contained test copy). Settings, logs, the private OBS and new clips then stay in
+/// make yourself, for a self-contained copy). Settings, logs, the private OBS and new clips then stay in
 /// it, so deleting the copy's folder takes everything it made. Installs never have one.
 pub fn local_data() -> Option<PathBuf> {
     static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -259,27 +259,142 @@ pub fn exists() -> bool {
     path().exists()
 }
 
-impl Config {
-    pub fn load() -> Self {
-        let raw = fs::read_to_string(path()).ok();
-        // Editors may add a UTF-8 byte-order mark when the file is hand-edited.
-        let parsed = raw.as_deref().map(|s| serde_json::from_str::<Self>(s.trim_start_matches('\u{feff}')));
-        // A damaged file would be overwritten with defaults; keep it for recovery first.
-        if let Some(Err(e)) = &parsed {
-            let _ = fs::copy(path(), dir().join("config.bad.json"));
-            crate::log::write(&format!("Settings file was damaged ({e}); kept a copy as config.bad.json and started from defaults."));
+/// What the window tells the user at start about the settings file, once: set by the first load
+/// that found it damaged (see `Config::load`).
+static NOTICE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Why the settings aren't the ones last saved, if the settings file was damaged at start. Given once.
+pub fn take_notice() -> Option<String> {
+    NOTICE.lock().ok()?.take()
+}
+
+/// At most this many copies of damaged settings files are kept (config.bad.json, then
+/// config.bad.2.json and on); past that the oldest makes way for the newest.
+const BAD_COPIES: usize = 5;
+
+/// Where the settings came from (see `read_settings`).
+#[derive(Debug, PartialEq)]
+enum Source {
+    /// The settings file.
+    File,
+    /// There is none yet: a new user.
+    New,
+    /// The file was damaged; its backup.
+    Backup,
+    /// The file and its backup were damaged (or there was no backup): the defaults.
+    Defaults,
+}
+
+/// The settings in `file` and their text; None if there's no file; Err (why) if it can't be read
+/// or isn't settings.
+fn read_file(file: &std::path::Path) -> Result<Option<(Config, String)>, String> {
+    let mut tries = 0;
+    let raw = loop {
+        match fs::read_to_string(file) {
+            Ok(s) => break s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // Antivirus or a backup tool can hold it for a moment.
+            Err(_) if tries < 5 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Err(e.to_string()),
         }
-        let ok = matches!(parsed, Some(Ok(_)));
-        let mut cfg: Self = parsed.and_then(Result::ok).unwrap_or_default();
+    };
+    // Editors may add a UTF-8 byte-order mark when the file is hand-edited.
+    serde_json::from_str(raw.trim_start_matches('\u{feff}')).map(|c| Some((c, raw))).map_err(|e| e.to_string())
+}
+
+/// Copies a damaged settings file to the first of config.bad.json, config.bad.2.json and on (up
+/// to `BAD_COPIES`) that isn't there yet, next to it, so it can be looked at or put back by hand.
+/// With all taken, the oldest copy (by its file time) makes way, so the newest damage is always
+/// kept. Returns where, or None if it couldn't be.
+fn keep_bad(file: &std::path::Path) -> Option<PathBuf> {
+    let mut from = fs::File::open(file).ok()?;
+    let slots: Vec<PathBuf> = (1..=BAD_COPIES).map(|n| bad_copy(file, n)).collect();
+    let to = match slots.iter().find(|p| !p.exists()) {
+        Some(free) => free.clone(),
+        None => {
+            let oldest = slots.iter().min_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())?;
+            fs::remove_file(oldest).ok()?;
+            oldest.clone()
+        }
+    };
+    let mut out = fs::File::options().write(true).create_new(true).open(&to).ok()?;
+    std::io::copy(&mut from, &mut out).ok().map(|_| to)
+}
+
+/// The `n`th copy of a damaged settings file next to `file`: config.bad.json, then config.bad.2.json and on.
+fn bad_copy(file: &std::path::Path, n: usize) -> PathBuf {
+    file.with_file_name(if n == 1 { "config.bad.json".into() } else { format!("config.bad.{n}.json") })
+}
+
+/// The settings in `file` (with their text) and where they came from. A damaged file is never
+/// just replaced by the defaults: its backup (config.json.bak, which `save` keeps once a day) is
+/// used instead, or the defaults only when that's damaged or missing too. `first` is asked only
+/// when the file is damaged: if it says so, a copy of the file and of a damaged backup is kept
+/// (`keep_bad`) and it's logged.
+fn read_settings(file: &std::path::Path, first: impl FnOnce() -> bool) -> (Option<(Config, String)>, Source) {
+    let why = match read_file(file) {
+        Ok(Some(found)) => return (Some(found), Source::File),
+        Ok(None) => return (None, Source::New),
+        Err(why) => why,
+    };
+    let bak = file.with_extension("json.bak");
+    let backup = read_file(&bak);
+    if first() {
+        let mut kept: Vec<String> = keep_bad(file).into_iter().chain(backup.is_err().then(|| keep_bad(&bak)).flatten()).filter_map(|p| Some(p.file_name()?.to_string_lossy().into_owned())).collect();
+        if kept.is_empty() {
+            kept.push("no copy (it couldn't be written)".into());
+        }
+        let from = match &backup {
+            Ok(Some(_)) => "the backup (config.json.bak)".to_string(),
+            Ok(None) => "defaults, as there's no backup".to_string(),
+            Err(e) => format!("defaults, as the backup was damaged too ({e})"),
+        };
+        crate::log::write(&format!("Settings file was damaged ({why}); kept {}, and started from {from}.", kept.join(" and ")));
+    }
+    match backup {
+        Ok(Some(found)) => (Some(found), Source::Backup),
+        _ => (None, Source::Defaults),
+    }
+}
+
+impl Config {
+    /// The saved settings (see `read_settings` for a damaged file). Many threads load them; only the
+    /// first load in a run that finds the file damaged keeps copies, logs and leaves the notice.
+    /// The window saves what it loaded right away, so loads after that find the file whole.
+    pub fn load() -> Self {
+        static DAMAGE_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let mut first = false;
+        let (cfg, source) = Self::load_from(&path(), || {
+            first = !DAMAGE_SEEN.swap(true, std::sync::atomic::Ordering::Relaxed);
+            first
+        });
+        let notice = match source {
+            Source::Backup => "The settings file was damaged, so your settings were put back from its backup. Changes from the last day may be missing.",
+            Source::Defaults => "The settings file was damaged, so settings start from their defaults. A copy of it is in the settings folder.",
+            Source::File | Source::New => return cfg,
+        };
+        if first && let Ok(mut n) = NOTICE.lock() {
+            *n = Some(notice.into());
+        }
+        cfg
+    }
+
+    /// `load` from `file`; `first` as for `read_settings`.
+    fn load_from(file: &std::path::Path, first: impl FnOnce() -> bool) -> (Self, Source) {
+        let (found, source) = read_settings(file, first);
+        let (mut cfg, raw) = found.map_or((Self::default(), None), |(c, raw)| (c, Some(raw)));
         // Settings saved before the wizard existed were set up by hand already.
-        if ok && raw.is_some_and(|s| !s.contains("setup_done")) {
+        if raw.is_some_and(|s| !s.contains("setup_done")) {
             cfg.setup_done = true;
         }
         if cfg.recorder_password.is_empty() {
             cfg.recorder_password = random_hex();
         }
         cfg.sanitize();
-        cfg
+        (cfg, source)
     }
 
     /// Puts every value back into the range the app can use, so a hand-edited or imported file
@@ -344,13 +459,13 @@ impl Config {
         self.follow_mouse && self.capture != "game"
     }
 
-    /// Written to a new file that then replaces the old one, so a crash mid-save, or another
-    /// thread reading it (autopause, the tray), never sees half a file.
+    /// Written to a new file, flushed, that then replaces the old one, so a crash or power cut
+    /// mid-save, or another thread reading it (autopause, the tray), never sees half a file. A
+    /// readable old file is kept as config.json.bak once a day (`clips::write_json`), for `load`
+    /// to fall back on.
     pub fn save(&self) -> anyhow::Result<()> {
         fs::create_dir_all(dir())?;
-        let tmp = path().with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
-        fs::rename(&tmp, path())?;
+        crate::clips::write_json(&path(), self)?;
         Ok(())
     }
 }
@@ -410,6 +525,8 @@ pub const FIELDS: &[(&str, Option<Page>, bool, Kind)] = {
         ("keep_days", Some(General), false, Setting),
         ("archive_days", Some(General), false, Setting),
         ("archive_folder", Some(General), false, Setting),
+        // Confirmed on this PC for its folder; a settings file can't confirm one.
+        ("shared_folder_ok", None, false, Local),
         ("capture", Some(Video), true, Setting),
         ("save_sound", Some(General), false, Setting),
         ("game_bar_off", Some(General), false, Setting),
@@ -435,8 +552,6 @@ pub const FIELDS: &[(&str, Option<Page>, bool, Kind)] = {
         ("setup_done", None, true, Local),
         ("discord_webhook", None, false, Secret),
         ("obs_dir", None, true, Local),
-        ("tips_seen", None, false, View),
-        ("show_tips", Some(General), false, Setting),
         ("check_updates", Some(General), false, Setting),
         ("pause_without_game", Some(General), false, Setting),
         ("accent", Some(General), false, Setting),
@@ -635,6 +750,19 @@ mod tests {
         assert!(!c.reduce_effects, "and Retro's effects on");
     }
 
+    /// Settings from before 0.2.2 still have the tips keys: they load, their other values are
+    /// kept, and the keys are gone once written back. The same file imports too.
+    #[test]
+    fn old_tips_keys_load() {
+        let raw = r#"{"buffer_secs": 90, "show_tips": false, "tips_seen": ["Clips", "General"], "theme": "retro"}"#;
+        let c: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!((c.buffer_secs, c.theme.as_str()), (90, "retro"));
+        let back = serde_json::to_string(&c).unwrap();
+        assert!(!back.contains("show_tips") && !back.contains("tips_seen"));
+        let file: Export = serde_json::from_str(&format!(r#"{{"config": {raw}}}"#)).unwrap();
+        assert_eq!(file.applied_to(&Config::default()).buffer_secs, 90);
+    }
+
     /// Settings from before 6 tracks (3 track names, 3 ticks per device) load into 6, the new ones
     /// empty and off, and write back as 6; a list too long is cut.
     #[test]
@@ -786,16 +914,89 @@ mod tests {
             "clip_sort": 3, "theme": "retro", "devices": {"out:spk": {"name": "Speakers", "tracks": [true, true, false, false, false, false]}}},
             "favorites": ["D:\\Clips\\a.mp4"], "tags": {"D:\\Clips\\a.mp4": ["Aces"]}}"#;
         let file: Export = serde_json::from_str(raw).unwrap();
-        let here = Config { recorder_password: "pw".into(), clip_sort: 1, obs_dir: String::new(), tips_seen: vec![], ..Config::default() };
+        let here = Config { recorder_password: "pw".into(), clip_sort: 1, obs_dir: String::new(), ..Config::default() };
         let c = file.applied_to(&here);
         assert_eq!((c.folder.as_str(), c.buffer_secs, c.theme.as_str()), (r"D:\Clips", 120, "retro"));
         assert_eq!(c.devices["out:spk"].tracks, [true, true, false, false, false, false]);
         assert_eq!((c.clip_sort, c.recorder_password.as_str(), c.obs_dir.as_str(), c.setup_done), (1, "pw", "", false));
-        assert!(c.more_open.is_empty() && c.tips_seen.is_empty());
+        assert!(c.more_open.is_empty());
         let restored = restore_page(&c, &Config::default(), Page::General);
         assert_eq!((restored.folder.as_str(), restored.buffer_secs, restored.theme.as_str()), (r"D:\Clips", Config::default().buffer_secs, "minimalist"));
         assert_eq!(restored.devices.len(), 1, "other pages stay");
         assert!(file.notes.is_empty(), "files from before notes load without them");
+    }
+
+    /// A damaged settings file comes back from its backup, and a copy of it is kept without
+    /// writing over an older copy; with the backup damaged too it's the defaults, and neither file
+    /// is changed or removed. Only the first damage in a run keeps copies. Temp files only.
+    #[test]
+    fn damaged_settings_come_back_from_the_backup() {
+        let dir = std::env::temp_dir().join(format!("replay-vault-config-{}", random_hex()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.json");
+        let bak = dir.join("config.json.bak");
+        // Saved twice: the second save keeps the first as the backup.
+        crate::clips::write_json(&file, &Config { buffer_secs: 90, setup_done: true, ..Config::default() }).unwrap();
+        crate::clips::write_json(&file, &Config { buffer_secs: 120, setup_done: true, ..Config::default() }).unwrap();
+        assert_eq!(read_file(&bak).unwrap().unwrap().0.buffer_secs, 90);
+        let (cfg, source) = Config::load_from(&file, || panic!("not damaged"));
+        assert_eq!((cfg.buffer_secs, source), (120, Source::File));
+        assert_eq!(Config::load_from(&dir.join("none.json"), || panic!("not damaged")).1, Source::New);
+
+        // Cut off by a power cut: the backup's settings, and a copy of the damaged file.
+        fs::write(&file, b"").unwrap();
+        let (cfg, source) = Config::load_from(&file, || true);
+        assert_eq!((cfg.buffer_secs, cfg.setup_done, source), (90, true, Source::Backup));
+        assert_eq!(fs::read(dir.join("config.bad.json")).unwrap(), b"");
+        // Damaged again later: a second copy, the first left as it was.
+        fs::write(&file, b"{\"buffer_secs\": 1").unwrap();
+        assert_eq!(Config::load_from(&file, || true).1, Source::Backup);
+        assert_eq!(fs::read(dir.join("config.bad.json")).unwrap(), b"");
+        assert_eq!(fs::read(dir.join("config.bad.2.json")).unwrap(), b"{\"buffer_secs\": 1");
+        // Not the first time in this run: no more copies.
+        assert_eq!(Config::load_from(&file, || false).1, Source::Backup);
+        assert!(!dir.join("config.bad.3.json").exists());
+
+        // The backup damaged too: defaults, and both files stay; the backup gets a copy too.
+        fs::write(&bak, b"[1, 2").unwrap();
+        let (cfg, source) = Config::load_from(&file, || true);
+        assert_eq!((cfg.buffer_secs, cfg.setup_done, source), (Config::default().buffer_secs, false, Source::Defaults));
+        assert_eq!(fs::read(&file).unwrap(), b"{\"buffer_secs\": 1");
+        assert_eq!(fs::read(&bak).unwrap(), b"[1, 2");
+        assert_eq!(fs::read(dir.join("config.bad.4.json")).unwrap(), b"[1, 2");
+        // Saving over the damaged file keeps the backup as it was: only a readable file becomes one.
+        crate::clips::write_json(&file, &Config::default()).unwrap();
+        assert_eq!(fs::read(&bak).unwrap(), b"[1, 2");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With all BAD_COPIES copies taken, a newly damaged file is still kept: the oldest copy by
+    /// file time makes way, and there are never more than BAD_COPIES. Temp files only.
+    #[test]
+    fn newest_damaged_file_is_kept() {
+        let dir = std::env::temp_dir().join(format!("replay-vault-config-{}", random_hex()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.json");
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for n in 1..=BAD_COPIES {
+            fs::write(&file, format!("bad {n}")).unwrap();
+            assert_eq!(keep_bad(&file).unwrap(), bad_copy(&file, n));
+            // Copies made a moment apart can share a file time; set them a minute apart, oldest first.
+            fs::File::options().write(true).open(bad_copy(&file, n)).unwrap().set_modified(base + std::time::Duration::from_secs(60 * n as u64)).unwrap();
+        }
+        let copies = || fs::read_dir(&dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("config.bad")).count();
+        fs::write(&file, "bad 6").unwrap();
+        assert_eq!(keep_bad(&file).unwrap(), bad_copy(&file, 1));
+        assert_eq!(fs::read_to_string(bad_copy(&file, 1)).unwrap(), "bad 6");
+        assert_eq!(fs::read_to_string(bad_copy(&file, 2)).unwrap(), "bad 2");
+        assert_eq!(copies(), BAD_COPIES);
+        // The copy just made is now the newest, so the next goes over the second.
+        fs::write(&file, "bad 7").unwrap();
+        assert_eq!(keep_bad(&file).unwrap(), bad_copy(&file, 2));
+        assert_eq!(fs::read_to_string(bad_copy(&file, 2)).unwrap(), "bad 7");
+        assert_eq!(fs::read_to_string(bad_copy(&file, 1)).unwrap(), "bad 6");
+        assert_eq!(copies(), BAD_COPIES);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Notes go into a settings file and come back out of it.

@@ -1,10 +1,11 @@
 //! Hotkeys without a keyboard hook. The save-clip hotkey lives inside the hidden OBS (see
-//! `Combo::obs_binding`), so this app never watches the keyboard for it. The app's other keys use
+//! `Combo::obs_binding`), which saves on it; this app only notices it (`watch_save`) to check the
+//! clip lands, and never registers it, so OBS keeps it. The app's other keys use
 //! Windows' standard RegisterHotKey. A key another program already registered (NVIDIA's overlay
 //! keeps Alt+F1, Alt+F9, Alt+R and more even when their features aren't used) is read from the
 //! key state instead, every 15 ms, the way OBS reads its own keys; both programs react to it. Not
-//! a hook, and nothing touches the game. (Raw Input was tried first: on Vlad's PC Windows sent it
-//! nothing for NVIDIA's keys.) The polling only runs while such a shared key exists.
+//! a hook, and nothing touches the game. (Raw Input was tried first: on one PC Windows sent it
+//! nothing for NVIDIA's keys.) The polling only runs while such a key (or the save key) is set.
 //! Setting a combo by pressing it reads the key state only while the user is doing that in our
 //! own window.
 
@@ -34,7 +35,7 @@ pub struct Combo {
 type Callback = Box<dyn Fn() + Send>;
 type Reply = Sender<Result<Held, String>>;
 
-/// The app's own hotkeys (the full save key belongs to OBS).
+/// The app's own hotkeys, and the save key, which belongs to OBS and is only noticed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Overlay = 1,
@@ -42,6 +43,8 @@ pub enum Action {
     Screenshot = 5,
     Replay = 6,
     Mic = 7,
+    /// OBS's save key was pressed (OBS saves on it by itself). Not in `ALL`: never registered.
+    SaveKey = 8,
 }
 
 impl Action {
@@ -112,7 +115,8 @@ pub fn install(on_press: impl Fn(Action) + Send + 'static) -> anyhow::Result<()>
                     shared.keys.retain(|(a, _)| *a != action);
                     let result = match combo {
                         None => Ok(Held::Ours),
-                        Some(c) if RegisterHotKey(None, id, c.modifiers() | MOD_NOREPEAT, c.vk as u32).is_ok() => Ok(Held::Ours),
+                        // Registering the save key would take it from OBS: it's only read.
+                        Some(c) if action != Action::SaveKey && RegisterHotKey(None, id, c.modifiers() | MOD_NOREPEAT, c.vk as u32).is_ok() => Ok(Held::Ours),
                         Some(c) => {
                             shared.keys.push((action, c));
                             // Still held from setting it (or anything else): that press doesn't count.
@@ -201,6 +205,12 @@ pub fn set_combo(action: Action, combo: Option<Combo>) -> Result<Held, String> {
     *REQUEST.lock().unwrap() = Some((action, combo, tx));
     unsafe { PostThreadMessageW(id, WM_APP, WPARAM(0), LPARAM(0)) }.map_err(|e| e.to_string())?;
     rx.recv_timeout(Duration::from_secs(2)).map_err(|_| "The hotkey listener didn't answer.".to_string())?
+}
+
+/// Notices OBS's save key `combo` (or stops, for None) by reading the key state like a shared key,
+/// so the app can check the clip lands; OBS still gets the key and does the saving.
+pub fn watch_save(combo: Option<Combo>) -> Result<(), String> {
+    set_combo(Action::SaveKey, combo).map(|_| ())
 }
 
 /// Waits for the next combo the user presses and calls `on_done`. Escape cancels.
@@ -461,6 +471,29 @@ mod tests {
         assert_eq!(on_key(&mut down, &keys, 0x78, false, (true, true, false, false)), None, "Ctrl+Alt+F9 is another key");
         on_key(&mut down, &keys, 0x78, true, alt);
         assert_eq!(on_key(&mut down, &keys, 0x78, false, alt), Some(Action::Record), "pressed again");
+    }
+
+    /// The save key is noticed from the key state: once per press with exactly its modifiers,
+    /// beside a shared app key, and not for another key or the same key with other modifiers.
+    #[test]
+    fn save_key_noticed_once_per_press() {
+        use super::{Action, on_key};
+        let save = Combo::parse("Alt+F10").unwrap();
+        let keys = [(Action::Record, Combo::parse("Alt+F9").unwrap()), (Action::SaveKey, save)];
+        let (none, alt, ctrl_alt) = ((false, false, false, false), (false, true, false, false), (true, true, false, false));
+        let mut down = Vec::new();
+        assert_eq!(on_key(&mut down, &keys, 0x79, false, none), None, "F10 alone");
+        on_key(&mut down, &keys, 0x79, true, none);
+        assert_eq!(on_key(&mut down, &keys, 0x79, false, ctrl_alt), None, "Ctrl+Alt+F10 isn't the save key");
+        on_key(&mut down, &keys, 0x79, true, ctrl_alt);
+        assert_eq!(on_key(&mut down, &keys, 0x79, false, alt), Some(Action::SaveKey));
+        for _ in 0..5 {
+            assert_eq!(on_key(&mut down, &keys, 0x79, false, alt), None, "held down, repeating");
+        }
+        assert_eq!(on_key(&mut down, &keys, 0x78, false, alt), Some(Action::Record), "the other key still works while it's held");
+        on_key(&mut down, &keys, 0x79, true, alt);
+        assert_eq!(on_key(&mut down, &keys, 0x79, false, alt), Some(Action::SaveKey), "pressed again");
+        assert!(!Action::ALL.contains(&Action::SaveKey), "never registered or freed with the app's keys");
     }
 
     #[test]

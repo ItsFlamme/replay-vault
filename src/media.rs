@@ -85,16 +85,16 @@ pub struct Probe {
 
 /// Length, frame rate, size and audio tracks of `path`, from one reader.
 pub fn probe(path: &Path) -> anyhow::Result<Probe> {
-    probe_reader(&reader(path, false)?)
+    probe_reader(&reader(path, false)?, path)
 }
 
-fn probe_reader(r: &IMFSourceReader) -> anyhow::Result<Probe> {
+fn probe_reader(r: &IMFSourceReader, path: &Path) -> anyhow::Result<Probe> {
     let video = unsafe { r.GetNativeMediaType(FIRST_VIDEO, 0)? };
     let size = unsafe { video.GetUINT64(&MF_MT_FRAME_SIZE)? };
     // Pairs packed as high and low 32 bits; the frame rate as numerator over denominator.
     let rate = unsafe { video.GetUINT64(&MF_MT_FRAME_RATE) }.ok();
     let fps = rate.map(|p| ((p >> 32) as f64, (p & 0xffff_ffff) as f64)).filter(|&(num, den)| num > 0.0 && den > 0.0).map(|(num, den)| num / den);
-    Ok(Probe { secs: length(r)?, fps, size: ((size >> 32) as u32, size as u32), tracks: audio_streams(r).len() })
+    Ok(Probe { secs: length(r)?, fps, size: ((size >> 32) as u32, size as u32), tracks: audio_streams(r, path).len() })
 }
 
 /// The frame at `at` seconds, scaled down to at most `max_w` pixels wide.
@@ -196,37 +196,58 @@ fn decode_frame(path: &Path, at: f64, max_w: usize, exact: bool) -> anyhow::Resu
     }
 }
 
-/// Copies `start`..`end` seconds of `src` into a new file `dst`, all streams, without re-encoding.
+/// Copies `start`..`end` seconds of `src` into a new file `dst`, the video and every audio track,
+/// without re-encoding. When they can't go into an MP4 as they are (a .mkv's Opus sound, say),
+/// it re-encodes instead, with track 1's sound, the way the clip plays.
 pub fn trim(src: &Path, dst: &Path, start: f64, end: f64) -> anyhow::Result<()> {
+    anyhow::ensure!(end.min(duration(src)?) > start, "the end has to come after the start");
+    let Err(err) = copy_cut(src, dst, start, end) else { return Ok(()) };
+    let _ = std::fs::remove_file(dst);
+    if !cfg!(test) {
+        crate::log::write(&format!("Couldn't copy the cut as it is ({err:#}); re-encoding it."));
+    }
+    reencode_cut(src, dst, start, end)
+}
+
+/// trim by re-encoding: the video at the clip's own size and frame rate, track 1's sound.
+fn reencode_cut(src: &Path, dst: &Path, start: f64, end: f64) -> anyhow::Result<()> {
+    let p = probe(src)?;
+    gpu_else_cpu(dst, same_size(p.size, p.fps), &|| false, |e| remix(src, dst, start, end, &track1(p.tracks), Some(e), &|_| {}))
+}
+
+/// trim without re-encoding.
+fn copy_cut(src: &Path, dst: &Path, start: f64, end: f64) -> anyhow::Result<()> {
     let r = reader(src, false)?;
     let end = end.min(length(&r)?);
     anyhow::ensure!(end > start, "the end has to come after the start");
     unsafe {
         let w = sink_writer(dst, false)?;
 
-        // Every stream (video plus each audio track) goes across as it is.
-        let mut types = Vec::new(); // by reader stream
+        // The first video and each audio track go across as they are. Other streams (a .mkv's
+        // subtitles, a .mov's timecode) are left out: an MP4 can't take them.
+        let mut types = Vec::new(); // by reader stream, None for one left out
         let mut video = None;
         while let Ok(t) = r.GetNativeMediaType(types.len() as u32, 0) {
             let i = types.len() as u32;
-            r.SetStreamSelection(i, true)?;
-            r.SetCurrentMediaType(i, None, &t)?;
-            if t.GetGUID(&MF_MT_MAJOR_TYPE)? == MFMediaType_Video && video.is_none() {
+            let major = t.GetGUID(&MF_MT_MAJOR_TYPE)?;
+            let keep = major == MFMediaType_Audio || (major == MFMediaType_Video && video.is_none());
+            r.SetStreamSelection(i, keep)?;
+            if keep {
+                r.SetCurrentMediaType(i, None, &t)?;
+            }
+            if major == MFMediaType_Video && video.is_none() {
                 video = Some(i as usize);
             }
-            types.push(t);
+            types.push(keep.then_some(t));
         }
         let video = video.ok_or_else(|| anyhow::anyhow!("the clip has no video"))?;
         // The writer stores tracks in the order they're added: video, then audio in track order.
-        let audio = audio_streams(&r);
-        let order: Vec<usize> = (0..types.len())
-            .filter(|i| !audio.contains(&(*i as u32)))
-            .chain(audio.iter().map(|&i| i as usize))
-            .collect();
+        let order = std::iter::once(video).chain(audio_streams(&r, src).into_iter().map(|i| i as usize));
         let mut out = vec![0u32; types.len()]; // writer stream, by reader stream
         for i in order {
-            out[i] = w.AddStream(&types[i])?;
-            w.SetInputMediaType(out[i], &types[i], None)?;
+            let Some(t) = &types[i] else { continue };
+            out[i] = w.AddStream(t)?;
+            w.SetInputMediaType(out[i], t, None)?;
         }
         w.BeginWriting()?;
         // After a seek, video starts at the keyframe before `start` but audio only at `start`, so
@@ -246,7 +267,7 @@ pub fn trim(src: &Path, dst: &Path, start: f64, end: f64) -> anyhow::Result<()> 
         seek(&r, (keyframe + 10_000) as f64 / SEC)?;
 
         let end_t = (end * SEC) as i64;
-        let mut done = vec![false; out.len()];
+        let mut done: Vec<bool> = types.iter().map(Option::is_none).collect();
         // The clip starts at the first video frame (a keyframe, `first`); audio waits for it.
         // Times are shifted by that frame's decode time (`base`), see timeline_start.
         let mut first: Option<i64> = None;
@@ -257,7 +278,7 @@ pub fn trim(src: &Path, dst: &Path, start: f64, end: f64) -> anyhow::Result<()> 
             let (mut idx, mut flags, mut ts, mut sample) = (0u32, 0u32, 0i64, None);
             r.ReadSample(ANY_STREAM, 0, Some(&mut idx), Some(&mut flags), Some(&mut ts), Some(&mut sample))?;
             let s = idx as usize;
-            if s >= out.len() {
+            if types.get(s).is_none_or(Option::is_none) {
                 continue;
             }
             if let Some(sample) = sample {
@@ -320,21 +341,30 @@ unsafe fn timeline_start(s: &IMFSample, ts: i64) -> i64 {
 
 /// Number of audio tracks in the clip.
 pub fn audio_tracks(path: &Path) -> anyhow::Result<usize> {
-    Ok(audio_streams(&reader(path, false)?).len())
+    Ok(audio_streams(&reader(path, false)?, path).len())
 }
 
-/// Reader stream numbers of the audio tracks, in track order (Track 1 first). Windows' MP4 reader
-/// lists a file's tracks last to first (an OBS clip stored as video, A1, A2, A3 reads back as
-/// A3, A2, A1, video), which put the full mix under the Track 3 slider. Its own stream IDs follow
-/// that same order, so they can't fix it; the list is just turned around.
-fn audio_streams(r: &IMFSourceReader) -> Vec<u32> {
+/// Reader stream numbers of `path`'s audio tracks, in track order (Track 1 first). Windows' MP4
+/// reader lists a file's tracks last to first (an OBS clip stored as video, A1, A2, A3 reads back
+/// as A3, A2, A1, video), which put the full mix under the Track 3 slider. Its own stream IDs
+/// follow that same order, so they can't fix it; the list is just turned around. Other readers
+/// (.mkv) list them in order.
+fn audio_streams(r: &IMFSourceReader, path: &Path) -> Vec<u32> {
     let mut audio: Vec<u32> = (0..)
         .map_while(|i| unsafe { r.GetNativeMediaType(i, 0) }.ok().map(|t| (i, t)))
         .filter(|(_, t)| unsafe { t.GetGUID(&MF_MT_MAJOR_TYPE) }.is_ok_and(|g| g == MFMediaType_Audio))
         .map(|(i, _)| i)
         .collect();
-    audio.reverse();
+    if mp4_reader(path) {
+        audio.reverse();
+    }
     audio
+}
+
+/// Whether Windows reads `path` with its MP4 reader (.mp4, .mov and the like), the one that
+/// lists tracks last to first.
+fn mp4_reader(path: &Path) -> bool {
+    path.extension().and_then(|x| x.to_str()).is_some_and(|x| ["mp4", "m4v", "mov", "3gp"].iter().any(|v| x.eq_ignore_ascii_case(v)))
 }
 
 /// Like trim, but the audio tracks are decoded, each scaled by `gains[i]` (by audio track order),
@@ -372,7 +402,7 @@ pub(crate) fn centering(left: f64, right: f64) -> Option<Center> {
 /// over the sound, shared by centering and the saved-clip check.
 pub fn channel_energy(path: &Path) -> anyhow::Result<Vec<(f64, f64)>> {
     let r = reader(path, false)?;
-    let audio = audio_streams(&r);
+    let audio = audio_streams(&r, path);
     let mut out = vec![(0.0, 0.0); audio.len()];
     let mut done = vec![false; audio.len()];
     unsafe {
@@ -427,7 +457,7 @@ pub fn center(src: &Path, dst: &Path, energy: &[(f64, f64)], mic_mixed: u8) -> a
 /// (re-encoded); the video and the other tracks are copied as they are.
 fn rewrite(src: &Path, dst: &Path, fixes: &[Option<Center>]) -> anyhow::Result<()> {
     let r = reader(src, false)?;
-    let audio = audio_streams(&r);
+    let audio = audio_streams(&r, src);
     unsafe {
         let w = sink_writer(dst, false)?;
         // Video first, then the sound tracks in track order, as trim writes them.
@@ -526,6 +556,8 @@ fn remix(src: &Path, dst: &Path, start: f64, end: f64, gains: &[f32], enc: Optio
         Copy(u32),
         Mix(usize),
         Encode(u32),
+        /// Not video or audio (subtitles, a timecode track), or a second video: left out.
+        Skip,
     }
     let r = reader(src, false)?;
     let end = end.min(length(&r)?);
@@ -534,15 +566,18 @@ fn remix(src: &Path, dst: &Path, start: f64, end: f64, gains: &[f32], enc: Optio
         let w = sink_writer(dst, enc.is_some_and(|e| e.hw))?;
 
         // Video goes across as it is; each audio track is decoded for the mix.
-        let audio = audio_streams(&r); // in track order, which is what gains[] follows
+        let audio = audio_streams(&r, src); // in track order, which is what gains[] follows
         let mut outs = Vec::new(); // by reader stream
         let mut video = None;
         let tracks = audio.len();
         let mut i = 0;
         while let Ok(t) = r.GetNativeMediaType(i, 0) {
-            r.SetStreamSelection(i, true)?;
             let major = t.GetGUID(&MF_MT_MAJOR_TYPE)?;
-            if let Some(track) = audio.iter().position(|&a| a == i) {
+            let keep = major == MFMediaType_Audio || (major == MFMediaType_Video && video.is_none());
+            r.SetStreamSelection(i, keep)?;
+            if !keep {
+                outs.push(Out::Skip);
+            } else if let Some(track) = audio.iter().position(|&a| a == i) {
                 decode_to_float(&r, i)?;
                 outs.push(Out::Mix(track));
             } else if let Some(e) = enc.filter(|_| major == MFMediaType_Video && video.is_none()) {
@@ -612,14 +647,14 @@ fn remix(src: &Path, dst: &Path, start: f64, end: f64, gains: &[f32], enc: Optio
                     progress(((ts - first) as f64 / (end_t - first).max(1) as f64) as f32);
                     Ok(true)
                 }
-                Out::Copy(_) | Out::Encode(_) => Ok(false),
+                Out::Copy(_) | Out::Encode(_) | Out::Skip => Ok(false),
                 Out::Mix(t) => {
                     m.push(t, ts, &floats(s)?);
                     Ok(false)
                 }
             }
         };
-        let mut done = vec![false; outs.len()];
+        let mut done: Vec<bool> = outs.iter().map(|o| matches!(o, Out::Skip)).collect();
         let mut ended = vec![false; tracks];
         let mut mixer: Option<Mixer> = None;
         let mut first = 0;
@@ -860,7 +895,7 @@ const FADE: f64 = 0.4;
 const MUSIC_FADE: f64 = 2.0;
 
 /// The parts one after another as one MP4 at `dst`, re-encoded at the first part's size and frame
-/// rate (other sizes are stretched to it). With `fades`, each part fades in from black and out to
+/// rate (other shapes fit inside it with black bars). With `fades`, each part fades in from black and out to
 /// black, its sound too. `music` plays under it all and fades out at the end. On the graphics card
 /// when it can, else in software. `progress` hears how far along it is (0 to 1); once `stop`
 /// says so it gives up with an error.
@@ -868,13 +903,18 @@ pub fn join(parts: &[Part], dst: &Path, fades: bool, music: Option<&Music>, prog
     anyhow::ensure!(!parts.is_empty(), "nothing to join");
     // Each part's clip looked at once, for its length (and the first for the size and rate).
     let probes = parts.iter().map(|p| probe(&p.path)).collect::<anyhow::Result<Vec<_>>>()?;
-    let (w, h) = (probes[0].size.0 & !1, probes[0].size.1 & !1);
-    let fps = probes[0].fps.unwrap_or(60.0);
-    // About 0.12 bits a pixel, as plan uses.
-    let kbps = (w as f64 * h as f64 * fps * 0.12 / 1000.0) as u32;
-    let e = Encode { crop: [0, 0, w, h], width: w, height: h, fps, kbps, hw: true };
+    let e = same_size(probes[0].size, probes[0].fps);
     let lens: Vec<f64> = probes.iter().map(|p| p.secs).collect();
     gpu_else_cpu(dst, e, stop, |e| join_as(parts, &lens, dst, e, fades, music, progress, stop))
+}
+
+/// Encoding a clip of `size` at `fps` (60 if it doesn't say) as it is, the whole picture.
+fn same_size(size: (u32, u32), fps: Option<f64>) -> Encode {
+    let (w, h) = (size.0 & !1, size.1 & !1);
+    let fps = fps.unwrap_or(60.0);
+    // About 0.12 bits a pixel, as plan uses.
+    let kbps = (w as f64 * h as f64 * fps * 0.12 / 1000.0) as u32;
+    Encode { crop: [0, 0, w, h], width: w, height: h, fps, kbps, hw: true }
 }
 
 /// Runs `encode` with `e` on the graphics card, and if that fails (and `stop` doesn't say to
@@ -979,7 +1019,7 @@ fn join_as(parts: &[Part], lens: &[f64], dst: &Path, e: &Encode, fades: bool, mu
         let mut done = 0u64; // output video frames written
         for (p, &n) in parts.iter().zip(&frames) {
             let r = reader(&p.path, false)?;
-            let audio = audio_streams(&r);
+            let audio = audio_streams(&r, &p.path);
             anyhow::ensure!(p.gains.len() == audio.len(), "got {} track volumes for {} audio tracks", p.gains.len(), audio.len());
             let video = (0..)
                 .map_while(|i| r.GetNativeMediaType(i, 0).ok().map(|t| (i, t)))
@@ -987,8 +1027,11 @@ fn join_as(parts: &[Part], lens: &[f64], dst: &Path, e: &Encode, fades: bool, mu
                 .map(|(i, _)| i)
                 .ok_or_else(|| anyhow::anyhow!("the clip has no video"))?;
             let size = r.GetNativeMediaType(video, 0)?.GetUINT64(&MF_MT_FRAME_SIZE)?;
-            // This part's whole picture, scaled to the output's size.
-            let pe = Encode { crop: [0, 0, (size >> 32) as u32 & !1, size as u32 & !1], ..*e };
+            let (sw, sh) = ((size >> 32) as u32 & !1, size as u32 & !1);
+            // This part's whole picture, scaled to fit the output keeping its shape (black bars
+            // fill the rest, see letterbox).
+            let place = fit_rect(sw, sh, e.width, e.height);
+            let pe = Encode { crop: [0, 0, sw, sh], width: place[2], height: place[3], ..*e };
             r.SetStreamSelection(ALL_STREAMS, false)?;
             r.SetStreamSelection(video, true)?;
             decode_to_nv12(&r, video)?;
@@ -1012,11 +1055,11 @@ fn join_as(parts: &[Part], lens: &[f64], dst: &Path, e: &Encode, fades: bool, mu
                 }
                 let px = match &mut last.1 {
                     Some(px) => px,
-                    none => none.insert(frame_pixels(&r, video, &last.0, &pe)?),
+                    none => none.insert(letterbox(frame_pixels(&r, video, &last.0, &pe)?, place, e.width, e.height)),
                 };
                 while *k < upto {
                     let f = fade((*k as f64 + 0.5) / e.fps, len);
-                    w.WriteSample(vo, &nv12_sample(px, &pe, ((done + *k) as f64 * step) as i64, f)?)?;
+                    w.WriteSample(vo, &nv12_sample(px, e, ((done + *k) as f64 * step) as i64, f)?)?;
                     *k += 1;
                 }
                 progress((done + *k) as f32 / total as f32);
@@ -1084,6 +1127,42 @@ fn join_as(parts: &[Part], lens: &[f64], dst: &Path, e: &Encode, fades: bool, mu
         w.Finalize()?;
     }
     Ok(())
+}
+
+/// Where a `sw`x`sh` picture goes in an `ow`x`oh` frame, keeping its shape: as big as fits,
+/// centred, as (x, y, width, height). All even, which NV12's colour pairs need.
+fn fit_rect(sw: u32, sh: u32, ow: u32, oh: u32) -> [u32; 4] {
+    let (sw, sh) = (sw.max(1) as u64, sh.max(1) as u64);
+    let (ow, oh) = (ow & !1, oh & !1);
+    // Full width when the picture is as wide or wider than the frame, else full height.
+    let (w, h) = if sw * oh as u64 >= sh * ow as u64 {
+        (ow, ((sh * ow as u64 + sw) / (sw * 2)) as u32 * 2)
+    } else {
+        (((sw * oh as u64 + sh) / (sh * 2)) as u32 * 2, oh)
+    };
+    let (w, h) = (w.clamp(2.min(ow), ow), h.clamp(2.min(oh), oh));
+    [((ow - w) / 2) & !1, ((oh - h) / 2) & !1, w, h]
+}
+
+/// An NV12 picture of `place`'s size (from frame_pixels) put at `place` in a black `ow`x`oh`
+/// frame. Given back as it is when it fills the frame.
+fn letterbox(px: Vec<u8>, place: [u32; 4], ow: u32, oh: u32) -> Vec<u8> {
+    let [x, y, w, h] = place.map(|v| v as usize);
+    let (ow, oh) = (ow as usize, oh as usize);
+    if (w, h) == (ow, oh) || px.len() < w * h * 3 / 2 {
+        return px;
+    }
+    // Black is brightness 16 and colour 128.
+    let mut o = vec![16u8; ow * oh];
+    o.resize(ow * oh * 3 / 2, 128);
+    for r in 0..h {
+        o[(y + r) * ow + x..][..w].copy_from_slice(&px[r * w..][..w]);
+    }
+    // Colour rows are half as many, each with `w` bytes of (u, v) pairs.
+    for r in 0..h / 2 {
+        o[ow * oh + (y / 2 + r) * ow + x..][..w].copy_from_slice(&px[w * h + r * w..][..w]);
+    }
+    o
 }
 
 /// The encoder's output (H.264) or input (NV12) for `e`.
@@ -1322,7 +1401,7 @@ pub const PEAKS_PER_SEC: usize = 20;
 /// `wanted` says no. A clip without sound gives an empty list.
 pub fn peaks(path: &Path, wanted: impl Fn() -> bool) -> anyhow::Result<Vec<f32>> {
     let r = reader(path, false)?;
-    let Some(&stream) = audio_streams(&r).first() else { return Ok(Vec::new()) };
+    let Some(&stream) = audio_streams(&r, path).first() else { return Ok(Vec::new()) };
     let step = (RATE as usize / PEAKS_PER_SEC) as i64;
     let mut out: Vec<f32> = Vec::new();
     unsafe {
@@ -1471,7 +1550,7 @@ pub(crate) struct AudioSource {
 impl AudioSource {
     pub(crate) fn open(path: &Path) -> anyhow::Result<AudioSource> {
         let reader = reader(path, false)?;
-        let streams = audio_streams(&reader);
+        let streams = audio_streams(&reader, path);
         anyhow::ensure!(!streams.is_empty(), "the clip has no sound");
         unsafe {
             reader.SetStreamSelection(ALL_STREAMS, false)?;
@@ -1712,8 +1791,13 @@ pub(crate) mod tests {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("mp4")))
             .min_by_key(|p| p.metadata().map(|m| m.len()).unwrap_or(u64::MAX))?;
+        Some(tone_clip_from(&real, name))
+    }
+
+    /// tone_clip with the video of `video` (copied first, never touched).
+    fn tone_clip_from(video: &Path, name: &str) -> std::path::PathBuf {
         let copy = std::env::temp_dir().join(format!("{name}.src.mp4"));
-        std::fs::copy(&real, &copy).unwrap();
+        std::fs::copy(video, &copy).unwrap();
         let dst = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&dst);
         let r = reader(&copy, false).unwrap();
@@ -1763,7 +1847,7 @@ pub(crate) mod tests {
         }
         drop(r);
         std::fs::remove_file(&copy).unwrap();
-        Some(dst)
+        dst
     }
 
     /// The loudest sample in `path` from `start` on, mixed with `gains`. With `settle`, the first
@@ -1897,6 +1981,46 @@ pub(crate) mod tests {
         drop((a, r));
         let _ = std::fs::remove_file(&dst);
         std::fs::remove_file(&src).unwrap();
+    }
+
+    /// Only Windows' MP4 reader (.mp4, .mov) lists tracks backwards.
+    #[test]
+    fn mp4_reader_by_extension() {
+        for (name, want) in [("a.mp4", true), ("a.MOV", true), ("a.m4v", true), ("a.mkv", false), ("a.webm", false), ("a", false)] {
+            assert_eq!(mp4_reader(Path::new(name)), want, "{name}");
+        }
+    }
+
+    /// A made-up three-track .mov trims with each track in its place. Re-encoding (what trim
+    /// falls back to when a cut can't be copied) gives one track with track 1's sound.
+    #[test]
+    fn trims_a_made_up_mov_and_reencodes() {
+        let dir = std::env::temp_dir();
+        let video = dir.join("rv-trim-video.mp4");
+        synth(&video, 6, [60, 120, 200], false, 30);
+        let mov = dir.join("rv-trim-tones.mov");
+        std::fs::rename(tone_clip_from(&video, "rv-trim-tones.mp4"), &mov).unwrap();
+        let (cut, again) = (dir.join("rv-trim-mov-cut.mp4"), dir.join("rv-trim-reencoded.mp4"));
+        trim(&mov, &cut, 3.0, 6.0).unwrap();
+        assert_eq!(audio_tracks(&cut).unwrap(), 3);
+        for (t, &(amp, _)) in TONES.iter().enumerate() {
+            let mut g = [0.0; 3];
+            g[t] = 1.0;
+            let p = peak(&cut, 0.0, true, &g);
+            assert!((amp - 0.05..amp + 0.05).contains(&p), "track {} peaks at {p}, expected {amp}", t + 1);
+        }
+        reencode_cut(&mov, &again, 3.0, 6.0).unwrap();
+        assert_eq!(audio_tracks(&again).unwrap(), 1);
+        let p = peak(&again, 0.0, true, &[1.0]);
+        assert!((0.45..0.55).contains(&p), "track 1 peaks at {p}");
+        // Both start on the keyframe at or before 3 s.
+        for f in [&cut, &again] {
+            let got = duration(f).unwrap();
+            assert!((2.9..=6.1).contains(&got), "{} is {got} s", f.display());
+        }
+        for f in [&video, &mov, &cut, &again] {
+            let _ = std::fs::remove_file(f);
+        }
     }
 
     #[test]
@@ -2256,6 +2380,55 @@ pub(crate) mod tests {
         drop(src);
         for f in [a, b, wav, dst] {
             std::fs::remove_file(f).unwrap();
+        }
+    }
+
+    /// A picture of another shape fits inside the frame, centred, with even numbers throughout.
+    #[test]
+    fn fit_rect_keeps_the_shape() {
+        assert_eq!(fit_rect(1920, 1080, 1920, 1080), [0, 0, 1920, 1080]);
+        assert_eq!(fit_rect(1280, 720, 1920, 1080), [0, 0, 1920, 1080]); // same shape, scaled up
+        assert_eq!(fit_rect(1440, 1080, 1920, 1080), [240, 0, 1440, 1080]); // 4:3 pillarboxed
+        assert_eq!(fit_rect(2560, 1080, 1920, 1080), [0, 134, 1920, 810]); // ultrawide letterboxed
+        assert_eq!(fit_rect(202, 360, 640, 360), [218, 0, 202, 360]); // vertical
+        for (sw, sh, ow, oh) in [(1366, 768, 1920, 1080), (1080, 1920, 1280, 720), (3, 1000, 640, 360), (1000, 3, 640, 360), (0, 0, 640, 360)] {
+            let [x, y, w, h] = fit_rect(sw, sh, ow, oh);
+            assert!([x, y, w, h].iter().all(|v| v % 2 == 0) && w >= 2 && h >= 2 && x + w <= ow && y + h <= oh, "{sw}x{sh}: {:?}", [x, y, w, h]);
+        }
+    }
+
+    /// The picture lands where fit_rect says, black (16 brightness, 128 colour) around it.
+    #[test]
+    fn letterbox_puts_the_picture_in_black() {
+        // A 2x2 picture (4 brightness bytes, one colour pair) in a 6x4 frame at (2, 2).
+        let px = vec![1, 2, 3, 4, 50, 60];
+        let o = letterbox(px.clone(), [2, 2, 2, 2], 6, 4);
+        assert_eq!(o.len(), 6 * 4 * 3 / 2);
+        assert_eq!(&o[..24], &[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 1, 2, 16, 16, 16, 16, 3, 4, 16, 16]);
+        assert_eq!(&o[24..], &[128, 128, 128, 128, 128, 128, 128, 128, 50, 60, 128, 128]);
+        // A picture that fills the frame is given back untouched.
+        assert_eq!(letterbox(px.clone(), [0, 0, 2, 2], 2, 2), px);
+    }
+
+    /// A vertical part joined after a wide one keeps its shape: pillarboxed, not stretched.
+    #[test]
+    fn join_fits_another_shape_with_bars() {
+        let dir = std::env::temp_dir();
+        let (wide, vert, dst) = (dir.join("rv-fit-wide.mp4"), dir.join("rv-fit-vertical.mp4"), dir.join("rv-fit-join.mp4"));
+        synth(&wide, 2, [200, 40, 40], false, 30);
+        export(&wide, &vert, Share::Vertical, &|_| {}).unwrap();
+        assert_eq!(probe(&vert).unwrap().size, (202, 360));
+        join(&[part(&wide, 0.0, 1.0), part(&vert, 0.0, 1.0)], &dst, false, None, &|_| {}, &|| false).unwrap();
+        let f = frame(&dst, 1.5, 4000).unwrap();
+        assert_eq!((f.width, f.height), (640, 360));
+        let px = |x: usize, y: usize| &f.rgba[(y * f.width + x) * 4..][..3];
+        // Bars at both sides, the red scene in the middle (its moving bar is near the left).
+        for x in [4, 200, 440, 635] {
+            assert!(px(x, 180).iter().all(|&c| c < 24), "x {x}: {:?}", px(x, 180));
+        }
+        assert!(px(400, 100)[0] > 80 && px(400, 100)[1] < 60, "{:?}", px(400, 100));
+        for f in [&wide, &vert, &dst] {
+            let _ = std::fs::remove_file(f);
         }
     }
 

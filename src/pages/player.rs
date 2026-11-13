@@ -27,6 +27,21 @@ pub(crate) struct TrimEdit {
     pub(crate) loud: Option<Vec<f64>>,
 }
 
+/// A clip being opened. Its file is read a little on another thread first (`player::wake`), so a
+/// disk that spun down or a NAS that's slow to answer doesn't hold up the window; then the player
+/// opens it (`App::finish_opening`).
+pub(crate) struct Opening {
+    path: std::path::PathBuf,
+    /// Trim it once it's open.
+    trim: bool,
+    woke: std::sync::mpsc::Receiver<std::io::Result<()>>,
+}
+
+/// What the Clips page says while `path` opens.
+fn opening_note(path: &std::path::Path) -> String {
+    format!("Opening {}...", path.file_name().unwrap_or_default().to_string_lossy())
+}
+
 /// Cuts and GIFs still being made when their trim closed (Back, Cancel, the clip moved), and
 /// whether each is a GIF, so finish_trim still says how they went and lists the new file.
 static LEFT: std::sync::Mutex<Vec<(Arc<ExportJob>, bool)>> = std::sync::Mutex::new(Vec::new());
@@ -88,10 +103,6 @@ pub(crate) fn trim_controls(ui: &mut egui::Ui, p: &mut player::Player, t: &mut T
             p.seek(t.start);
             p.play();
         }
-        note(ui, "Drag the purple edges to set the start and end. Ctrl+scroll on the timeline zooms; then scroll, or drag the strip under it, to move along.");
-        if t.loud.as_ref().is_some_and(|l| !l.is_empty()) {
-            note(ui, "Yellow marks are loud moments: click one, or press M for the next.");
-        }
     });
     parts_row(ui, t, busy);
     // A volume per audio track, heard live. Only clips recorded with separate tracks have more than one.
@@ -106,9 +117,15 @@ pub(crate) fn trim_controls(ui: &mut egui::Ui, p: &mut player::Player, t: &mut T
                 } else {
                     track_name(cfg, i)
                 };
-                ui.add_sized([130.0, 18.0], egui::Label::new(name));
+                ui.add_sized([130.0, 18.0], egui::Label::new(&name));
                 let mut pct = *g * 100.0;
-                if ui.add(egui::Slider::new(&mut pct, 0.0..=200.0).suffix("%").integer()).on_hover_text("How loud this sound is in the trimmed copy").changed() {
+                // Track 1 is the full mix: how to change one sound goes with its slider.
+                let about = if one || i > 0 {
+                    "How loud this sound is in the trimmed copy".to_string()
+                } else {
+                    format!("How loud this sound is in the trimmed copy. {name} (track 1) is the full mix, so to change one sound, turn {name} down and use the others. Rename tracks on the Audio page.")
+                };
+                if ui.add(egui::Slider::new(&mut pct, 0.0..=200.0).suffix("%").integer()).on_hover_text(about).changed() {
                     *g = pct / 100.0;
                     changed = true;
                 }
@@ -117,13 +134,12 @@ pub(crate) fn trim_controls(ui: &mut egui::Ui, p: &mut player::Player, t: &mut T
         if changed {
             p.set_track_gains(&t.gains);
         }
-        if !one {
-            let first = track_name(cfg, 0);
-            note(ui, format!("{first} (track 1) is the full mix, so to change one sound, turn {first} down and use the others. Rename tracks on the Audio page."));
-        } else if split_on {
-            note(ui, "This clip was recorded with the game and your mic on one track, so they go up and down together. Clips saved from now on have them apart, with a slider each.");
-        } else {
-            note(ui, "This clip has the game and your mic on one track, so they go up and down together. A clip can't be split afterwards, but new ones can be recorded with them apart.");
+        // A clip with one track: why there's one slider, kept on screen.
+        let muted = |text| RichText::new(text).small().color(pal().muted);
+        if one && split_on {
+            ui.label(muted("This clip was recorded with the game and your mic on one track, so they go up and down together. Clips saved from now on have them apart, with a slider each."));
+        } else if one {
+            ui.label(muted("This clip has the game and your mic on one track, so they go up and down together. A clip can't be split afterwards, but new ones can be recorded with them apart."));
             if button(ui, "Record game and mic apart").on_hover_text("New clips get your mic on its own track. Takes effect after Save.").clicked() {
                 t.want_split = true;
             }
@@ -215,21 +231,34 @@ pub(crate) fn parts_row(ui: &mut egui::Ui, t: &mut TrimEdit, busy: bool) {
             t.parts.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
         let mut remove = None;
+        // With tape labels, each part is a little tape label striped in the parts' green.
+        let tape = look().labels == Labels::Tape;
+        let (fill, radius, left) = if tape { (PAPER, 3, 14) } else { (pal().raised, R_SMALL, 8) };
         for (i, &(s, e)) in t.parts.iter().enumerate() {
-            egui::Frame::new().fill(pal().raised).corner_radius(R_SMALL).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
+            let frame = egui::Frame::new().fill(fill).corner_radius(radius).inner_margin(egui::Margin { left, right: 8, top: 2, bottom: 2 }).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Part {}: {} to {}", i + 1, secs_text(s), secs_text(e))).small().color(PART_EDGE));
-                    if ui.add_enabled(!busy, egui::Button::new(icon(icon::CANCEL, 10.0).color(pal().muted)).frame(false)).on_hover_text("Take this part off").clicked() {
+                    let text = format!("Part {}: {} to {}", i + 1, secs_text(s), secs_text(e));
+                    let (text, x) = if tape { (RichText::new(text).family(Face::Marker.family()).size(14.0).color(INK), INK) } else { (RichText::new(text).small().color(PART_EDGE), pal().muted) };
+                    ui.label(text);
+                    if ui.add_enabled(!busy, egui::Button::new(icon(icon::CANCEL, 10.0).color(x)).frame(false)).on_hover_text("Take this part off").clicked() {
                         remove = Some(i);
                     }
                 });
             });
+            if tape {
+                let r = frame.response.rect;
+                ui.painter().rect_filled(r.with_max_x(r.left() + 6.0), egui::CornerRadius { nw: radius, sw: radius, ne: 0, se: 0 }, PART_EDGE);
+            }
         }
         if let Some(i) = remove {
             t.parts.remove(i);
         }
     });
 }
+
+/// The timeline's hover text: how to trim and move along, and the loud marks when it has them.
+const TRIM_HOW: &str = "Drag the purple edges to set the start and end. Ctrl+scroll zooms; then scroll, or drag the strip under it, to move along.";
+const TRIM_HOW_LOUD: &str = "Drag the purple edges to set the start and end. Ctrl+scroll zooms; then scroll, or drag the strip under it, to move along. Yellow marks are loud moments: click one, or press M for the next.";
 
 /// A timeline with the kept part shaded between two edges, plus the playhead. Point at the start
 /// or end edge and drag to move it (it lights up while you're on it); drag anywhere else to scrub.
@@ -255,6 +284,7 @@ pub(crate) fn range_bar(ui: &mut egui::Ui, len: f64, view: &mut (f64, f64), star
     const STRIP: f32 = 10.0; // the bottom of the bar that grabs the in-view strip
     let height = if wave.is_empty() { 36.0 } else { 64.0 };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click_and_drag());
+    let resp = resp.on_hover_text(if loud.is_empty() { TRIM_HOW } else { TRIM_HOW_LOUD });
     // Zoomed in down to one second across the bar.
     let fit = |v: &mut (f64, f64)| {
         v.1 = v.1.clamp(len.min(1.0), len);
@@ -410,6 +440,38 @@ pub(crate) fn start_playing(p: &mut player::Player, range: Option<(f64, f64)>) {
     p.play();
 }
 
+/// The VCR's on-screen display, beside the play button: PLAY or PAUSE in the display's green,
+/// shown when playback starts, stops or jumps and fading out after a second, then the counter.
+/// It can't go over the picture: the video is a child window that covers anything egui paints
+/// there. Repaints only while the word shows or fades. Kept per clip, and only from the last
+/// frame: a clip just opened (or opened again) shows the word as a start, not as a jump.
+fn vcr_readout(ui: &mut egui::Ui, clip: &std::path::Path, playing: bool, at: f64, len: f64) {
+    const SHOW: f32 = 1.0;
+    const FADE: f32 = 0.4;
+    let id = egui::Id::NULL.with(("vcr readout", clip));
+    let now = ui.input(|i| i.time);
+    let frame = ui.ctx().cumulative_frame_nr();
+    let last = ui.data(|d| d.get_temp::<(bool, f64, f64, u64)>(id)).filter(|s| s.3 + 1 >= frame);
+    let (was_playing, was_at, since, _) = last.unwrap_or((!playing, at, now, frame));
+    // A jump: further than a frame or two of playing (or stepping) moves it.
+    let jumped = (at - was_at).abs() > if playing { 1.0 } else { 0.1 };
+    let since = if playing != was_playing || jumped { now } else { since };
+    ui.data_mut(|d| d.insert_temp(id, (playing, at, since, frame)));
+    let shown = (1.0 - ((now - since) as f32 - SHOW) / FADE).clamp(0.0, 1.0);
+    if shown > 0.0 {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
+    }
+    let font = Face::Osd.font(22.0);
+    // Room for the longer word either way, so the counter stays put.
+    let pause = "PAUSE \u{275A}\u{275A}";
+    let w = ui.painter().layout_no_wrap(pause.into(), font.clone(), pal().phosphor).size().x;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::hover());
+    if shown > 0.0 {
+        ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, if playing { "PLAY \u{25B6}" } else { pause }, font, pal().phosphor.gamma_multiply(shown));
+    }
+    ui.label(RichText::new(format!("{} / {}", secs_text(at), secs_text(len))).family(Face::Osd.family()).size(22.0).color(pal().text));
+}
+
 /// Seconds as m:ss.s, for trim points.
 pub(crate) fn secs_text(secs: f64) -> String {
     let s = secs.max(0.0);
@@ -517,7 +579,11 @@ impl App {
             if cap(ui, true, icon_button(glyph, text).min_size(egui::vec2(96.0, 32.0))).on_hover_text(keys).clicked() {
                 if playing { p.pause() } else { start_playing(p, range) }
             }
-            ui.label(RichText::new(format!("{} / {}", secs_text(p.position()), secs_text(len))).color(pal().muted));
+            if look().player_osd {
+                vcr_readout(ui, &path, playing, p.position(), len);
+            } else {
+                ui.label(RichText::new(format!("{} / {}", secs_text(p.position()), secs_text(len))).color(pal().muted));
+            }
             if p.rate() != 1.0 {
                 ui.label(RichText::new(format!("{}x  ·  no sound", p.rate())).color(pal().amber)).on_hover_text("Sound plays only at normal speed. K goes back to it.");
             }
@@ -558,9 +624,11 @@ impl App {
     }
 
     /// Opens `path` paused in the player with the whole clip selected for trimming.
+    /// If it isn't open yet, it's opened first and this comes back once it is (`finish_opening`).
     pub(crate) fn begin_trim(&mut self, path: &std::path::Path) {
         if self.player.as_ref().is_none_or(|(p, _)| p != path) {
-            self.play(path);
+            self.open_clip(path, true);
+            return;
         }
         match &mut self.player {
             Some((p, player)) if p == path => {
@@ -644,7 +712,7 @@ impl App {
             t.gif = None;
             t.gif_msg = Some(match done {
                 Ok(out) => {
-                    self.clips_checked -= std::time::Duration::from_secs(60);
+                    self.rescan_now = true;
                     saved_note(&out)
                 }
                 Err(e) => format!("Couldn't make the GIF: {e}"),
@@ -669,7 +737,62 @@ impl App {
 
     /// Opens `path` in the window's player, or in the default app if it can't be played here.
     pub(crate) fn play(&mut self, path: &std::path::Path) {
+        self.open_clip(path, false);
+    }
+
+    /// Starts opening `path` (see `Opening`), trimming it once open with `trim`. A clip still
+    /// opening is let go.
+    fn open_clip(&mut self, path: &std::path::Path, trim: bool) {
         self.player = None; // lets go of the old file first
+        let (tx, woke) = std::sync::mpsc::channel();
+        let src = path.to_path_buf();
+        std::thread::spawn(move || _ = tx.send(player::wake(&src)));
+        self.clips_msg = Some(opening_note(path));
+        self.opening = Some(Opening { path: path.to_path_buf(), trim, woke });
+    }
+
+    /// `open_clip` with nothing read: the clip stays opening while the returned sender is kept, for
+    /// the screens test.
+    #[cfg(test)]
+    pub(crate) fn opening_unanswered(&mut self, path: &std::path::Path) -> std::sync::mpsc::Sender<std::io::Result<()>> {
+        let (tx, woke) = std::sync::mpsc::channel();
+        self.clips_msg = Some(opening_note(path));
+        self.opening = Some(Opening { path: path.to_path_buf(), trim: false, woke });
+        tx
+    }
+
+    /// Once the clip being opened has answered, opens it in the player (and starts its trim if
+    /// asked), or says why it can't be opened. Until then, looks again shortly.
+    pub(crate) fn finish_opening(&mut self, ctx: &egui::Context) {
+        let woke = match self.opening.as_ref().map(|o| o.woke.try_recv()) {
+            None => return,
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Some(Ok(r)) => r,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => Err(std::io::Error::other("it stopped answering")),
+        };
+        let Some(Opening { path, trim, .. }) = self.opening.take() else { return };
+        if self.clips_msg.as_deref() == Some(opening_note(&path).as_str()) {
+            self.clips_msg = None;
+        }
+        if let Err(e) = woke {
+            log::write(&format!("Couldn't open {}: {e}", path.display()));
+            self.clips_msg = Some(format!("Couldn't open {}: {e}", path.file_name().unwrap_or_default().to_string_lossy()));
+            return;
+        }
+        self.open_now(&path);
+        if trim && self.player.as_ref().is_some_and(|(p, _)| *p == path) {
+            self.begin_trim(&path);
+        } else if trim {
+            self.clips_msg = Some("Can't open that clip here for trimming.".into());
+        }
+    }
+
+    /// Opens `path` in the player now (on the UI thread, which the player's window needs), or in
+    /// the default app if it can't be played here.
+    fn open_now(&mut self, path: &std::path::Path) {
         let opened = overlay::hwnd().ok_or_else(|| anyhow::anyhow!("no window")).and_then(|h| player::Player::open(h, path));
         match opened {
             Ok(mut p) => {

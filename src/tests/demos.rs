@@ -16,7 +16,6 @@ fn demo_app(cc: &eframe::CreationContext, folder: &str) -> App {
     let cfg = Config {
         folder: folder.into(),
         setup_done: true,
-        tips_seen: ["Clips", "General", "Keybinds", "Video", "Audio", "Help"].map(String::from).to_vec(),
         discord_webhook: "https://discord.com/api/webhooks/123/made-up-token".into(),
         ..Config::default()
     };
@@ -83,7 +82,7 @@ fn demos() {
         fr.hold(&mut h, 8);
         for (from, to) in [(262.0, 500.0), (542.0, 780.0)] {
             for k in 0..=40 {
-                h.hover_at(egui::pos2(from + (to - from) * k as f32 / 40.0, 330.0));
+                h.hover_at(egui::pos2(from + (to - from) * k as f32 / 40.0, 240.0));
                 fr.shot(&mut h);
             }
             fr.hold(&mut h, 6);
@@ -100,7 +99,7 @@ fn demos() {
         warm_up(&mut h);
         let mut fr = Frames::new(&out, "share");
         fr.hold(&mut h, 8);
-        h.query_all_by_label(&icon::MORE.to_string()).next().unwrap().click();
+        h.query_all_by_label(&icon::MORE.to_string()).nth(1).unwrap().click();
         fr.hold(&mut h, 4);
         h.get_by_label("Post to Discord").hover();
         fr.hold(&mut h, 18);

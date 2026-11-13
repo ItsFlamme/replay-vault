@@ -38,11 +38,12 @@ Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.c
 - Desktop capture by default, which is safe with anti-cheat. Game capture is there if you want it.
 - Game and mic on separate tracks, noise suppression, or record only the apps you pick
 - Even sound on both sides (experimental, off to start with, on the Audio page): a clip that comes out louder on one side (your balance in Windows or another app) is evened after saving, still in stereo, with your mic kept in the middle
-- Optional pause when no game is open, back on by itself when one is. A game in a window counts too, once you pick it from the tray.
-- If instant replay stops by itself, you're told and it's turned back on. Every saved clip is checked, and you're told if it came out empty or without sound.
+- Optional pause when no game is open, back on by itself when one is. A game in a window counts too: one as big as the screen, one you saved a clip from in the last hour, or one you pick from the tray.
+- If instant replay stops by itself, you're told and it's turned back on. If it won't come back on, the recorder is restarted and it keeps trying. Every saved clip is checked, and you're told if it came out empty or without sound.
+- A full recording stays playable if the app or the PC stops in the middle of it (with the OBS the app installs, 30.2 or later). One still running when Windows shuts down or the app is uninstalled is finished and saved first, as far as Windows gives it time.
 
 **Clips and trim**
-- A clips page with folders per game, search, stars and tags
+- A clips page grouped by day, with your games in the sidebar and as chips, a folder per game, search, stars and tags
 - Hover over a clip to scrub through it, or play it in the built-in player
 - Trim with an audio waveform and a volume per track
 - Copies sized for Discord, 720p or vertical 9:16, GIFs and a montage maker
@@ -50,8 +51,8 @@ Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.c
 **Sharing**
 - Drag a clip into Discord, a browser or a folder, or play and copy the last clip from the tray
 - Post to your Discord channel through your own webhook
-- Upload for a share link, and keep the link that deletes it later
-- Clean up old clips by size or age, and move old ones to an archive drive
+- Upload for a share link, and keep the link that deletes it later. Links follow their clips, and links of deleted clips are listed on General > Sharing.
+- Clean up old clips by size or age, to the Recycle Bin only, and move old ones to an archive drive. Both stay off in a shared folder like Videos, Desktop or the top of a drive unless you confirm it on General > Storage.
 
 ## Requirements
 
@@ -64,7 +65,7 @@ Recording is done by a private, hidden copy of [OBS Studio](https://obsproject.c
 2. Run it. A short setup downloads OBS Studio (about 225 MB), checks it against its published SHA-256 hash, and asks where it and your clips should go.
 3. Setup then picks a quality that suits your PC, or uses the video and sound settings from your own OBS if you have one. Keys, sound and everything else can be changed later.
 
-After that the app updates itself: when a new version is out it asks, and **Update now** downloads it, checks it and puts it in place. Settings and clips stay.
+After that the app updates itself: when a new version is out it asks, and **Update now** downloads it, checks it and puts it in place. The download can be cancelled. Settings and clips stay. Only one copy of the app runs at a time.
 
 Each release includes `SHA256SUMS.txt`. To verify a download, compare it with the output of `Get-FileHash <file>`.
 
@@ -81,7 +82,7 @@ Each release includes `SHA256SUMS.txt`. To verify a download, compare it with th
 | Screenshot | <kbd>Alt</kbd> + <kbd>F12</kbd> |
 | Turn instant replay on or off | <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>F11</kbd> |
 
-All keys can be changed on the Keybinds page. Save is <kbd>Alt</kbd> + <kbd>F10</kbd> on purpose, the same key as NVIDIA's instant replay, so ShadowPlay players keep the habit; if NVIDIA's own instant replay is also on, it saves a clip too (the Keybinds page can turn NVIDIA's overlay off while the app runs). The other keys avoid NVIDIA's and AMD's default shortcuts, which those apps keep even with their overlays off. A key NVIDIA's overlay holds still works for Replay Vault too, and both apps react to it. If another app already uses a key you pick, the Keybinds page says which one.
+All keys can be changed on the Keybinds page, and a changed key takes effect when you Save. Save is <kbd>Alt</kbd> + <kbd>F10</kbd> on purpose, the same key as NVIDIA's instant replay, so ShadowPlay players keep the habit; if NVIDIA's own instant replay is also on, it saves a clip too (the Keybinds page can turn NVIDIA's overlay off while the app runs). The other keys avoid NVIDIA's and AMD's default shortcuts, which those apps keep even with their overlays off. A key NVIDIA's overlay holds still works for Replay Vault too, and both apps react to it. If another app already uses a key you pick, the Keybinds page says which one.
 
 ## Privacy
 
@@ -96,7 +97,7 @@ Clips, settings and logs stay on your PC: clips in `Videos\Replay Vault Clips` a
 
 ## Uninstall
 
-Use **General > Remove from this PC** in the app. It undoes the changes the app made (startup entry, firewall rule, GPU preference and any Windows settings you turned off), moves the private OBS copy and the app's settings to the Recycle Bin, then uninstalls the app and its shortcuts. Your clips are kept.
+Use **General > Backup > Remove from this PC** in the app. It undoes the changes the app made (startup entry, firewall rule, GPU preference and any Windows settings you turned off), moves the private OBS copy and the app's settings to the Recycle Bin, then uninstalls the app and its shortcuts. Your clips are kept.
 
 ## Building from source
 

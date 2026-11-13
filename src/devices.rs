@@ -43,6 +43,35 @@ pub fn list() -> Vec<Device> {
     out
 }
 
+/// The specific devices Windows uses as the default ones right now (their ids, as in `Device::key`
+/// after the "out:" or "in:"), which "out:default" and "in:default" record.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Defaults {
+    pub out: Option<String>,
+    /// Only when the same mic is Windows' default for both normal use and calls, so whichever of
+    /// the two OBS follows, it's this one.
+    pub mic: Option<String>,
+}
+
+/// Asks Windows for its default devices. Nothing is opened or changed.
+pub fn defaults() -> Defaults {
+    use windows::Win32::Media::Audio::{EDataFlow, ERole, eCommunications, eConsole};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
+            return Defaults::default();
+        };
+        let id = |flow: EDataFlow, role: ERole| -> Option<String> {
+            let raw = en.GetDefaultAudioEndpoint(flow, role).ok()?.GetId().ok()?;
+            let id = raw.to_string().ok();
+            CoTaskMemFree(Some(raw.0 as *const _));
+            id
+        };
+        let mic = id(eCapture, eConsole).filter(|m| id(eCapture, eCommunications).as_ref() == Some(m));
+        Defaults { out: id(eRender, eConsole), mic }
+    }
+}
+
 /// Open apps whose sound can be recorded on its own: visible top-level windows with a title,
 /// one per program, sorted by exe name. The exe name comes from Windows' list of running
 /// programs (a snapshot), so no app or game process is ever opened.
@@ -136,6 +165,17 @@ mod tests {
     fn obs_window_escapes_like_obs() {
         let a = AppSel { title: "#general | Server: Discord".into(), class: "Chrome_WidgetWin_1".into(), exe: "Discord.exe".into() };
         assert_eq!(obs_window(&a), "#22general | Server#3A Discord:Chrome_WidgetWin_1:Discord.exe");
+    }
+
+    /// Windows' default devices, when it has them, are among the devices listed. Read only.
+    #[test]
+    fn defaults_are_listed_devices() {
+        let (d, all) = (defaults(), list());
+        for (kind, id) in [("out", &d.out), ("in", &d.mic)] {
+            if let Some(id) = id {
+                assert!(all.iter().any(|dev| dev.key == format!("{kind}:{id}")), "{kind}:{id}");
+            }
+        }
     }
 
     /// Lists without error, one entry per program, never this test process.

@@ -17,25 +17,353 @@ pub(crate) const ACCENTS: [(&str, Color32, Color32, Color32); 6] = [
 pub(crate) const CUSTOM_ACCENT: u8 = ACCENTS.len() as u8;
 
 /// The accent in use (an index into ACCENTS, or CUSTOM_ACCENT), set from the settings every frame.
+#[cfg(not(test))]
 pub(crate) static ACCENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// The custom accent as 0xRRGGBB, set from the settings every frame.
+#[cfg(not(test))]
 pub(crate) static CUSTOM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x8448F0);
 
 /// Light mode and the Retro theme (Dark and Minimalist when off), set from the settings every frame.
+#[cfg(not(test))]
 pub(crate) static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(not(test))]
 pub(crate) static RETRO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Retro's scanlines, grain and glows are on (Retro, and "Reduce effects" off), set every frame.
+/// "Reduce effects" is off, set every frame. The look says whether it has effects at all.
+#[cfg(not(test))]
 pub(crate) static EFFECTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub(crate) fn retro() -> bool {
-    RETRO.load(std::sync::atomic::Ordering::Relaxed)
+#[cfg(test)]
+pub(crate) use per_thread::{ACCENT, CUSTOM, EFFECTS, LIGHT, RETRO};
+
+/// The same settings, one set per thread: tests run side by side, each on its own thread, and one
+/// drawing Retro mustn't turn another's frame Retro halfway through. The app sets and reads them
+/// on its UI thread only, so there they stay plain statics.
+#[cfg(test)]
+mod per_thread {
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+
+    pub(crate) struct PerThread<T: 'static>(&'static std::thread::LocalKey<T>);
+
+    macro_rules! load_store {
+        ($atomic:ty, $value:ty) => {
+            impl PerThread<$atomic> {
+                pub(crate) fn load(&self, order: Ordering) -> $value {
+                    self.0.with(|a| a.load(order))
+                }
+                pub(crate) fn store(&self, value: $value, order: Ordering) {
+                    self.0.with(|a| a.store(value, order));
+                }
+            }
+        };
+    }
+    load_store!(AtomicU8, u8);
+    load_store!(AtomicU32, u32);
+    load_store!(AtomicBool, bool);
+
+    thread_local! {
+        static ACCENT_HERE: AtomicU8 = const { AtomicU8::new(0) };
+        static CUSTOM_HERE: AtomicU32 = const { AtomicU32::new(0x8448F0) };
+        static LIGHT_HERE: AtomicBool = const { AtomicBool::new(false) };
+        static RETRO_HERE: AtomicBool = const { AtomicBool::new(false) };
+        static EFFECTS_HERE: AtomicBool = const { AtomicBool::new(false) };
+    }
+    pub(crate) static ACCENT: PerThread<AtomicU8> = PerThread(&ACCENT_HERE);
+    pub(crate) static CUSTOM: PerThread<AtomicU32> = PerThread(&CUSTOM_HERE);
+    pub(crate) static LIGHT: PerThread<AtomicBool> = PerThread(&LIGHT_HERE);
+    pub(crate) static RETRO: PerThread<AtomicBool> = PerThread(&RETRO_HERE);
+    pub(crate) static EFFECTS: PerThread<AtomicBool> = PerThread(&EFFECTS_HERE);
 }
 
+/// The look's scanlines, grain and glows are on: it has them, and "Reduce effects" is off.
 pub(crate) fn effects() -> bool {
-    EFFECTS.load(std::sync::atomic::Ordering::Relaxed)
+    look().effects && EFFECTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A typeface by role: body text, its bold, the VCR on-screen display, or the tape marker.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Face {
+    Body,
+    Strong,
+    Osd,
+    Marker,
+}
+
+impl Face {
+    pub(crate) fn family(self) -> egui::FontFamily {
+        match self {
+            Face::Body => egui::FontFamily::Proportional,
+            Face::Strong => egui::FontFamily::Name("strong".into()),
+            Face::Osd => egui::FontFamily::Name("osd".into()),
+            Face::Marker => egui::FontFamily::Name("marker".into()),
+        }
+    }
+
+    pub(crate) fn font(self, size: f32) -> egui::FontId {
+        egui::FontId::new(size, self.family())
+    }
+}
+
+/// Text in a face, at `scale` times the size a caller asks for (rounded), so one call reads right
+/// in a face that runs small (VT323) and one that doesn't.
+#[derive(Clone, Copy)]
+pub(crate) struct Type {
+    pub(crate) face: Face,
+    pub(crate) scale: f32,
+}
+
+impl Type {
+    pub(crate) fn size(self, size: f32) -> f32 {
+        (size * self.scale).round()
+    }
+
+    pub(crate) fn text(self, text: impl Into<String>, size: f32) -> RichText {
+        RichText::new(text).family(self.face.family()).size(self.size(size))
+    }
+}
+
+/// How buttons stand: flat, or chunky remote-control keys with these corners on a dark lip they
+/// sink onto while pressed (main buttons on a darker accent).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Button {
+    Flat,
+    Chunky { lip: f32, radius: u8 },
+}
+
+/// How choice chips look: a quiet keycap ringed in the accent when picked, or a remote-control key
+/// with these corners on a dark lip, filled with the accent when picked.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Chip {
+    Ring,
+    Key { lip: f32, radius: u8 },
+}
+
+/// What a keycap is filled with: a raised surface, or a VCR remote's dark button.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum KeyFill {
+    Raised,
+    Remote,
+}
+
+/// Keys drawn as keycaps: their fill, corners, the edge under them, whether the key button around
+/// them keeps its frame (without, the caps are the button), and their type, size and capitals.
+#[derive(Clone, Copy)]
+pub(crate) struct Keycap {
+    pub(crate) fill: KeyFill,
+    pub(crate) radius: u8,
+    pub(crate) depth: f32,
+    pub(crate) framed: bool,
+    pub(crate) face: Face,
+    pub(crate) size: f32,
+    pub(crate) caps: bool,
+}
+
+/// Short text on keys: chips, the Clips page's buttons, settings slots (Clear, Set, Not set). Its
+/// type, size, capitals and letter spacing.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyText {
+    pub(crate) face: Face,
+    pub(crate) size: f32,
+    pub(crate) caps: bool,
+    pub(crate) spacing: f32,
+}
+
+/// Headings on settings cards, dialog titles and the trim's parts: plain text, or a cream tape
+/// label with a color stripe.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Labels {
+    Plain,
+    Tape,
+}
+
+/// A clip's card in the grid.
+#[derive(Clone, Copy)]
+pub(crate) struct ClipCard {
+    /// PLAY and the length on the picture in the VCR font (no dark tag behind the length).
+    pub(crate) osd: bool,
+    /// The dark lip under the card, and the game's color stripe under the picture (0: none).
+    pub(crate) lip: f32,
+    pub(crate) stripe: f32,
+    /// The title's type, size and capitals, and the details line's type and size.
+    pub(crate) title: (Face, f32, bool),
+    pub(crate) details: (Face, f32),
+}
+
+/// The status box at the bottom of the sidebar: a card, or the VCR's display (its own fill, the
+/// switch's label saying REPLAY ON or OFF in the display's green, the lines in capitals). Its
+/// corners.
+#[derive(Clone, Copy)]
+pub(crate) struct StatusBox {
+    pub(crate) display: bool,
+    pub(crate) radius: u8,
+}
+
+/// The sidebar's page links: quiet list rows, or tapes on a shelf.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum NavStyle {
+    Row,
+    Tape,
+}
+
+/// How the page links are drawn, and their spacing: the usual one, and a tighter one for a window
+/// too short for it (see `App::sidebar`).
+#[derive(Clone, Copy)]
+pub(crate) struct Nav {
+    pub(crate) style: NavStyle,
+    pub(crate) normal: NavSpacing,
+    pub(crate) compact: NavSpacing,
+}
+
+/// The space above and under the app's name, a page link's height, the gap between links (None:
+/// the usual item spacing), and the space under Clips.
+#[derive(Clone, Copy)]
+pub(crate) struct NavSpacing {
+    pub(crate) brand: f32,
+    pub(crate) height: f32,
+    pub(crate) gap: Option<f32>,
+    pub(crate) after_clips: f32,
+}
+
+/// A sidebar section heading: its indent, type and size, and whether it's in capitals.
+#[derive(Clone, Copy)]
+pub(crate) struct SideHeading {
+    pub(crate) indent: f32,
+    pub(crate) face: Face,
+    pub(crate) size: f32,
+    pub(crate) caps: bool,
+}
+
+/// What's behind the pages: the plain fill, or the site's room of light pools and scanlines.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Background {
+    Plain,
+    Room,
+}
+
+/// Everything a theme changes besides its colors, in one place: widgets and pages read these and
+/// never ask which theme is on. A new theme is one more of these.
+pub(crate) struct Look {
+    /// The palettes for dark and light mode.
+    pub(crate) dark: &'static Palette,
+    pub(crate) light: &'static Palette,
+    /// Page titles, and whether they're painted with the TV's colored fringes (with effects on).
+    pub(crate) title: Type,
+    pub(crate) title_fringe: bool,
+    /// Readouts like the setup step counter (`osd`).
+    pub(crate) readout: Type,
+    /// Headings and names, and the size of a card's title.
+    pub(crate) heading: Face,
+    pub(crate) card_title: f32,
+    pub(crate) side_heading: SideHeading,
+    /// The status box's line ("Keeping the last 5:00", or why it isn't recording): its face and size.
+    pub(crate) status: (Face, f32),
+    /// The game rows under Clips in the sidebar: their face and size.
+    pub(crate) side_row: (Face, f32),
+    pub(crate) nav: Nav,
+    pub(crate) button: Button,
+    pub(crate) chip: Chip,
+    pub(crate) keycap: Keycap,
+    /// Text on keys; None keeps the body text.
+    pub(crate) key_text: Option<KeyText>,
+    pub(crate) labels: Labels,
+    /// The corners of cards (settings cards, clip cards) and dialogs.
+    pub(crate) card_radius: u8,
+    pub(crate) clip: ClipCard,
+    /// Colors handed to games (see `tape_color`), for their cards, chip and sidebar row; none
+    /// leaves games without one.
+    pub(crate) tape_colors: &'static [Color32],
+    /// The sidebar's small links (Help, What's new, Feedback): face, size, capitals.
+    pub(crate) side_links: (Face, f32, bool),
+    pub(crate) status_box: StatusBox,
+    /// The player's VCR readout: PLAY or PAUSE, fading after a moment, and a counter.
+    pub(crate) player_osd: bool,
+    /// The Clip saved popup reads like the VCR's display.
+    pub(crate) vcr_popup: bool,
+    pub(crate) background: Background,
+    /// Scanlines, grain and glows (unless "Reduce effects" is on).
+    pub(crate) effects: bool,
+}
+
+/// Minimalist: plain graphite, quiet rows and flat keycaps, bold kept for titles.
+pub(crate) const MINIMALIST: Look = Look {
+    dark: &GRAPHITE,
+    light: &GRAPHITE_LIGHT,
+    title: Type { face: Face::Strong, scale: 0.72 },
+    title_fringe: false,
+    readout: Type { face: Face::Strong, scale: 0.72 },
+    heading: Face::Body,
+    card_title: 16.0,
+    side_heading: SideHeading { indent: 12.0, face: Face::Body, size: 12.0, caps: false },
+    status: (Face::Body, 13.0),
+    side_row: (Face::Body, 12.5),
+    nav: Nav {
+        style: NavStyle::Row,
+        normal: NavSpacing { brand: 22.0, height: 36.0, gap: Some(2.0), after_clips: 18.0 },
+        compact: NavSpacing { brand: 12.0, height: 32.0, gap: Some(2.0), after_clips: 8.0 },
+    },
+    button: Button::Flat,
+    chip: Chip::Ring,
+    keycap: Keycap { fill: KeyFill::Raised, radius: R_KEY, depth: 2.0, framed: false, face: Face::Strong, size: 13.0, caps: false },
+    key_text: None,
+    labels: Labels::Plain,
+    card_radius: R_CARD,
+    clip: ClipCard { osd: false, lip: 0.0, stripe: 0.0, title: (Face::Body, 14.0, false), details: (Face::Body, 12.0) },
+    tape_colors: &[],
+    side_links: (Face::Body, 12.0, false),
+    status_box: StatusBox { display: false, radius: R_CARD },
+    player_osd: false,
+    vcr_popup: false,
+    background: Background::Plain,
+    effects: false,
+};
+
+/// Retro: the site's tape shelf, VCR titles and readouts, chunky accent buttons and keys.
+pub(crate) const RETRO_LOOK: Look = Look {
+    dark: &DARK,
+    light: &LIGHT_PALETTE,
+    title: Type { face: Face::Osd, scale: 1.0 },
+    title_fringe: true,
+    readout: Type { face: Face::Osd, scale: 1.0 },
+    heading: Face::Strong,
+    card_title: 15.0,
+    side_heading: SideHeading { indent: 4.0, face: Face::Osd, size: 17.0, caps: true },
+    status: (Face::Osd, 17.0),
+    side_row: (Face::Osd, 17.0),
+    nav: Nav {
+        style: NavStyle::Tape,
+        normal: NavSpacing { brand: 22.0, height: 40.0, gap: None, after_clips: 14.0 },
+        compact: NavSpacing { brand: 12.0, height: 34.0, gap: Some(0.0), after_clips: 6.0 },
+    },
+    button: Button::Chunky { lip: 3.0, radius: 4 },
+    chip: Chip::Key { lip: 2.0, radius: 3 },
+    keycap: Keycap { fill: KeyFill::Remote, radius: 3, depth: 3.0, framed: false, face: Face::Osd, size: 17.0, caps: true },
+    key_text: Some(KeyText { face: Face::Osd, size: 17.0, caps: true, spacing: 0.7 }),
+    labels: Labels::Tape,
+    card_radius: 4,
+    clip: ClipCard { osd: true, lip: 3.0, stripe: 3.0, title: (Face::Osd, 21.0, true), details: (Face::Osd, 17.0) },
+    tape_colors: &TAPES,
+    side_links: (Face::Osd, 16.0, true),
+    status_box: StatusBox { display: true, radius: 4 },
+    player_osd: true,
+    vcr_popup: true,
+    background: Background::Room,
+    effects: true,
+};
+
+/// The site's tape colors: pink, orange, teal and violet.
+pub(crate) const TAPES: [Color32; 4] = [Color32::from_rgb(217, 70, 239), Color32::from_rgb(249, 115, 22), Color32::from_rgb(45, 212, 191), Color32::from_rgb(139, 92, 246)];
+
+/// The tape color of the game in `slot` (see `tape_slots`), if the look hands any out.
+pub(crate) fn tape_color(slot: usize) -> Option<Color32> {
+    let tapes = look().tape_colors;
+    (!tapes.is_empty()).then(|| tapes[slot % tapes.len()])
+}
+
+/// The look of the theme in use (set from the settings every frame).
+pub(crate) fn look() -> &'static Look {
+    if RETRO.load(std::sync::atomic::Ordering::Relaxed) { &RETRO_LOOK } else { &MINIMALIST }
 }
 
 /// The accent's main, light and dim colors. A custom color is first made readable in the current
@@ -58,7 +386,7 @@ static FITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 fn fitted_custom() -> Color32 {
     use std::sync::atomic::Ordering::Relaxed;
     let custom = CUSTOM.load(Relaxed) & 0xFF_FFFF;
-    let key = custom as u64 | (retro() as u64) << 24 | (LIGHT.load(Relaxed) as u64) << 25 | 1 << 26;
+    let key = custom as u64 | (RETRO.load(Relaxed) as u64) << 24 | (LIGHT.load(Relaxed) as u64) << 25 | 1 << 26;
     let cached = FITTED.load(Relaxed);
     if cached >> 32 == key {
         let [_, r, g, b] = (cached as u32).to_be_bytes();
@@ -190,6 +518,11 @@ pub(crate) struct Palette {
     /// The edge of a control that's only a box when empty or off (checkboxes, text boxes, combo
     /// boxes, the off switch): 3:1 against the cards.
     pub(crate) outline: Color32,
+    /// The lip under chunky keys and cards, a VCR remote's button (body text goes on it), and the
+    /// status box as the VCR's display (body text and the display's green go on it).
+    pub(crate) lip: Color32,
+    pub(crate) key: Color32,
+    pub(crate) display: Color32,
 }
 
 /// Retro's dark palette, the "tape shelf" of replayvault.app: dark plums and its lilac grey text.
@@ -210,6 +543,9 @@ pub(crate) const DARK: Palette = Palette {
     phosphor: Color32::from_rgb(95, 227, 208),
     red: Color32::from_rgb(255, 110, 100),
     outline: Color32::from_rgb(122, 108, 146),
+    lip: Color32::from_rgb(8, 7, 10),
+    key: Color32::from_rgb(46, 42, 54),
+    display: Color32::from_rgb(10, 10, 13),
 };
 
 /// The same shelf in daylight: lilac whites, plum text.
@@ -230,6 +566,9 @@ pub(crate) const LIGHT_PALETTE: Palette = Palette {
     phosphor: Color32::from_rgb(0, 110, 96),
     red: Color32::from_rgb(185, 35, 35),
     outline: Color32::from_rgb(142, 130, 162),
+    lip: Color32::from_rgb(196, 187, 212),
+    key: Color32::from_rgb(232, 226, 241),
+    display: Color32::from_rgb(255, 255, 255),
 };
 
 /// Minimalist's dark palette: plain graphite, so the clips carry the color and the accent marks
@@ -251,6 +590,9 @@ pub(crate) const GRAPHITE: Palette = Palette {
     phosphor: Color32::from_rgb(95, 227, 208),
     red: Color32::from_rgb(255, 110, 100),
     outline: Color32::from_rgb(112, 112, 118),
+    lip: Color32::from_rgb(12, 12, 13),
+    key: Color32::from_rgb(38, 38, 41),
+    display: Color32::from_rgb(28, 28, 30),
 };
 
 /// Minimalist's light palette: the same graphite in daylight.
@@ -271,10 +613,13 @@ pub(crate) const GRAPHITE_LIGHT: Palette = Palette {
     phosphor: Color32::from_rgb(0, 110, 96),
     red: Color32::from_rgb(185, 35, 35),
     outline: Color32::from_rgb(138, 138, 143),
+    lip: Color32::from_rgb(212, 212, 216),
+    key: Color32::from_rgb(242, 242, 243),
+    display: Color32::from_rgb(255, 255, 255),
 };
 
 /// The component scale: two corner radii (controls: buttons, keys, chips, fields, pills; and
-/// cards: cards, tiles, tips, the player), Retro's round chips, and two button heights (everyday
+/// cards: cards, tiles, tips, the player), and two button heights (everyday
 /// buttons and chips; main buttons, the search box and the key buttons).
 pub(crate) const R_SMALL: u8 = 8;
 
@@ -283,19 +628,12 @@ pub(crate) const R_CARD: u8 = 12;
 /// Keycaps and tags: small enough that their corners stay tighter than the buttons'.
 pub(crate) const R_KEY: u8 = 5;
 
-pub(crate) const R_PILL: u8 = 14;
-
 pub(crate) const H: f32 = 28.0;
 
 pub(crate) const H_BIG: f32 = 34.0;
 
 pub(crate) fn pal() -> &'static Palette {
-    match (retro(), LIGHT.load(std::sync::atomic::Ordering::Relaxed)) {
-        (true, true) => &LIGHT_PALETTE,
-        (true, false) => &DARK,
-        (false, true) => &GRAPHITE_LIGHT,
-        (false, false) => &GRAPHITE,
-    }
+    if LIGHT.load(std::sync::atomic::Ordering::Relaxed) { look().light } else { look().dark }
 }
 
 /// The site's tape-label paper and its ink.
@@ -362,6 +700,9 @@ pub(crate) fn set_visuals(ctx: &egui::Context) {
     });
 }
 
+/// VT323, bundled once for the window and the save popups.
+pub(crate) static VT323: &[u8] = include_bytes!("../../assets/fonts/VT323-Regular.ttf");
+
 /// The fonts of replayvault.app, bundled (see assets\fonts for their licenses): Atkinson
 /// Hyperlegible for text (its bold as the "strong" family), VT323 (a VCR on-screen display font)
 /// as "osd" for page titles and the recording readout, and Permanent Marker as "marker" for the
@@ -374,7 +715,7 @@ pub(crate) fn use_windows_fonts(ctx: &egui::Context) {
     for (name, bytes) in [
         ("atkinson", &include_bytes!("../../assets/fonts/AtkinsonHyperlegible-Regular.ttf")[..]),
         ("atkinson-bold", &include_bytes!("../../assets/fonts/AtkinsonHyperlegible-Bold.ttf")[..]),
-        ("vt323", &include_bytes!("../../assets/fonts/VT323-Regular.ttf")[..]),
+        ("vt323", VT323),
         ("marker", &include_bytes!("../../assets/fonts/PermanentMarker-Regular.ttf")[..]),
     ] {
         fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
@@ -430,7 +771,7 @@ pub(crate) fn oval_glow(painter: &egui::Painter, center: egui::Pos2, radii: egui
 /// and only a few shapes. In light mode: pastel pools, much fainter lines and grain, no dark corners.
 /// Retro only: Minimalist, and Retro with "Reduce effects", keep the plain fill.
 pub(crate) fn room(ui: &egui::Ui, rect: egui::Rect) {
-    if !effects() {
+    if look().background != Background::Room || !effects() {
         return;
     }
     let light = pal().light;

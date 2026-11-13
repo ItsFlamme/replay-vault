@@ -342,6 +342,19 @@ unsafe fn device_id(d: &IMMDevice) -> String {
     }
 }
 
+/// Reads a little of the start and the end of `path` (where an MP4 keeps its index), so a disk
+/// that spun down or a NAS has answered before `Player::open` runs on the UI thread. Run it on
+/// another thread. Fails if the file isn't there or can't be read.
+pub fn wake(path: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let size = f.metadata()?.len();
+    let mut part = vec![0; size.min(64 << 10) as usize];
+    f.read_exact(&mut part)?;
+    f.seek(SeekFrom::Start(size - part.len() as u64))?;
+    f.read_exact(&mut part)
+}
+
 impl Player {
     /// Loads `path` paused on its first frame. Blocks until that frame is decoded (a few ms for a
     /// local file) so a broken file fails here instead of showing a black box.
@@ -698,6 +711,20 @@ mod tests {
     fn letterboxes() {
         assert_eq!(fit((0, 0, 1000, 1000), (1920, 1080)), (0, 218, 1000, 563));
         assert_eq!(fit((10, 0, 400, 100), (1920, 1080)), (121, 0, 178, 100));
+    }
+
+    /// A clip is read before opening; a missing one, or a folder, fails there. In a temp folder.
+    #[test]
+    fn wakes_a_clip_before_opening() {
+        let dir = std::env::temp_dir().join("instant-replay-player-wake");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (big, small) = (dir.join("big.mp4"), dir.join("small.mp4"));
+        std::fs::write(&big, vec![7u8; 200_000]).unwrap();
+        std::fs::write(&small, b"tiny").unwrap();
+        assert!(wake(&big).is_ok() && wake(&small).is_ok());
+        assert!(wake(&dir.join("gone.mp4")).is_err());
+        assert!(wake(&dir).is_err(), "a folder isn't a clip");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

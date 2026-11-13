@@ -4,10 +4,11 @@
 //! installer (or, for a portable copy, its exe), checks it against the SHA-256 GitHub published
 //! for it, and runs it (or swaps it in and restarts). Only the app's own files are replaced, and
 //! the old ones are deleted for good, never left in the Recycle Bin. Settings, notes, tags and
-//! clips live elsewhere (`config::dir`, the clips folder) and are never touched.
+//! clips live elsewhere (`config::dir`, the clips folder) and are never touched. A copy that may not
+//! update (see `instance`) never checks, downloads or installs.
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -15,6 +16,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+use crate::instance::UPDATE_CHECK_OFF;
 use crate::obs_install::{self, Shared};
 
 const LATEST: &str = "https://api.github.com/repos/ItsFlamme/replay-vault/releases/latest";
@@ -33,9 +35,28 @@ static CHECKING: AtomicBool = AtomicBool::new(false);
 /// The SHA-256 the last download matched, so a portable swap can check the file again.
 static CHECKED: Mutex<Option<String>> = Mutex::new(None);
 
+/// Whether this copy updates at all.
+fn allowed() -> bool {
+    crate::instance::current().updates_allowed()
+}
+
 /// The newer release the last check found, if any.
+#[cfg(not(test))]
 pub fn found() -> Option<Newer> {
     FOUND.lock().unwrap().clone()
+}
+
+/// For tests: what `set_found` set on this thread. Tests run side by side, each on its own thread,
+/// and one showing the sidebar's "Version X is out" mustn't move another's status box between the
+/// frame a click is aimed in and the frame it lands in. Tests never check GitHub.
+#[cfg(test)]
+pub fn found() -> Option<Newer> {
+    FOUND_HERE.with(|f| f.borrow().clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FOUND_HERE: std::cell::RefCell<Option<Newer>> = const { std::cell::RefCell::new(None) };
 }
 
 /// How many times a check has found a newer release.
@@ -97,11 +118,11 @@ fn newer_in(json: &serde_json::Value, current: &str) -> Option<Newer> {
     Some(Newer { version, url: url.into(), notes: notes.trim().into(), installer, portable })
 }
 
-/// For tests: what a check found. `finds` isn't counted, so the popup only shows in a test that
-/// asks for it (tests run side by side and share this).
+/// For tests: what a check found, for this thread only (see `found`). `finds` isn't counted, so the
+/// popup only shows in a test that asks for it.
 #[cfg(test)]
 pub fn set_found(n: Option<Newer>) {
-    *FOUND.lock().unwrap() = n;
+    FOUND_HERE.with(|f| *f.borrow_mut() = n);
 }
 
 /// Asks GitHub once. No release yet (or the repository isn't public) is Ok(None).
@@ -145,8 +166,12 @@ fn check_and_keep() -> String {
 }
 
 /// Checks a minute after start, then once a day while `ENABLED`; `repaint` runs after each check.
-/// Also deletes what an update left behind: its installer, or a portable copy's old exe.
+/// Also deletes what an update left behind: its installer, or a portable copy's old exe. A copy
+/// that may not update does neither: nothing is left behind.
 pub fn start(repaint: impl Fn() + Send + 'static) {
+    if !allowed() {
+        return;
+    }
     std::thread::spawn(move || {
         let _ = fs::remove_file(installer_path());
         if let Ok(exe) = std::env::current_exe() {
@@ -172,6 +197,11 @@ pub fn start(repaint: impl Fn() + Send + 'static) {
 
 /// "Check for updates": checks now, whatever the setting, and says what it found in `status`.
 pub fn check_now(repaint: impl Fn() + Send + 'static) {
+    if !allowed() {
+        *STATUS.lock().unwrap() = Some(UPDATE_CHECK_OFF.into());
+        repaint();
+        return;
+    }
     if CHECKING.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -220,7 +250,13 @@ pub fn download(inst: Installer, repaint: impl Fn() + Send + 'static) -> Shared 
         Ok(exe) if !installed() => beside(&exe, "new"),
         _ => installer_path(),
     };
-    obs_install::spawn(move |p| fetch(&inst, &dest, p), repaint)
+    obs_install::spawn(
+        move |p| {
+            anyhow::ensure!(allowed(), "{UPDATE_CHECK_OFF}");
+            fetch(&inst, &dest, p)
+        },
+        repaint,
+    )
 }
 
 /// Puts the downloaded update in place; the app must quit right after. Installed: the installer
@@ -228,6 +264,9 @@ pub fn download(inst: Installer, repaint: impl Fn() + Send + 'static) -> Shared 
 /// running, is parked beside it and deleted for good at the next start) and is started once this
 /// copy has quit.
 pub fn apply() -> std::io::Result<()> {
+    if !allowed() {
+        return Err(std::io::Error::other(UPDATE_CHECK_OFF));
+    }
     if installed() {
         return run_installer();
     }
@@ -253,22 +292,12 @@ fn fetch(inst: &Installer, dest: &Path, p: &Shared) -> anyhow::Result<()> {
         const FILE_SHARE_READ: u32 = 1;
         File::options().write(true).create(true).truncate(true).share_mode(FILE_SHARE_READ).open(dest)?
     };
-    let mut resp = obs_install::get(&inst.url, Duration::from_secs(3600))?;
-    let mut reader = resp.body_mut().as_reader();
-    let mut hash = Sha256::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut done = 0u64;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])?;
-        hash.update(&buf[..n]);
-        done += n as u64;
-        obs_install::set(p, "Downloading", done, inst.size);
-    }
+    // Cancelled, stalled or cut off: the part that came is thrown away.
+    let downloaded = obs_install::get(&inst.url, None).map_err(anyhow::Error::from).and_then(|mut resp| obs_install::download_to(&mut resp.body_mut().as_reader(), &mut file, p, "Downloading", inst.size));
     drop(file);
+    let hash = downloaded.inspect_err(|_| {
+        let _ = fs::remove_file(dest);
+    })?;
     let got = hex(hash);
     if got != inst.sha256 {
         let _ = fs::remove_file(dest);
@@ -347,6 +376,18 @@ mod tests {
 
     fn release(tag: &str) -> serde_json::Value {
         json!({ "tag_name": tag, "html_url": format!("https://github.com/ItsFlamme/replay-vault/releases/tag/{tag}"), "draft": false, "prerelease": false })
+    }
+
+    /// A release one test thread sets isn't seen by another, so one test's "Version X is out"
+    /// can't move another's sidebar mid-click.
+    #[test]
+    fn found_is_per_test_thread() {
+        let other = std::thread::spawn(|| {
+            set_found(newer_in(&release("v9.0.0"), "0.1.0"));
+            found().map(|n| n.version)
+        });
+        assert_eq!(other.join().unwrap(), Some("9.0.0".into()));
+        assert!(found().is_none());
     }
 
     #[test]

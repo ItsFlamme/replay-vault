@@ -1,6 +1,7 @@
 //! The hidden "recorder" OBS: our private copy in portable mode with its own config folder, so
 //! the user's own OBS install, profile and scenes are never touched.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -8,9 +9,9 @@ use std::process::Command;
 
 use serde_json::json;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, DeviceSel};
 use crate::display::{self, Monitor};
-use crate::{hotkey, log, obs_install};
+use crate::{devices, hotkey, log, obs_install};
 
 pub const PORT: u16 = 4466;
 const NAME: &str = "InstantReplay";
@@ -61,7 +62,34 @@ pub fn pick_monitor(all: &[Monitor], cfg: &Config) -> Option<Monitor> {
 /// Windows' SDR brightness (nits) when the recorded monitor has HDR on; when following the
 /// mouse, that of any HDR monitor, since the capture may land on it.
 fn hdr_white(cfg: &Config, mon: &Monitor) -> Option<u32> {
-    if cfg.follows_mouse() { display::list().iter().find_map(|m| m.hdr) } else { mon.hdr }
+    hdr_white_of(cfg, mon, display::list)
+}
+
+/// `hdr_white`, with `all` giving every monitor when it's needed.
+fn hdr_white_of(cfg: &Config, mon: &Monitor, all: impl FnOnce() -> Vec<Monitor>) -> Option<u32> {
+    if cfg.follows_mouse() { all().iter().find_map(|m| m.hdr) } else { mon.hdr }
+}
+
+/// What the recorder's settings take from the monitors, for `cfg`: the recorded monitor, its
+/// size, its refresh rate when the clips use it, and the HDR white level. A display change that
+/// leaves this as it was needs no recorder restart.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayKey {
+    id: String,
+    size: (u32, u32),
+    hz: Option<u32>,
+    hdr: Option<u32>,
+}
+
+/// The `DisplayKey` of `cfg` on monitors `all`; None with no monitor at all.
+pub fn display_key(cfg: &Config, all: &[Monitor]) -> Option<DisplayKey> {
+    let mon = pick_monitor(all, cfg)?;
+    Some(DisplayKey {
+        hdr: hdr_white_of(cfg, &mon, || all.to_vec()),
+        hz: (cfg.fps == 0).then_some(mon.hz),
+        size: (mon.width, mon.height),
+        id: mon.id,
+    })
 }
 
 /// Copies the main OBS's version stamps so the hidden copy never shows "What's new" dialogs. Only
@@ -288,7 +316,11 @@ pub fn write_config(cfg: &Config) -> anyhow::Result<()> {
     // Version stamps stop "what's new" dialogs: our private copy knows its own version (its
     // version.txt); without it, the user's main OBS settings are only read for theirs.
     let private_stamp = obs_install::private_version().and_then(|v| obs_install::last_version_stamp(&v));
-    log::write(&write_files(cfg, &portable_root(&exe), &mon, &main_root, private_stamp)?);
+    // Asked here, on the recorder's thread, each time it starts: the default can change any time.
+    let defaults = devices::defaults();
+    // A mic muted with its key starts muted, so no unmuted moment lands in the replay.
+    let mic_muted = crate::obs::MIC_MUTED.load(std::sync::atomic::Ordering::Relaxed);
+    log::write(&write_files(cfg, &portable_root(&exe), &mon, &main_root, private_stamp, &defaults, mic_muted)?);
     Ok(())
 }
 
@@ -345,9 +377,55 @@ fn encoder_settings(gpu: Gpu, cfg: &Config, kbps: u64) -> (&'static str, serde_j
     (encoder, enc_settings)
 }
 
+/// OBS's version stamp (`obs_install::last_version_stamp`) of 30.2, the first with hybrid MP4.
+const HYBRID_MP4_FROM: u64 = 30 << 24 | 2 << 16;
+
+/// The container of full recordings (`RecFormat2`) for our private OBS, by its version stamp.
+/// Hybrid MP4 stays playable if the recorder, the app or the PC stops mid-recording, and becomes
+/// a normal MP4 when the recording ends. OBS before 30.2 doesn't know the name and would take it
+/// as the file extension, for replays too, with no muxer for it; an unknown version gets plain MP4
+/// for that reason. Fragmented MP4 is no fallback: OBS hands its muxer flags to the replay buffer
+/// as well, which would change every clip. With hybrid MP4, replays stay plain MP4 from the replay
+/// buffer's own muxer.
+fn rec_format(obs_stamp: Option<u64>) -> &'static str {
+    if obs_stamp.is_some_and(|s| s >= HYBRID_MP4_FROM) { "hybrid_mp4" } else { "mp4" }
+}
+
+/// A scene item that fits its source into the `w` x `h` canvas whatever its size: OBS's "scale to
+/// inner bounds" (bounds_type 2) keeps the aspect ratio and never stretches or crops, and
+/// bounds_align 0 centres it, so a picture of another shape gets even bars (a 4:3 game on a 16:9
+/// canvas at the sides, an ultrawide one above and below). The bounds' top-left corner (align 5)
+/// is the canvas's. A monitor whose size changed, the one under the mouse, or a game at its own
+/// resolution all fill the clip this way, and the clip's size never changes.
+fn fit_to_canvas(name: &str, w: u32, h: u32) -> serde_json::Value {
+    json!({
+        "name": name, "visible": true, "pos": { "x": 0, "y": 0 }, "scale": { "x": 1, "y": 1 }, "align": 5,
+        "bounds_type": 2, "bounds_align": 0, "bounds": { "x": w, "y": h },
+    })
+}
+
+/// The sound devices to record, with the tracks (OBS mixers, bit 0 = track 1) each goes on: those
+/// on any of the first `n` tracks. A device that Windows uses as the default right now (`defaults`)
+/// and that is also ticked as the "default" one would be recorded twice, its sound doubled: it's
+/// left out and its tracks go to "default" too, which records the same device. "default" is the one
+/// kept as it follows the sound to whichever device is the default when the recorder next starts.
+fn device_sources<'a>(devices: &'a BTreeMap<String, DeviceSel>, n: usize, defaults: &devices::Defaults) -> Vec<(&'a str, &'a DeviceSel, u32)> {
+    let mixers = |d: &DeviceSel| -> u32 { (0..n).filter(|&i| d.tracks[i]).map(|i| 1 << i).sum() };
+    let mut out: Vec<(&str, &DeviceSel, u32)> = devices.iter().map(|(k, d)| (k.as_str(), d, mixers(d))).filter(|s| s.2 != 0).collect();
+    for (kind, id) in [("out", &defaults.out), ("in", &defaults.mic)] {
+        let Some(id) = id else { continue };
+        let (default_key, same_key) = (format!("{kind}:default"), format!("{kind}:{id}"));
+        let (Some(at), Some(same)) = (out.iter().position(|s| s.0 == default_key), out.iter().position(|s| s.0 == same_key)) else { continue };
+        out[at].2 |= out[same].2;
+        out.remove(same);
+    }
+    out
+}
+
 /// Writes the recorder's settings, profile and scene collection under `root`. Returns the
-/// encoder line for the app log.
-fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, private_stamp: Option<u64>) -> anyhow::Result<String> {
+/// encoder line for the app log. `private_stamp` is our private OBS's version stamp, if known;
+/// `defaults` are Windows' default sound devices now; `mic_muted` starts the mics muted.
+fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, private_stamp: Option<u64>, defaults: &devices::Defaults, mic_muted: bool) -> anyhow::Result<String> {
     let profile = root.join(r"basic\profiles").join(NAME);
     fs::create_dir_all(&profile)?;
     fs::create_dir_all(root.join(r"basic\scenes"))?;
@@ -375,7 +453,10 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
     });
     fs::write(root.join(r"plugin_config\obs-websocket\config.json"), ws.to_string())?;
 
-    let Plan { base_w, base_h, out_w, out_h, fps, kbps, mb, .. } = plan(cfg, mon);
+    let Plan { base_w, base_h, out_w, out_h, fps, kbps, mb, fits_secs, .. } = plan(cfg, mon);
+    // A length past what fits in the memory cap (settings saved before the cap, or another PC's) is
+    // kept as long as fits, so the replay time OBS is told matches what it can hold.
+    let secs = fits_secs.map_or(cfg.buffer_secs, |s| s.min(cfg.buffer_secs));
     let (encoder, enc_settings) = encoder_settings(gpu(), cfg, kbps);
     let summary = format!("Encoder: {} ({encoder}), {out_w}x{out_h} at {fps} fps, {kbps} kbps.", gpu().label());
     let mask = track_mask(cfg.track_count);
@@ -389,14 +470,15 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
     let hdr = hdr_white(cfg, mon)
         .map(|nits| format!("ColorFormat=NV12\nColorSpace=709\nColorRange=Partial\nSdrWhiteLevel={}\n", nits.clamp(80, 480)))
         .unwrap_or_default();
+    let rec_format = rec_format(private_stamp);
     let basic = format!(
         "[General]\nName={NAME}\n\n[Output]\nMode=Advanced\nFilenameFormatting={name_format}\n\n\
-         [AdvOut]\nRecType=Standard\nRecFilePath={folder}\nRecFormat2=mp4\nRecEncoder={encoder}\nRecRBPrefix=\n\
+         [AdvOut]\nRecType=Standard\nRecFilePath={folder}\nRecFormat2={rec_format}\nRecEncoder={encoder}\nRecRBPrefix=\n\
          RecTracks={mask}\nRecRB=true\nRecRBTime={}\nRecRBSize={mb}\nRecAudioEncoder=ffmpeg_aac\n\
          Track1Bitrate=192\nTrack2Bitrate=192\nTrack3Bitrate=192\nTrack4Bitrate=192\nTrack5Bitrate=192\nTrack6Bitrate=192\n\n\
          [Video]\nBaseCX={base_w}\nBaseCY={base_h}\nOutputCX={out_w}\nOutputCY={out_h}\nFPSType=1\nFPSInt={fps}\n{hdr}\n\
          [Audio]\nSampleRate=48000\nChannelSetup=Stereo\n",
-        cfg.buffer_secs
+        secs
     );
     // OBS itself listens for the save hotkey, so this app never watches the keyboard for it.
     let binding = hotkey::Combo::parse(&cfg.hotkey).and_then(|c| c.obs_binding());
@@ -412,15 +494,7 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
         "name": "Screen", "id": "monitor_capture", "versioned_id": "monitor_capture",
         "settings": { "monitor_id": mon.id, "capture_cursor": true },
     })];
-    let mut items = vec![json!({ "name": "Screen", "visible": true })];
-    // Following the mouse switches the capture to monitors of other sizes; scale each to fit
-    // the canvas (OBS "scale to inner bounds", centred), so the clip size never changes.
-    if cfg.follows_mouse() {
-        items[0] = json!({
-            "name": "Screen", "visible": true, "pos": { "x": 0, "y": 0 }, "scale": { "x": 1, "y": 1 }, "align": 5,
-            "bounds_type": 2, "bounds_align": 0, "bounds": { "x": base_w, "y": base_h },
-        });
-    }
+    let mut items = vec![fit_to_canvas("Screen", base_w, base_h)];
     // Game capture mode: OBS hooks into whatever fullscreen game runs and draws it over the
     // screen capture, which still shows whenever no game is hooked. Off unless the user picks it.
     if cfg.capture == "game" {
@@ -428,7 +502,7 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
             "name": "Game", "id": "game_capture", "versioned_id": "game_capture",
             "settings": { "capture_mode": "any_fullscreen", "capture_cursor": true, "anti_cheat_hook": true },
         }));
-        items.push(json!({ "name": "Game", "visible": true }));
+        items.push(fit_to_canvas("Game", base_w, base_h));
     }
     let n = cfg.tracks();
     let unique =|items: &[serde_json::Value], mut name: String| {
@@ -439,11 +513,7 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
     };
     // With "Only these apps", the playback devices only say which tracks the apps go on.
     let mut app_mixers = 0;
-    for (key, dev) in &cfg.devices {
-        let mixers: u32 = (0..n).filter(|&i| dev.tracks[i]).map(|i| 1 << i).sum();
-        if mixers == 0 {
-            continue;
-        }
+    for (key, dev, mixers) in device_sources(&cfg.devices, n, defaults) {
         let (kind, id) = match key.split_once(':') {
             Some(("in", id)) => ("wasapi_input_capture", id),
             Some(_) if cfg.only_apps => {
@@ -468,6 +538,10 @@ fn write_files(cfg: &Config, root: &Path, mon: &Monitor, main_root: &Path, priva
                 "name": "Noise Suppression", "id": "noise_suppress_filter", "versioned_id": "noise_suppress_filter_v2",
                 "enabled": true, "settings": { "method": cfg.noise },
             }]);
+        }
+        // OBS loads a source muted when its saved state says so (obs::set_mics mutes them all alike).
+        if mono && mic_muted {
+            source["muted"] = json!(true);
         }
         sources.push(source);
         items.push(json!({ "name": name, "visible": true }));
@@ -547,18 +621,76 @@ pub fn is_running() -> bool {
     saved_pid().is_some_and(pid_alive)
 }
 
-/// Every running hidden recorder, including strays left by a crash or an older build. Matched
-/// by the launch flags only this app uses, so the user's own OBS is never picked up.
+/// The private OBS folder (`obs-studio`) of every recorder this process started, so one started
+/// before the user moved the private OBS in setup is still stopped.
+static LAUNCHED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// The `obs-studio` folder that holds `<obs-studio>\bin\64bit\obs64.exe`, or None if the path is too short.
+fn obs_dir_of(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors().nth(3).filter(|d| !d.as_os_str().is_empty()).map(Path::to_path_buf)
+}
+
+/// This copy's running hidden recorders, including strays left by a crash or an older build of
+/// it. Matched by the launch flags only this app uses, so the user's own OBS is never picked up,
+/// and by an exe inside this copy's own private OBS folder (`obs-studio`, not the whole install
+/// folder, which could hold another copy's), so another copy's recorder never is. A process whose
+/// exe path can't be read isn't matched. Empty if the query fails.
 fn all_recorders() -> Vec<u32> {
-    let script = "Get-CimInstance Win32_Process -Filter \"Name='obs64.exe'\" | Where-Object { \
+    let script = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+                  Get-CimInstance Win32_Process -Filter \"Name='obs64.exe'\" | Where-Object { \
                   $_.CommandLine -match '--portable' -and $_.CommandLine -match '--multi' -and \
-                  $_.CommandLine -match '--startreplaybuffer' } | ForEach-Object { $_.ProcessId }";
-    Command::new(windows_exe("powershell.exe"))
+                  $_.CommandLine -match '--startreplaybuffer' } | ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }";
+    let Ok(out) = Command::new(windows_exe("powershell.exe"))
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect())
-        .unwrap_or_default()
+    else {
+        return Vec::new();
+    };
+    let mut roots = vec![obs_install::private_dir()];
+    roots.extend(LAUNCHED_DIRS.lock().unwrap().iter().cloned());
+    parse_recorders(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .filter(|(_, exe)| roots.iter().any(|r| is_ours(exe, r)))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// The "pid|exe path" lines `all_recorders` asks PowerShell for. Lines without a number before
+/// the bar are skipped; the path may be empty (Windows wouldn't say).
+fn parse_recorders(out: &str) -> Vec<(u32, String)> {
+    out.lines()
+        .filter_map(|l| {
+            let (pid, exe) = l.trim().split_once('|')?;
+            Some((pid.trim().parse().ok()?, exe.trim().to_string()))
+        })
+        .collect()
+}
+
+/// `exe` is inside `root`, by its path as written or, where both exist, by their real paths (so
+/// an 8.3 short name or another spelling of the same folder still counts).
+fn is_ours(exe: &str, root: &Path) -> bool {
+    if exe.is_empty() {
+        return false;
+    }
+    let real = |p: &Path| fs::canonicalize(p).ok().map(|p| p.to_string_lossy().into_owned());
+    under_root(exe, &root.to_string_lossy())
+        || real(Path::new(exe)).zip(real(root)).is_some_and(|(e, r)| under_root(&e, &r))
+}
+
+/// `exe` is a path inside the folder `root`: ignoring case, `/` or `\`, a trailing slash and the
+/// `\\?\` prefix, and only on a whole folder name (`C:\obs` doesn't hold `C:\obs2\obs64.exe`).
+fn under_root(exe: &str, root: &str) -> bool {
+    fn norm(p: &str) -> String {
+        let p = p.trim().replace('/', "\\");
+        let p = match p.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => format!(r"\\{rest}"),
+            None => p.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(p),
+        };
+        p.trim_end_matches('\\').to_lowercase()
+    }
+    let (exe, root) = (norm(exe), norm(root));
+    !root.is_empty() && exe.strip_prefix(&root).is_some_and(|rest| rest.starts_with('\\'))
 }
 
 /// The running recorder's WebSocket password, so `stop` can reach it to finish a recording.
@@ -572,6 +704,7 @@ pub async fn finish_recording(c: &obws::Client) -> anyhow::Result<Option<String>
         return Ok(None);
     }
     let path = c.recording().stop().await?;
+    recording_stopped(&path);
     // OBS answers before it has closed the file; it's done once the recording shows as stopped.
     for _ in 0..40 {
         if !c.recording().status().await.is_ok_and(|s| s.active) {
@@ -604,12 +737,130 @@ fn finish_recording_now() {
     }
 }
 
-/// Stops the hidden recorder(s), after finishing a full recording if one is running. Safe to
+/// The clips folder the running recorder saves into (`RecFilePath`); replays saved during a full
+/// recording land in its Recordings folder.
+static OUTPUT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+/// When the app last asked the recorder to save a replay that hasn't landed yet.
+static SAVE_ASKED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+/// The full recording the recorder last stopped, and when: OBS can still be writing its end for a
+/// moment after it says the recording stopped.
+static LAST_RECORDING: std::sync::Mutex<Option<(PathBuf, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// A save asked this long ago that never landed has failed (obs.rs says so after 10 s).
+const SAVE_PENDING_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+/// Videos created or changed this recently may still be being written. A replay save writes for
+/// seconds, a long one on a slow disk for a minute or two.
+const RECENT: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long `stop` waits for a save or a recording's end to be written before it closes the
+/// recorder anyway. Long enough for a few minutes of replay (1 to 3 GB) to land on an SSD, short
+/// enough that quitting never feels stuck, and well inside what Windows allows at shutdown.
+pub const SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The app asked the recorder to save a replay (the Save button, or a noticed save key).
+pub fn save_asked() {
+    *SAVE_ASKED.lock().unwrap() = Some(std::time::Instant::now());
+}
+
+/// The recorder reported a saved replay, or the save request failed: nothing is on its way.
+pub fn save_done() {
+    *SAVE_ASKED.lock().unwrap() = None;
+}
+
+/// A full recording was just stopped; `wait_for_writes` makes sure its file is closed.
+pub fn recording_stopped(path: &str) {
+    *LAST_RECORDING.lock().unwrap() = Some((PathBuf::from(path), std::time::Instant::now()));
+}
+
+/// Waits (up to `cap`) until nothing the recorder writes is still being written: no replay save the
+/// app asked for is still on its way, and every recent video in the clips folder and its Recordings
+/// folder, and the full recording last stopped, is closed by its writer and the same size twice in
+/// a row. Covers saves from OBS's own save key, which the app may not know about. Only files from
+/// the last few minutes are looked at, so a big clips folder costs one folder listing per look.
+/// Returns false, and logs it, if `cap` ran out first. Call before closing the recorder.
+pub fn wait_for_writes(cap: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    let dirs: Vec<PathBuf> = OUTPUT.lock().unwrap().iter().flat_map(|f| [f.clone(), f.join("Recordings")]).collect();
+    let files: Vec<PathBuf> = LAST_RECORDING.lock().unwrap().iter().filter(|(_, at)| at.elapsed() < RECENT).map(|(p, _)| p.clone()).collect();
+    let pending = || SAVE_ASKED.lock().unwrap().is_some_and(|at| at.elapsed() < SAVE_PENDING_FOR);
+    let done = wait_until_written(&dirs, &files, pending, cap);
+    let waited = started.elapsed().as_secs_f32();
+    if !done {
+        log::write(&format!("A clip or recording was still being written after {waited:.0} s; closing the recorder anyway."));
+    } else if waited >= 0.5 {
+        log::write(&format!("Waited {waited:.1} s for a clip or recording to finish writing before closing the recorder."));
+    }
+    done
+}
+
+/// `wait_for_writes` on given folders and files, with `pending` saying whether a save the app asked
+/// for is still on its way. Looks every 250 ms.
+fn wait_until_written(dirs: &[PathBuf], files: &[PathBuf], pending: impl Fn() -> bool, cap: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    let mut before: Option<Vec<(PathBuf, u64)>> = None;
+    loop {
+        let since = std::time::SystemTime::now().checked_sub(RECENT).unwrap_or(std::time::UNIX_EPOCH);
+        let mut paths: Vec<PathBuf> = dirs.iter().flat_map(|d| recent_videos(d, since)).collect();
+        paths.extend(files.iter().cloned());
+        paths.sort();
+        paths.dedup();
+        // Sizes from the file itself: the folder listing's can lag while it's open.
+        let now: Vec<(PathBuf, u64)> = paths.into_iter().filter_map(|p| fs::metadata(&p).ok().map(|m| (p, m.len()))).collect();
+        // Nothing recent: no second look needed.
+        let settled = now.is_empty() || before.as_ref().is_some_and(|b| !still_writing(b, &now, held_for_writing));
+        if settled && !pending() {
+            return true;
+        }
+        if started.elapsed() >= cap {
+            return false;
+        }
+        before = Some(now);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Videos directly in `dir` created or changed at or after `since`, by the folder listing alone
+/// (no file is opened). The listing's times can lag for a file still open, so creation counts too.
+fn recent_videos(dir: &Path, since: std::time::SystemTime) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| ["mp4", "mkv", "mov"].iter().any(|v| x.eq_ignore_ascii_case(v))))
+        .filter(|e| e.metadata().is_ok_and(|m| m.is_file() && [m.created(), m.modified()].into_iter().flatten().any(|t| t >= since)))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Whether a file may still be being written, from two looks at the recent videos (`before`, then
+/// `now`, each a path and its size): one is new since the last look, changed size, or `held` says
+/// a writer still has it open.
+fn still_writing(before: &[(PathBuf, u64)], now: &[(PathBuf, u64)], held: impl Fn(&Path) -> bool) -> bool {
+    now.iter().any(|(p, len)| !before.iter().any(|(b, l)| b == p && l == len) || held(p))
+}
+
+/// Whether another program has `path` open for writing. OBS's writers (ffmpeg's muxer and the
+/// hybrid MP4 writer) let others read and even write, so a plain open always works; asking to be
+/// the only writer fails while any writer has it open. Readers (Explorer, thumbnails) don't count.
+/// The handle is closed at once; a missing file or any other error counts as not held.
+pub fn held_for_writing(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_DELETE: u32 = 4;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE).open(path) {
+        Ok(_) => false,
+        Err(e) => e.raw_os_error() == Some(ERROR_SHARING_VIOLATION),
+    }
+}
+
+/// Stops this copy's hidden recorder(s), after finishing a full recording if one is running and
+/// waiting (up to `SAVE_WAIT`) for a replay save or the recording's end to be written. Safe to
 /// kill then: OBS skips its crash check for `--multi` copies.
-/// Only processes launched with our flags are killed: a saved PID alone could by now belong to the
-/// user's own OBS (Windows reuses PIDs).
+/// Only processes launched with our flags from this copy's own private OBS folder are killed
+/// (`all_recorders`): a saved PID alone could by now belong to the user's own OBS (Windows reuses
+/// PIDs), and another copy of the app (a portable one) has its own recorder that isn't ours to stop.
 pub fn stop() {
     finish_recording_now();
+    wait_for_writes(SAVE_WAIT);
     for pid in all_recorders() {
         let _ = Command::new(windows_exe("taskkill.exe"))
             .args(["/PID", &pid.to_string(), "/F"])
@@ -629,6 +880,7 @@ pub fn restart(cfg: &Config) -> anyhow::Result<()> {
         log::write(&format!("Couldn't set the recorder's graphics preference: {e:#}"));
     }
     *PASSWORD.lock().unwrap() = cfg.recorder_password.clone();
+    *OUTPUT.lock().unwrap() = Some(PathBuf::from(&cfg.folder));
     let front = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
     let child = Command::new(&exe)
         .args(["--portable", "--multi", "--minimize-to-tray", "--startreplaybuffer", "--disable-updater"])
@@ -636,6 +888,12 @@ pub fn restart(cfg: &Config) -> anyhow::Result<()> {
         // Always as a normal user, even if a compatibility setting asks for admin, so the app can stop it.
         .env("__COMPAT_LAYER", "RunAsInvoker")
         .spawn()?;
+    if let Some(dir) = obs_dir_of(&exe) {
+        let mut launched = LAUNCHED_DIRS.lock().unwrap();
+        if !launched.contains(&dir) {
+            launched.push(dir);
+        }
+    }
     let _ = tie_to_app(&child);
     keep_focus(front, child.id());
     PID.store(child.id(), std::sync::atomic::Ordering::Relaxed);
@@ -710,7 +968,7 @@ pub fn lighter_effort(effort: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::config::{AppSel, DeviceSel};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// A trimmed OBS (`obs_install::prune`) really records: a copy of OBS at `RV_OBS_COPY` (its
     /// obs-studio folder, a throwaway copy) is trimmed, started on port 4477 with this app's settings, saves a clip
@@ -729,7 +987,7 @@ mod tests {
         let root = copy.join(r"config\obs-studio");
         let _ = fs::remove_dir_all(root.join("logs"));
         let mon = chosen_monitor(&cfg).expect("a monitor");
-        println!("{}", write_files(&cfg, &root, &mon, &copy.join("no-main-obs"), obs_install::last_version_stamp("33.0.1")).unwrap());
+        println!("{}", write_files(&cfg, &root, &mon, &copy.join("no-main-obs"), obs_install::last_version_stamp("33.0.1"), &devices::defaults(), false).unwrap());
         let ws = root.join(r"plugin_config\obs-websocket\config.json");
         let mut json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&ws).unwrap()).unwrap();
         json["server_port"] = serde_json::json!(4477);
@@ -784,10 +1042,20 @@ mod tests {
     /// Writes the recorder files into a fresh temp folder (never the real OBS config) and
     /// returns basic.ini and the scene collection.
     fn written(tag: &str, cfg: &mut Config, mon: &Monitor) -> (String, serde_json::Value) {
+        written_for(tag, cfg, mon, None)
+    }
+
+    /// `written` for a private OBS of version `obs` ("33.0.1"), or of an unknown version.
+    fn written_for(tag: &str, cfg: &mut Config, mon: &Monitor, obs: Option<&str>) -> (String, serde_json::Value) {
+        written_with(tag, cfg, mon, obs, &devices::Defaults::default(), false)
+    }
+
+    /// `written_for` with Windows' default sound devices as `defaults`.
+    fn written_with(tag: &str, cfg: &mut Config, mon: &Monitor, obs: Option<&str>, defaults: &devices::Defaults, mic_muted: bool) -> (String, serde_json::Value) {
         let root = std::env::temp_dir().join(format!("replay-vault-recorder-test-{tag}"));
         let _ = fs::remove_dir_all(&root);
         cfg.folder = root.join("clips").display().to_string();
-        write_files(cfg, &root, mon, &root.join("main"), None).unwrap();
+        write_files(cfg, &root, mon, &root.join("main"), obs.and_then(obs_install::last_version_stamp), defaults, mic_muted).unwrap();
         let basic = fs::read_to_string(root.join(r"basic\profiles").join(NAME).join("basic.ini")).unwrap();
         let scene = fs::read_to_string(root.join(r"basic\scenes").join(format!("{NAME}.json"))).unwrap();
         let _ = fs::remove_dir_all(&root);
@@ -813,18 +1081,78 @@ mod tests {
         assert!(basic.contains("SdrWhiteLevel=480\n"));
     }
 
-    /// Following the mouse fits whichever monitor is captured into the canvas; not in game mode.
+    /// The screen, and in game mode the game, are always fitted into the canvas (scale to inner
+    /// bounds, centred, from the canvas's corner), following the mouse or not: a monitor or game of
+    /// another size or shape gets bars, never a crop, a stretch or an empty corner.
     #[test]
-    fn follow_the_mouse_fits_monitors_to_the_canvas() {
-        let mut cfg = Config { follow_mouse: true, ..Config::default() };
-        let (_, scene) = written("follow", &mut cfg, &test_monitor());
-        let screen = &scene["sources"][0]["settings"]["items"][0];
-        assert_eq!(screen["name"], "Screen");
-        assert_eq!((screen["bounds_type"].as_i64(), screen["bounds_align"].as_i64()), (Some(2), Some(0)));
-        assert_eq!((screen["bounds"]["x"].as_u64(), screen["bounds"]["y"].as_u64()), (Some(2560), Some(1440)));
-        cfg.capture = "game".into();
-        let (_, scene) = written("follow-game", &mut cfg, &test_monitor());
-        assert!(scene["sources"][0]["settings"]["items"][0].get("bounds_type").is_none());
+    fn captures_fit_the_canvas() {
+        let fitted = |item: &serde_json::Value, name: &str| {
+            assert_eq!(item["name"], name);
+            assert_eq!((item["bounds_type"].as_i64(), item["bounds_align"].as_i64(), item["align"].as_i64()), (Some(2), Some(0), Some(5)), "{item}");
+            assert_eq!((item["bounds"]["x"].as_u64(), item["bounds"]["y"].as_u64()), (Some(2560), Some(1440)));
+            assert_eq!((item["pos"]["x"].as_i64(), item["pos"]["y"].as_i64(), item["scale"]["x"].as_f64()), (Some(0), Some(0), Some(1.0)));
+        };
+        for (tag, follow, capture) in [("fit", false, "desktop"), ("fit-follow", true, "desktop"), ("fit-game", false, "game"), ("fit-follow-game", true, "game")] {
+            let mut cfg = Config { follow_mouse: follow, capture: capture.into(), ..Config::default() };
+            let (_, scene) = written(tag, &mut cfg, &test_monitor());
+            let items = scene["sources"][0]["settings"]["items"].as_array().unwrap().clone();
+            fitted(&items[0], "Screen");
+            if capture == "game" {
+                fitted(&items[1], "Game");
+            } else {
+                assert!(!items.iter().any(|i| i["name"] == "Game"), "{tag}");
+            }
+        }
+    }
+
+    /// Only what the recorder takes from the monitors counts as a change: another monitor's size
+    /// or name doesn't, the recorded one's size, its going away, or its HDR (any monitor's, when
+    /// following the mouse) does; its refresh rate only when the clips use it.
+    #[test]
+    fn display_changes_that_matter() {
+        let main = test_monitor();
+        let side = Monitor { id: "side".into(), primary: false, x: 2560, width: 1920, height: 1080, ..test_monitor() };
+        let cfg = Config::default();
+        let key = |cfg: &Config, all: &[Monitor]| display_key(cfg, all);
+        let before = key(&cfg, &[main.clone(), side.clone()]);
+        assert!(before.is_some());
+        assert_eq!(key(&cfg, &[main.clone(), Monitor { width: 1280, height: 720, name: "TV".into(), ..side.clone() }]), before);
+        assert_eq!(key(&cfg, std::slice::from_ref(&main)), before, "another monitor unplugged");
+        assert_ne!(key(&cfg, &[Monitor { width: 1920, height: 1080, ..main.clone() }, side.clone()]), before);
+        assert_ne!(key(&cfg, &[Monitor { hdr: Some(240), ..main.clone() }, side.clone()]), before);
+        assert_ne!(key(&cfg, &[Monitor { primary: true, ..side.clone() }]), before, "the recorded monitor unplugged");
+        assert_eq!(key(&cfg, &[]), None);
+        // Refresh rate: only when the clip frame rate follows it.
+        assert_eq!(key(&cfg, &[Monitor { hz: 60, ..main.clone() }]), key(&cfg, std::slice::from_ref(&main)));
+        let native = Config { fps: 0, ..Config::default() };
+        assert_ne!(key(&native, &[Monitor { hz: 60, ..main.clone() }]), key(&native, std::slice::from_ref(&main)));
+        // HDR on another monitor: only when the capture may land on it.
+        let hdr_side = [main.clone(), Monitor { hdr: Some(200), ..side.clone() }];
+        assert_eq!(key(&cfg, &hdr_side), before);
+        let follow = Config { follow_mouse: true, ..Config::default() };
+        assert_ne!(key(&follow, &hdr_side), key(&follow, &[main, side]));
+    }
+
+    /// Full recordings are hybrid MP4 on OBS 30.2 and later, plain MP4 on older or unknown OBS; the
+    /// rest of the recording and replay settings are the same either way.
+    #[test]
+    fn full_recordings_crash_safe_where_obs_can() {
+        let mut cfg = Config::default();
+        // [AdvOut] without the clips folder, which each test run has its own of.
+        let adv_out = |basic: &str| basic.split("[AdvOut]\n").nth(1).unwrap().split("\n\n").next().unwrap().lines().filter(|l| !l.starts_with("RecFilePath=")).collect::<Vec<_>>().join("\n");
+        let format_line = |basic: &str| adv_out(basic).lines().filter(|l| l.starts_with("RecFormat")).map(str::to_string).collect::<Vec<_>>();
+        let (hybrid, _) = written_for("hybrid", &mut cfg, &test_monitor(), Some("33.0.1"));
+        assert_eq!(format_line(&hybrid), ["RecFormat2=hybrid_mp4"]);
+        let (first, _) = written_for("hybrid-30.2", &mut cfg, &test_monitor(), Some("30.2.0"));
+        assert_eq!(format_line(&first), ["RecFormat2=hybrid_mp4"]);
+        for (tag, obs) in [("old", Some("30.1.2")), ("older", Some("29.1.3")), ("unknown", None), ("junk", Some("junk"))] {
+            let (plain, _) = written_for(tag, &mut cfg, &test_monitor(), obs);
+            assert_eq!(format_line(&plain), ["RecFormat2=mp4"], "{obs:?}");
+            assert_eq!(adv_out(&plain).replace("RecFormat2=mp4", "RecFormat2=hybrid_mp4"), adv_out(&hybrid), "only the format differs");
+            // No muxer flags: OBS would give them to the replay buffer too.
+            assert!(!plain.contains("RecMuxerCustom") && !plain.contains("movflags"));
+        }
+        assert!(!hybrid.contains("RecMuxerCustom") && !hybrid.contains("fragmented"));
     }
 
     #[test]
@@ -877,6 +1205,61 @@ mod tests {
         let (_, scene) = written("mono", &mut cfg, &test_monitor());
         assert_eq!(source(&scene, "wasapi_output_capture")[0]["flags"], 0);
         assert_eq!(source(&scene, "wasapi_input_capture")[0]["flags"], 2);
+    }
+
+    /// A headset ticked while it's also Windows' default, with "Default playback device" ticked
+    /// too, is recorded once, on both's tracks; the same for a mic. Another device isn't touched,
+    /// nor one that isn't the default, nor anything when Windows didn't say.
+    #[test]
+    fn default_device_recorded_once() {
+        let sel = |tracks: [bool; 6]| DeviceSel { name: String::new(), tracks };
+        let t = |bits: u8| std::array::from_fn::<bool, 6, _>(|i| bits & 1 << i != 0);
+        let mut devices = BTreeMap::new();
+        devices.insert("out:default".to_string(), sel(t(0b001)));
+        devices.insert("out:{headset}".to_string(), sel(t(0b010)));
+        devices.insert("out:{speakers}".to_string(), sel(t(0b001)));
+        devices.insert("out:{off}".to_string(), sel(t(0)));
+        devices.insert("in:default".to_string(), sel(t(0b001)));
+        devices.insert("in:{mic}".to_string(), sel(t(0b100)));
+        let keys = |s: &[(&str, &DeviceSel, u32)]| s.iter().map(|(k, _, m)| (k.to_string(), *m)).collect::<Vec<_>>();
+        let pairs = |p: &[(&str, u32)]| p.iter().map(|(k, m)| (k.to_string(), *m)).collect::<Vec<_>>();
+        let none = devices::Defaults::default();
+        assert_eq!(
+            keys(&device_sources(&devices, 3, &none)),
+            pairs(&[("in:default", 0b001), ("in:{mic}", 0b100), ("out:default", 0b001), ("out:{headset}", 0b010), ("out:{speakers}", 0b001)])
+        );
+        let both = devices::Defaults { out: Some("{headset}".into()), mic: Some("{mic}".into()) };
+        assert_eq!(keys(&device_sources(&devices, 3, &both)), pairs(&[("in:default", 0b101), ("out:default", 0b011), ("out:{speakers}", 0b001)]));
+        // Past the track count nothing is recorded, so nothing is folded.
+        assert_eq!(keys(&device_sources(&devices, 1, &both)), pairs(&[("in:default", 0b001), ("out:default", 0b001), ("out:{speakers}", 0b001)]));
+        // "default" not ticked: the device is recorded as itself.
+        devices.get_mut("out:default").unwrap().tracks = t(0);
+        assert_eq!(keys(&device_sources(&devices, 3, &both)), pairs(&[("in:default", 0b101), ("out:{headset}", 0b010), ("out:{speakers}", 0b001)]));
+
+        // In the scene: one playback source and one mic, on the tracks of both.
+        let mut cfg = Config { track_count: 3, devices: devices.clone(), ..Config::default() };
+        cfg.devices.get_mut("out:default").unwrap().tracks = t(0b001);
+        let (_, scene) = written_with("dedup", &mut cfg, &test_monitor(), None, &both, false);
+        let outs = source(&scene, "wasapi_output_capture");
+        assert_eq!(outs.iter().map(|s| (s["settings"]["device_id"].as_str().unwrap(), s["mixers"].as_u64().unwrap())).collect::<Vec<_>>(), [("default", 0b011), ("{speakers}", 0b001)]);
+        let mics = source(&scene, "wasapi_input_capture");
+        assert_eq!((mics.len(), mics[0]["settings"]["device_id"].as_str(), mics[0]["mixers"].as_u64()), (1, Some("default"), Some(0b101)));
+    }
+
+    /// A mic muted with its key is written muted, every mic alike, so a restarted recorder never
+    /// records a moment of it; playback isn't touched, and unmuted nothing says muted.
+    #[test]
+    fn muted_mic_starts_muted() {
+        let mut cfg = Config::default();
+        cfg.devices.insert("in:{usb}".into(), DeviceSel { name: "USB mic".into(), tracks: [true, false, false, false, false, false] });
+        let none = devices::Defaults::default();
+        let muted = |scene: &serde_json::Value, id: &str| source(scene, id).iter().map(|s| s.get("muted").and_then(|m| m.as_bool())).collect::<Vec<_>>();
+        let (_, scene) = written_with("unmuted", &mut cfg, &test_monitor(), None, &none, false);
+        assert_eq!(muted(&scene, "wasapi_input_capture"), [None, None]);
+        assert_eq!(muted(&scene, "wasapi_output_capture"), [None]);
+        let (_, scene) = written_with("muted", &mut cfg, &test_monitor(), None, &none, true);
+        assert_eq!(muted(&scene, "wasapi_input_capture"), [Some(true), Some(true)]);
+        assert_eq!(muted(&scene, "wasapi_output_capture"), [None]);
     }
 
     /// Only tracks with a mic and other sound count as mixed.
@@ -973,6 +1356,215 @@ mod tests {
         assert_eq!(lighter_effort(1), Some(2));
         assert_eq!(lighter_effort(2), None);
         assert_eq!(lighter_effort(7), None);
+    }
+
+    const INSTALLED: &str = r"C:\Users\You\AppData\Local\replay-vault\obs-studio";
+    const PORTABLE: &str = r"G:\Portable\Replay Vault\replay-vault-data\obs\obs-studio";
+
+    /// Each copy matches only the recorder in its own private OBS folder.
+    #[test]
+    fn recorder_matched_only_in_its_own_folder() {
+        let installed = format!(r"{INSTALLED}\bin\64bit\obs64.exe");
+        let portable = format!(r"{PORTABLE}\bin\64bit\obs64.exe");
+        assert!(under_root(&installed, INSTALLED) && under_root(&portable, PORTABLE));
+        assert!(!under_root(&portable, INSTALLED) && !under_root(&installed, PORTABLE));
+        // The user's own OBS.
+        assert!(!under_root(r"C:\Program Files\obs-studio\bin\64bit\obs64.exe", INSTALLED));
+    }
+
+    /// A copy installed at a drive root (its OBS in G:\obs-studio) and a portable copy further
+    /// down the same drive don't match each other's recorder.
+    #[test]
+    fn recorder_not_matched_in_a_nested_copy() {
+        let (installed, installed_exe) = (r"G:\obs-studio", r"G:\obs-studio\bin\64bit\obs64.exe");
+        let portable_exe = format!(r"{PORTABLE}\bin\64bit\obs64.exe");
+        assert!(!under_root(&portable_exe, installed) && !under_root(installed_exe, PORTABLE));
+        assert!(under_root(installed_exe, installed) && under_root(&portable_exe, PORTABLE));
+    }
+
+    /// The install folder itself (G:\) holds the portable copy's recorder, so only its obs-studio folder is matched.
+    #[test]
+    fn install_root_alone_would_match_another_copy() {
+        let portable_exe = format!(r"{PORTABLE}\bin\64bit\obs64.exe");
+        assert!(under_root(&portable_exe, r"G:\"));
+        assert!(!under_root(&portable_exe, &Path::new(r"G:\").join("obs-studio").to_string_lossy()));
+    }
+
+    /// `restart` remembers the obs-studio folder of the exe it ran.
+    #[test]
+    fn obs_dir_found_from_the_exe() {
+        assert_eq!(obs_dir_of(Path::new(&format!(r"{PORTABLE}\bin\64bit\obs64.exe"))), Some(PathBuf::from(PORTABLE)));
+        assert_eq!(obs_dir_of(Path::new(r"G:\obs-studio\bin\64bit\obs64.exe")), Some(PathBuf::from(r"G:\obs-studio")));
+        assert_eq!(obs_dir_of(Path::new(r"bin\64bit\obs64.exe")), None);
+        assert_eq!(obs_dir_of(Path::new(r"64bit\obs64.exe")), None);
+        assert_eq!(obs_dir_of(Path::new(r"C:\obs64.exe")), None);
+        assert_eq!(obs_dir_of(Path::new("")), None);
+    }
+
+    #[test]
+    fn recorder_path_spellings_match() {
+        let exe = r"g:/portable/REPLAY VAULT/replay-vault-data/OBS/OBS-Studio/bin/64bit/obs64.exe";
+        assert!(under_root(exe, PORTABLE));
+        assert!(under_root(exe, &format!(r"{PORTABLE}\")));
+        assert!(under_root(exe, r"G:/Portable/Replay Vault/replay-vault-data/obs/obs-studio//"));
+        assert!(under_root(&format!(r"\\?\{PORTABLE}\bin\64bit\obs64.exe"), PORTABLE));
+        assert!(under_root(&format!(r"{PORTABLE}\bin\64bit\obs64.exe"), &format!(r"\\?\{PORTABLE}")));
+        assert!(under_root(r"\\?\UNC\server\share\obs\obs-studio\bin\64bit\obs64.exe", r"\\server\share\obs\obs-studio"));
+        assert!(under_root(r"D:\obs-studio\bin\64bit\obs64.exe", r"D:\obs-studio\"));
+    }
+
+    #[test]
+    fn recorder_not_matched_in_a_sibling_folder_or_without_a_path() {
+        assert!(!under_root(r"C:\obs-studio2\bin\64bit\obs64.exe", r"C:\obs-studio"));
+        assert!(!under_root(r"C:\obs-studio.old\bin\64bit\obs64.exe", r"C:\obs-studio"));
+        assert!(!under_root(r"C:\obs-studio", r"C:\obs-studio"));
+        assert!(!under_root("", r"C:\obs"));
+        assert!(!under_root(r"C:\obs\obs64.exe", ""));
+        assert!(!under_root(r"C:\obs\obs64.exe", "  "));
+        assert!(!is_ours("", Path::new(INSTALLED)));
+    }
+
+    /// Real folders compare by their real paths, so another spelling of the same folder matches and
+    /// a sibling folder still doesn't.
+    #[test]
+    fn recorder_matched_by_real_path() {
+        let base = std::env::temp_dir().join(format!("replay-vault-roots-{}", std::process::id()));
+        let root = base.join(r"obs\obs-studio");
+        let exe = root.join(r"bin\64bit\obs64.exe");
+        let sibling = base.join(r"obs\obs-studio2\bin\64bit\obs64.exe");
+        for f in [&exe, &sibling] {
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, b"").unwrap();
+        }
+        let canonical = fs::canonicalize(&exe).unwrap();
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        assert!(is_ours(&canonical.to_string_lossy(), &root));
+        assert!(is_ours(&exe.to_string_lossy().to_uppercase(), &root));
+        // Only the real paths show this root holds the exe.
+        assert!(!under_root(&exe.to_string_lossy(), &base.join(r"obs\obs-studio2\..\obs-studio").to_string_lossy()));
+        assert!(is_ours(&exe.to_string_lossy(), &base.join(r"obs\obs-studio2\..\obs-studio")));
+        assert!(!is_ours(&sibling.to_string_lossy(), &root));
+        assert!(!is_ours(&fs::canonicalize(&sibling).unwrap().to_string_lossy(), &root));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn recorder_query_output_parsed() {
+        let out = "123|C:\\obs\\obs64.exe\r\n  456 | D:\\x y\\obs64.exe \r\n789|\r\n\r\nnot a pid|C:\\a\r\nWARNING: something\r\n12a|C:\\b\r\n|C:\\c\r\n";
+        assert_eq!(
+            parse_recorders(out),
+            vec![(123, r"C:\obs\obs64.exe".to_string()), (456, r"D:\x y\obs64.exe".to_string()), (789, String::new())]
+        );
+        assert!(parse_recorders("").is_empty());
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("replay-vault-writes-{tag}-{}", crate::config::random_hex()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A writer that blocks everyone else, and one that shares like OBS's writers do, both count as
+    /// holding the file; a reader doesn't, nor a closed or missing file.
+    #[test]
+    fn file_held_for_writing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp_dir("held");
+        let clip = dir.join("clip.mp4");
+        fs::write(&clip, b"x").unwrap();
+        assert!(!held_for_writing(&clip));
+        let only_me = fs::OpenOptions::new().write(true).share_mode(0).open(&clip).unwrap();
+        assert!(held_for_writing(&clip));
+        drop(only_me);
+        assert!(!held_for_writing(&clip));
+        // ffmpeg and OBS's hybrid MP4 writer open with every kind of sharing allowed.
+        let shared = fs::OpenOptions::new().write(true).share_mode(1 | 2 | 4).open(&clip).unwrap();
+        assert!(held_for_writing(&clip));
+        drop(shared);
+        let reader = fs::File::open(&clip).unwrap();
+        assert!(!held_for_writing(&clip), "a reader like Explorer's thumbnails doesn't count");
+        drop(reader);
+        assert!(!held_for_writing(&dir.join("gone.mp4")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Settled only when every recent file was there last time at the same size and nothing holds it.
+    #[test]
+    fn still_writing_from_two_looks() {
+        let p = |n: &str, len: u64| (PathBuf::from(n), len);
+        let free = |_: &Path| false;
+        let before = [p("a.mp4", 10), p("b.mp4", 20)];
+        assert!(!still_writing(&before, &before, free));
+        assert!(still_writing(&before, &[p("a.mp4", 10), p("b.mp4", 25)], free), "b grew");
+        assert!(still_writing(&before, &[p("a.mp4", 10), p("b.mp4", 20), p("c.mp4", 0)], free), "c is new");
+        assert!(!still_writing(&before, &[p("a.mp4", 10)], free), "b was moved away");
+        assert!(still_writing(&before, &before, |f: &Path| f == Path::new("b.mp4")), "b still open");
+        assert!(!still_writing(&[], &[], free));
+    }
+
+    /// Only videos from the last few minutes are looked at; old ones and other files aren't.
+    #[test]
+    fn only_recent_videos_looked_at() {
+        use std::os::windows::fs::FileTimesExt;
+        let dir = temp_dir("recent");
+        fs::write(dir.join("new.mp4"), b"x").unwrap();
+        fs::write(dir.join("notes.txt"), b"x").unwrap();
+        fs::create_dir(dir.join("VALORANT.mp4")).unwrap();
+        let old = dir.join("old.MKV");
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        let f = fs::File::create(&old).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(hour_ago).set_created(hour_ago)).unwrap();
+        drop(f);
+        let since = std::time::SystemTime::now() - RECENT;
+        assert_eq!(recent_videos(&dir, since), vec![dir.join("new.mp4")]);
+        assert!(recent_videos(&dir.join("missing"), since).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The wait ends once a save being written is closed, runs to the cap while it isn't or while a
+    /// save is still on its way, and costs nothing when nothing recent is there.
+    #[test]
+    fn waits_for_a_save_to_be_written() {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp_dir("wait");
+        let dirs = [dir.clone(), dir.join("Recordings")];
+        let t = Instant::now();
+        assert!(wait_until_written(&dirs, &[], || false, Duration::from_secs(5)));
+        assert!(t.elapsed() < Duration::from_millis(100), "nothing recent: no wait");
+
+        // A save written in pieces for about 0.6 s, shared like OBS's writers.
+        let clip = dir.join("2026-11-12 10-00-00.mp4");
+        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).share_mode(1 | 2 | 4).open(&clip).unwrap();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..6 {
+                f.write_all(&[0u8; 4096]).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let t = Instant::now();
+        assert!(wait_until_written(&dirs, &[], || false, Duration::from_secs(5)));
+        writer.join().unwrap();
+        assert!(t.elapsed() >= Duration::from_millis(400), "waited for the writer: {:?}", t.elapsed());
+
+        // Still held when the cap runs out.
+        let held = fs::OpenOptions::new().write(true).share_mode(1 | 2 | 4).open(&clip).unwrap();
+        let t = Instant::now();
+        assert!(!wait_until_written(&dirs, &[], || false, Duration::from_millis(600)));
+        assert!(t.elapsed() >= Duration::from_millis(600) && t.elapsed() < Duration::from_secs(2));
+        drop(held);
+        // A save asked for that hasn't landed holds the wait too, even with every file closed.
+        assert!(!wait_until_written(&dirs, &[], || true, Duration::from_millis(300)));
+        // A recording outside the folders, named as just stopped, counts as well.
+        let elsewhere = temp_dir("wait-recording");
+        let rec = elsewhere.join("old recording.mp4");
+        fs::write(&rec, b"x").unwrap();
+        let held = fs::OpenOptions::new().write(true).share_mode(1 | 2 | 4).open(&rec).unwrap();
+        assert!(!wait_until_written(&[], std::slice::from_ref(&rec), || false, Duration::from_millis(300)));
+        drop(held);
+        assert!(wait_until_written(&[], &[rec], || false, Duration::from_secs(2)));
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&elsewhere).unwrap();
     }
 
     /// A harmless hidden background process gets tied to this (test) process's kill-on-close job.

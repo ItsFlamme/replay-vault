@@ -15,12 +15,8 @@ impl App {
     /// Setup's first card: the save key and where clips go.
     pub(crate) fn setup_clips_card(&mut self, ui: &mut egui::Ui) {
         card(ui, "Your clips", |ui| {
-            form(ui, "setup_clips", |ui| {
-                ui.label("Save clip");
-                self.hotkey_button(ui, Target::Save, "Click, then press the keys you want. Works even in a game.", 0.0);
-                ui.end_row();
-
-                ui.label("Clips folder");
+            row(ui, "Save clip", |ui| self.hotkey_button(ui, Target::Save, "Click, then press the keys you want. Works even in a game.", 0.0));
+            row(ui, "Clips folder", |ui| {
                 if self.obs_exe.is_none() {
                     // Picked together with OBS's folder above, so setup has one Browse.
                     ui.add(egui::Label::new(RichText::new(&self.cfg.folder).color(pal().muted)).truncate())
@@ -28,8 +24,8 @@ impl App {
                 } else {
                     folder_field(ui, &mut self.cfg.folder, "");
                 }
-                ui.end_row();
             });
+            self.clips_folder_note(ui);
             self.check_conflicts();
             self.conflict_notes(ui, Some(Target::Save));
         });
@@ -78,7 +74,9 @@ impl App {
             _ => card(ui, "You're ready", |ui| {
                 ui.label(RichText::new(format!("Press {} in a game to save the last {}.", self.cfg.hotkey, mmss(self.cfg.buffer_secs))).size(16.0).strong());
                 ui.add_space(4.0);
-                ui.label(RichText::new(format!("{} opens or hides this window. Clips go to {}. You can change all of it later.", self.cfg.overlay_hotkey, self.cfg.folder)).color(pal().muted));
+                // The window key line only when there is one.
+                let key = if self.cfg.overlay_hotkey.is_empty() { String::new() } else { format!("{} opens or hides this window. ", self.cfg.overlay_hotkey) };
+                ui.label(RichText::new(format!("{key}Clips go to {}. You can change all of it later.", self.cfg.folder)).color(pal().muted));
                 ui.add_space(10.0);
                 self.startup_checkbox(ui);
             }),
@@ -95,11 +93,11 @@ impl App {
             match &self.imported {
                 Some(s) => status(ui, true, RichText::new(s).small(), accent_light(), 12.0),
                 None if ask => _ = ui.label("We found your own OBS settings. Use its video and sound setup here (resolution, frame rate, encoder, quality, sound devices and tracks)? Otherwise the recommended settings for this PC are used. Your OBS is only read, never changed."),
-                None => note(ui, "Use the resolution, frame rate, encoder and quality from your own OBS, and its sound devices and tracks. Your OBS is only read, never changed."),
+                None => {}
             };
             ui.add_space(4.0);
             let label = if ask { "Use my OBS settings" } else { "Import my OBS video and sound settings" };
-            if button(ui, label).on_hover_text("Copies your own OBS's video and sound setup. Your OBS isn't changed.").clicked() {
+            if button(ui, label).on_hover_text("Copies the resolution, frame rate, encoder and quality from your own OBS, and its sound devices and tracks. Your OBS is only read, never changed.").clicked() {
                 let s = obs_import::apply(&mut self.cfg, mon, &self.devices).unwrap_or_else(|| "Nothing usable was found in your OBS settings.".into());
                 log::write(&s);
                 self.imported = Some(s);
@@ -156,7 +154,10 @@ impl App {
                 // Where it goes: any drive, so it needn't take space on the system drive.
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Install to").color(pal().muted));
-                    if button(ui, "Browse").on_hover_text("Pick a drive or folder: the recorder goes in Replay Vault OBS and your clips in Replay Vault Clips, side by side").clicked()
+                    if cap(ui, crate::instance::current().obs_dir_allowed(), egui::Button::new("Browse"))
+                        .on_hover_text("Pick a drive or folder: the recorder goes in Replay Vault OBS and your clips in Replay Vault Clips, side by side")
+                        .on_disabled_hover_text(crate::instance::OBS_DIR_FIXED)
+                        .clicked()
                         && let Some(dir) = overlay::file_dialog().set_title("Where should OBS and your clips go?").pick_folder() {
                         new_dir = Some(dir.join("Replay Vault OBS").display().to_string());
                     }

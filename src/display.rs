@@ -186,6 +186,69 @@ fn friendly_names() -> Vec<(String, String)> {
         .collect()
 }
 
+/// What `look_again` compares: each monitor's id, size, refresh rate and HDR white level.
+type Shape = (String, u32, u32, u32, Option<u32>);
+
+fn shapes(mons: &[Monitor]) -> Vec<Shape> {
+    mons.iter().map(|m| (m.id.clone(), m.width, m.height, m.hz, m.hdr)).collect()
+}
+
+/// The monitors last seen by `look_again`, a change waiting for `changed`, and who to tell.
+struct Watch {
+    seen: Vec<Shape>,
+    changed: Option<Vec<Monitor>>,
+    tell: std::sync::Arc<dyn Fn() + Send + Sync>,
+}
+
+type Slot = std::sync::Mutex<Option<Watch>>;
+
+static WATCH: Slot = std::sync::Mutex::new(None);
+
+/// From now on, `look_again` keeps a change to the monitors since `now` for `changed` and calls
+/// `tell` (on its own thread).
+pub fn watch(now: &[Monitor], tell: impl Fn() + Send + Sync + 'static) {
+    watch_in(&WATCH, now, tell);
+}
+
+/// Lists the monitors again (a few ms, so off the UI thread) and, if `watch` was called and they
+/// changed since last seen, keeps them for `changed` and says so.
+pub fn look_again() {
+    look_again_in(&WATCH, list);
+}
+
+/// The monitors as they are now, if `look_again` found them changed since the last call.
+pub fn changed() -> Option<Vec<Monitor>> {
+    changed_in(&WATCH)
+}
+
+fn changed_in(slot: &Slot) -> Option<Vec<Monitor>> {
+    slot.lock().unwrap().as_mut().and_then(|w| w.changed.take())
+}
+
+fn watch_in(slot: &Slot, now: &[Monitor], tell: impl Fn() + Send + Sync + 'static) {
+    *slot.lock().unwrap() = Some(Watch { seen: shapes(now), changed: None, tell: std::sync::Arc::new(tell) });
+}
+
+/// `look_again` on `slot`, with `list` listing the monitors.
+fn look_again_in(slot: &Slot, list: impl FnOnce() -> Vec<Monitor>) {
+    if slot.lock().unwrap().is_none() {
+        return;
+    }
+    let now = list();
+    let tell = {
+        let mut watch = slot.lock().unwrap();
+        let Some(w) = watch.as_mut() else { return };
+        let shape = shapes(&now);
+        if shape == w.seen {
+            return;
+        }
+        w.seen = shape;
+        w.changed = Some(now);
+        w.tell.clone()
+    };
+    tell();
+}
+
 /// The monitor holding the desktop point (x, y), if any.
 pub fn at(mons: &[Monitor], x: i32, y: i32) -> Option<&Monitor> {
     mons.iter().find(|m| (m.x..m.x + m.width as i32).contains(&x) && (m.y..m.y + m.height as i32).contains(&y))
@@ -236,6 +299,34 @@ mod tests {
         assert_eq!(id(-1, 200), Some("left"));
         assert_eq!(id(-1920, 1279), Some("left"));
         assert_eq!(id(-5, 100), None);
+    }
+
+    /// Nothing is listed before `watch`; then a change from what it was given is kept once and
+    /// told, the same monitors again are no change, and a moved or renamed one isn't either.
+    #[test]
+    fn display_changes_kept_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SLOT: Slot = std::sync::Mutex::new(None);
+        let told = std::sync::Arc::new(AtomicU32::new(0));
+        let main = mon("main", 0, 0, 2560, 1440);
+        look_again_in(&SLOT, || panic!("listed before watch"));
+        assert!(changed_in(&SLOT).is_none());
+        let t = told.clone();
+        watch_in(&SLOT, std::slice::from_ref(&main), move || {
+            t.fetch_add(1, Ordering::Relaxed);
+        });
+        let told_now = || told.load(Ordering::Relaxed);
+        look_again_in(&SLOT, || vec![Monitor { name: "MAG274QRF".into(), x: 10, ..main.clone() }]);
+        assert!(changed_in(&SLOT).is_none() && told_now() == 0, "moved or named: no change");
+        let hdr = Monitor { hdr: Some(240), ..main.clone() };
+        look_again_in(&SLOT, || vec![hdr.clone()]);
+        assert_eq!(changed_in(&SLOT).map(|m| shapes(&m)), Some(shapes(std::slice::from_ref(&hdr))));
+        assert_eq!(told_now(), 1);
+        assert!(changed_in(&SLOT).is_none(), "taken");
+        look_again_in(&SLOT, || vec![hdr.clone()]);
+        assert!(changed_in(&SLOT).is_none() && told_now() == 1, "the same monitors again");
+        look_again_in(&SLOT, || vec![hdr.clone(), mon("side", 2560, 0, 1920, 1080)]);
+        assert_eq!(changed_in(&SLOT).map(|m| m.len()), Some(2), "one plugged in");
     }
 
     /// Windows reports an SDR brightness for a connected monitor, HDR on or not (80 to 480 nits

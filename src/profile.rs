@@ -106,12 +106,17 @@ pub fn apply(cfg: &mut Config, hw: &Hardware, mon: &Monitor) -> String {
             break;
         }
     }
-    // Game and desktop sound on track 1; the mic stays the user's choice.
-    let out = cfg
-        .devices
-        .entry("out:default".into())
-        .or_insert_with(|| DeviceSel { name: "Default playback device".into(), ..Default::default() });
-    out.tracks[0] = true;
+    // Game and desktop sound on track 1, unless a playback device is recorded already (a headset
+    // picked under More options): ticking the default one too could record it twice. The mic
+    // stays the user's choice.
+    let n = cfg.tracks();
+    if !cfg.devices.iter().any(|(k, d)| k.starts_with("out:") && d.tracks[..n].iter().any(|&t| t)) {
+        let out = cfg
+            .devices
+            .entry("out:default".into())
+            .or_insert_with(|| DeviceSel { name: "Default playback device".into(), ..Default::default() });
+        out.tracks[0] = true;
+    }
 
     let p = recorder::plan(cfg, mon);
     format!(
@@ -197,6 +202,28 @@ mod tests {
         assert_eq!((c.out_height, c.fps, c.quality), (0, 60, 1)); // native 1440p
         c.fps = 120;
         assert_eq!(preset_of(&c, &h, &m), None);
+    }
+
+    /// Recommended settings tick the default playback device only when no playback device is
+    /// recorded, so a headset picked by hand isn't recorded a second time through it.
+    #[test]
+    fn recommended_keeps_a_picked_playback_device() {
+        let (h, m) = (hw(Gpu::Nvidia, 8, 32), mon(2560, 1440));
+        let mut c = Config::default();
+        c.devices.clear();
+        apply(&mut c, &h, &m);
+        assert!(c.devices["out:default"].tracks[0], "nothing recorded: the default device");
+        c.devices.clear();
+        c.devices.insert("out:{headset}".into(), DeviceSel { name: "Headset".into(), tracks: [true, false, false, false, false, false] });
+        c.devices.insert("out:default".into(), DeviceSel { name: "Default playback device".into(), ..Default::default() });
+        apply(&mut c, &h, &m);
+        assert!(!c.devices["out:default"].tracks.iter().any(|&t| t));
+        assert!(c.devices["out:{headset}"].tracks[0]);
+        // A tick past the track count records nothing, so the default device is ticked.
+        c.devices.get_mut("out:{headset}").unwrap().tracks = [false, false, false, true, false, false];
+        c.track_count = 1;
+        apply(&mut c, &h, &m);
+        assert!(c.devices["out:default"].tracks[0]);
     }
 
     #[test]

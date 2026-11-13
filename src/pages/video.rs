@@ -25,6 +25,13 @@ pub(crate) fn plan_text(p: &recorder::Plan) -> String {
     format!("{}p at {} fps, about {} Mbps, up to {:.1} GB of memory", p.out_h, p.fps, p.kbps / 1000, p.mb as f64 / 1024.0)
 }
 
+/// The encoder effort choices, with what each one does.
+const EFFORTS: [(&str, &str); 3] = [
+    ("Best quality", "The encoder takes its time on every frame for the cleanest clips."),
+    ("Balanced", "Less work per frame and no extra GPU passes. A little more FPS when your GPU is maxed out; clips look slightly softer in fast motion."),
+    ("Max FPS", "The lightest encoding. The most FPS headroom; fast motion looks blockier at the same bitrate (raise Quality to make up for it)."),
+];
+
 impl App {
     /// The Video page's top card, and setup's second step: this PC, a quality choice scaled to
     /// it with what each one makes, Use recommended settings, and the screen when there's a choice.
@@ -46,14 +53,13 @@ impl App {
             }
             ui.add_space(8.0);
             ui.label(RichText::new("Quality").strong());
-            note(ui, "Each choice is scaled to what this PC handles well.");
             ui.add_space(2.0);
             egui::Grid::new("quality").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 for (i, name) in profile::PRESETS.into_iter().enumerate() {
                     let mut c = self.cfg.clone();
                     profile::set_preset(&mut c, &self.hw, mon, i);
                     let text = if i + 1 == profile::PRESETS.len() { format!("{name} (recommended)") } else { name.to_string() };
-                    chip(ui, &mut pick, Some(i), text).on_hover_text("Higher looks better but makes bigger files and uses more of the PC");
+                    chip(ui, &mut pick, Some(i), text).on_hover_text("Each choice is scaled to what this PC handles well. Higher looks better but makes bigger files and uses more of the PC.");
                     ui.label(RichText::new(plan_text(&recorder::plan(&c, mon))).color(pal().muted));
                     ui.end_row();
                 }
@@ -74,11 +80,7 @@ impl App {
             });
             if self.monitors.len() > 1 {
                 ui.add_space(6.0);
-                form(ui, "screen", |ui| {
-                    ui.label("Screen");
-                    monitor_combo(ui, &mut self.cfg, &self.monitors, "monitor", mon);
-                    ui.end_row();
-                });
+                row(ui, "Screen", |ui| monitor_combo(ui, &mut self.cfg, &self.monitors, "monitor", mon));
             }
         });
         if let Some(level) = pick.filter(|_| pick != current) {
@@ -115,7 +117,7 @@ impl App {
     /// A line when the recorded monitor (following the mouse: any monitor) has HDR on.
     pub(crate) fn hdr_note(&self, ui: &mut egui::Ui, mon: &display::Monitor) {
         if self.monitors.iter().any(|m| m.hdr.is_some() && (self.cfg.follows_mouse() || m.id == mon.id)) {
-            note(ui, "HDR monitor: clips are converted to normal colors.");
+            ui.label(RichText::new("HDR monitor: clips are converted to normal colors.").small().color(pal().muted));
         }
     }
 
@@ -133,78 +135,61 @@ impl App {
     /// and importing from your own OBS.
     pub(crate) fn video_more(&mut self, ui: &mut egui::Ui, mon: &display::Monitor) {
         card(ui, "Capture", |ui| {
-            form(ui, "capture", |ui| {
-                ui.label("Mode");
+            row(ui, "Mode", |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    chip(ui, &mut self.cfg.capture, "desktop".to_string(), "Desktop").on_hover_text("Records the whole screen. Safe with every anti-cheat.");
+                    chip(ui, &mut self.cfg.capture, "desktop".to_string(), "Desktop").on_hover_text("Records the whole monitor. Never touches the game, so it's safe with any anti-cheat. Popups and notifications on that monitor show up in clips.");
                     chip(ui, &mut self.cfg.capture, "game".to_string(), "Game capture").on_hover_text("Records just the game window. Some anti-cheats block it.");
                 });
-                ui.end_row();
-
-                ui.label("Resolution");
+            });
+            row(ui, "Resolution", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     chip(ui, &mut self.cfg.out_height, 0, format!("Native {}p", mon.height)).on_hover_text("Same size as your screen");
                     for h in [1440, 1080, 900, 720].into_iter().filter(|&h| h < mon.height) {
                         chip(ui, &mut self.cfg.out_height, h, format!("{h}p")).on_hover_text("Smaller video: smaller files, a little less sharp");
                     }
                 });
-                ui.end_row();
-
-                ui.label("Frame rate");
+            });
+            row(ui, "Frame rate", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for f in [30, 60, 120, 144, 240] {
                         chip(ui, &mut self.cfg.fps, f, f.to_string()).on_hover_text("Frames per second: higher is smoother, files get bigger");
                     }
                     chip(ui, &mut self.cfg.fps, 0, format!("Native {}", mon.hz)).on_hover_text("As smooth as your screen refreshes");
                 });
-                ui.end_row();
             });
             if self.cfg.capture == "game" {
                 ui.colored_label(pal().amber, "Game capture hooks into the game. Anti-cheats like Vanguard (Valorant), FACEIT or ESEA may block it or flag it. Use Desktop for those games.");
             } else {
-                note(ui, "Records the whole monitor. Never touches the game, so it's safe with any anti-cheat. Popups and notifications on that monitor show up in clips.");
+                ui.label(RichText::new("Popups and notifications on that monitor show up in clips.").small().color(pal().muted));
                 if self.monitors.len() > 1 {
-                    ui.checkbox(&mut self.cfg.follow_mouse, "Follow the mouse").on_hover_text("Records whichever monitor your mouse is on");
+                    ui.checkbox(&mut self.cfg.follow_mouse, "Follow the mouse")
+                        .on_hover_text("Records whichever monitor your mouse is on, switching about 2 seconds after it moves over. Clips keep one size; a monitor with another resolution is scaled to fit.");
                 }
             }
             self.hdr_note(ui, mon);
-            if self.cfg.follows_mouse() {
-                note(ui, "Follow the mouse: records the monitor your mouse is on, switching about 2 seconds after it moves over. Clips keep one size; a monitor with another resolution is scaled to fit.");
-            }
         });
         card(ui, "Encoding", |ui| {
-            form(ui, "encoding", |ui| {
-                ui.label("Bitrate");
+            row(ui, "Bitrate", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (i, q) in ["Highest", "High", "Medium", "Low"].into_iter().enumerate() {
                         chip(ui, &mut self.cfg.quality, i as u8, q).on_hover_text("Higher looks better and makes bigger files");
                     }
                 });
-                ui.end_row();
-
-                ui.label("Encoder");
+            });
+            row(ui, "Encoder", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (v, name) in [("h264", "H.264"), ("hevc", "HEVC"), ("av1", "AV1")] {
-                        chip(ui, &mut self.cfg.codec, v.to_string(), name).on_hover_text("The video format. H.264 plays everywhere; the others make smaller files.");
+                        chip(ui, &mut self.cfg.codec, v.to_string(), name).on_hover_text("The video format. H.264 plays everywhere; HEVC and AV1 make smaller files. AV1 needs a recent GPU (RTX 40, RX 7000, Intel Arc or newer).");
                     }
                 });
-                ui.end_row();
-
-                ui.label("Encoder effort");
-                ui.horizontal_wrapped(|ui| {
-                    for (i, name) in ["Best quality", "Balanced", "Max FPS"].into_iter().enumerate() {
-                        chip(ui, &mut self.cfg.encoder_effort, i as u8, name).on_hover_text("Cleaner video, or more FPS left for your game");
-                    }
-                });
-                ui.end_row();
             });
-            note(ui, "HEVC and AV1 make smaller files; H.264 plays everywhere. AV1 needs a recent GPU (RTX 40, RX 7000, Intel Arc or newer).");
-            let effort = [
-                "Best quality: the encoder takes its time on every frame for the cleanest clips.",
-                "Balanced: less work per frame and no extra GPU passes. A little more FPS when your GPU is maxed out; clips look slightly softer in fast motion.",
-                "Max FPS: the lightest encoding. The most FPS headroom; fast motion looks blockier at the same bitrate (raise Quality to make up for it).",
-            ][self.cfg.encoder_effort.min(2) as usize];
-            note(ui, effort);
+            row(ui, "Encoder effort", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (i, (name, about)) in EFFORTS.into_iter().enumerate() {
+                        chip(ui, &mut self.cfg.encoder_effort, i as u8, name).on_hover_text(about);
+                    }
+                });
+            });
             self.encoder_hint(ui);
             if recorder::gpu() == recorder::Gpu::None {
                 ui.label(RichText::new("No NVIDIA, AMD or Intel video encoder found, so clips are H.264 encoded on the CPU. That can cost some FPS in games.").small().color(pal().amber));
@@ -212,19 +197,15 @@ impl App {
         });
         let p = recorder::plan(&self.cfg, mon);
         card(ui, "Result", |ui| {
-            form(ui, "result", |ui| {
-                for (k, v) in [
-                    ("Clip", format!("{}x{} at {} fps", p.out_w, p.out_h, p.fps)),
-                    ("Encoder", recorder::gpu().label().to_string()),
-                    ("Bitrate", format!("about {} Mbps", p.kbps / 1000)),
-                    ("Memory", format!("up to {:.1} GB of RAM", p.mb as f64 / 1024.0)),
-                    ("Disk", recorder::space_estimate(&self.cfg, p.kbps)),
-                ] {
-                    ui.label(RichText::new(k).color(pal().muted));
-                    ui.label(RichText::new(v).strong());
-                    ui.end_row();
-                }
-            });
+            for (k, v) in [
+                ("Clip", format!("{}x{} at {} fps", p.out_w, p.out_h, p.fps)),
+                ("Encoder", recorder::gpu().label().to_string()),
+                ("Bitrate", format!("about {} Mbps", p.kbps / 1000)),
+                ("Memory", format!("up to {:.1} GB of RAM", p.mb as f64 / 1024.0)),
+                ("Disk", recorder::space_estimate(&self.cfg, p.kbps)),
+            ] {
+                row(ui, RichText::new(k).color(pal().muted), |ui| ui.label(RichText::new(v).strong()));
+            }
             if let Some(secs) = p.fits_secs {
                 let want = self.cfg.buffer_secs;
                 ui.label(RichText::new(format!(

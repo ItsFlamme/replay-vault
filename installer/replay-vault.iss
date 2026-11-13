@@ -56,8 +56,12 @@ Filename: "{app}\replay-vault.exe"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 ; The app lives in the tray; stop this installed copy (its OBS goes with it) so its files can
-; be removed. Only this copy: a portable one elsewhere keeps running.
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -Command ""Get-Process replay-vault -ErrorAction SilentlyContinue | Where-Object Path -eq '{app}\replay-vault.exe' | Stop-Process -Force"""; Flags: runhidden; RunOnceId: "StopApp"
+; be removed. Only this copy: a portable one elsewhere keeps running. First it's asked to quit
+; the normal way, so a full recording is finished and saved (--quit waits up to 30 s for that);
+; then whatever is left of it is stopped by force. The path goes to PowerShell quoted by
+; PsQuotedExe, so a quote in it (an apostrophe in the user name) can't break the command.
+Filename: "{app}\replay-vault.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "QuitApp"
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -Command ""Get-Process replay-vault -ErrorAction SilentlyContinue | Where-Object Path -eq {code:PsQuotedExe} | Stop-Process -Force"""; Flags: runhidden; RunOnceId: "StopApp"
 
 [InstallDelete]
 ; An update clears the old copy's leftovers for good (files are replaced in place, never recycled).
@@ -67,6 +71,22 @@ Type: files; Name: "{app}\debug.log"
 ; Chromium (in OBS's browser, or an overlay injected into the app) leaves a debug.log in the
 ; app's folder; without this the folder stays behind with just that file in it.
 Type: files; Name: "{app}\debug.log"
+
+[Code]
+// The installed exe's path as a PowerShell single-quoted string. In one, a quote is written
+// twice; PowerShell also takes the curly quotes for one, so those are doubled too.
+function PsQuotedExe(Param: String): String;
+var
+  S: String;
+begin
+  S := ExpandConstant('{app}\replay-vault.exe');
+  StringChangeEx(S, '''', '''''', True);
+  StringChangeEx(S, #$2018, #$2018#$2018, True);
+  StringChangeEx(S, #$2019, #$2019#$2019, True);
+  StringChangeEx(S, #$201A, #$201A#$201A, True);
+  StringChangeEx(S, #$201B, #$201B#$201B, True);
+  Result := '''' + S + '''';
+end;
 
 [Messages]
 ConfirmUninstall=Remove Replay Vault?%n%nYour clips and settings stay. To also undo what the app changed on this PC (its private OBS, firewall rule, GPU and Game Bar settings), cancel and use General > Remove from this PC instead (it uninstalls the app too).

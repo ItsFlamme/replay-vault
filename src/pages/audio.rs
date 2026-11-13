@@ -131,6 +131,9 @@ pub(crate) fn device_track_name(cfg: &Config, i: usize) -> String {
     on.iter().map(short).collect::<Vec<_>>().join(" + ")
 }
 
+/// The Custom track count's hover text: what track 1 is for, and what each track costs.
+const TRACKS_ABOUT: &str = "How many separate sound tracks each clip has. Track 1 is what most players and Discord play, so put everything you want heard on it. If one device already carries another's sound (like a mixer's stream mix), leave the other off that track. Each extra track adds about 7 MB of memory per 5 minutes.";
+
 impl App {
     pub(crate) fn refresh_devices(&mut self) {
         self.devices = devices::list();
@@ -153,18 +156,12 @@ impl App {
         let current = sound_preset(&self.cfg).filter(|_| !self.audio_custom);
         let mut pick = current.unwrap_or(custom_at);
         card(ui, "How should sound be saved?", |ui| {
-            egui::Grid::new("sound_presets").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("sound_presets").num_columns(1).spacing([12.0, 6.0]).show(ui, |ui| {
                 for (i, (name, hint)) in SOUND_PRESETS.into_iter().enumerate() {
                     chip(ui, &mut pick, i, name).on_hover_text(hint);
-                    if tips_on() {
-                        ui.label(RichText::new(hint).color(pal().muted));
-                    }
                     ui.end_row();
                 }
-                chip(ui, &mut pick, custom_at, "Custom").on_hover_text("Pick how many tracks, and what goes on each");
-                if tips_on() {
-                    ui.label(RichText::new("Choose 1 to 6 tracks and what goes on each.").color(pal().muted));
-                }
+                chip(ui, &mut pick, custom_at, "Custom").on_hover_text("Pick 1 to 6 tracks, and what goes on each");
                 ui.end_row();
             });
             if pick != current.unwrap_or(custom_at) {
@@ -177,9 +174,6 @@ impl App {
                 ui.add_space(6.0);
                 self.custom_tracks(ui);
             }
-            ui.add_space(4.0);
-            note(ui, "Each extra track adds about 7 MB of memory per 5 minutes.");
-
             ui.add_space(8.0);
             let mics: Vec<String> = used_devices(&self.cfg, "in:").map(|(k, _)| k.clone()).collect();
             let name_of = |k: &String| self.devices.iter().find(|d| &d.key == k).map_or_else(|| self.cfg.devices[k].name.clone(), |d| d.name.clone());
@@ -189,8 +183,7 @@ impl App {
                 n => format!("{n} mics"),
             };
             let mut chosen: Option<Option<String>> = None;
-            form(ui, "mic", |ui| {
-                ui.label("Microphone");
+            row(ui, "Microphone", |ui| {
                 egui::ComboBox::from_id_salt("mic").selected_text(text).width(ui.available_width().min(360.0)).show_ui(ui, |ui| {
                     for d in self.devices.iter().filter(|d| d.key.starts_with("in:")) {
                         if ui.selectable_label(mics.len() == 1 && mics[0] == d.key, &d.name).clicked() {
@@ -203,7 +196,6 @@ impl App {
                 })
                 .response
                 .on_hover_text("The mic whose voice goes into clips");
-                ui.end_row();
             });
             if let Some(key) = chosen {
                 let tracks = current.map_or([true, false, false, false, false, false], |p| preset_layout(p).2);
@@ -229,11 +221,12 @@ impl App {
     /// Custom sound: how many tracks, a name for each, and what goes on it, track 1 included, so
     /// a device whose sound is already in another (like a mixer's stream mix) can stay off it.
     pub(crate) fn custom_tracks(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Tracks");
-            for n in 1..=6u8 {
-                chip(ui, &mut self.cfg.track_count, n, n.to_string()).on_hover_text("How many separate sound tracks each clip has");
-            }
+        row(ui, "Tracks", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for n in 1..=6u8 {
+                    chip(ui, &mut self.cfg.track_count, n, n.to_string()).on_hover_text(TRACKS_ABOUT);
+                }
+            });
         });
         let n = self.cfg.tracks();
         // Every device recorded on any track; one taken off all of them is turned on again
@@ -272,16 +265,16 @@ impl App {
         // Discord's own capture is only for "Game, mic and chat separate". Custom has no row for
         // it, and Discord is already in the playback sound, so it's never recorded here.
         self.cfg.chat_tracks = [false; 6];
-        note(ui, "Track 1 is what most players and Discord play, so put everything you want heard on it. If one device already carries another's sound (like a mixer's stream mix), leave the other off that track.");
         if n > 1 {
             ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Track names").color(pal().muted)).on_hover_text("Shown when trimming");
-                for i in 0..n {
-                    let auto = device_track_name(&self.cfg, i);
-                    ui.label((i + 1).to_string());
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.track_names[i]).desired_width(100.0).char_limit(24).hint_text(auto)).on_hover_text("A name for this track, shown when trimming");
-                }
+            row(ui, "Track names", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for i in 0..n {
+                        let auto = device_track_name(&self.cfg, i);
+                        ui.label((i + 1).to_string());
+                        ui.add(egui::TextEdit::singleline(&mut self.cfg.track_names[i]).desired_width(100.0).char_limit(24).hint_text(auto)).on_hover_text("A name for this track, shown when trimming");
+                    }
+                });
             });
         }
     }
@@ -321,14 +314,10 @@ impl App {
         let current = sound_preset(&self.cfg).filter(|_| !self.audio_custom);
         const TRACK_1: [bool; 6] = [true, false, false, false, false, false];
         card(ui, "Game and PC sound", |ui| {
-            note(ui, "Click the devices whose sound goes into clips: your speakers, headset or both.");
-            ui.add_space(4.0);
             self.device_chips(ui, "out:", "record what this device plays", current.map_or(TRACK_1, |p| preset_layout(p).1));
         });
         card(ui, "Microphones", |ui| {
-            note(ui, "Click every mic whose voice goes into clips. With Custom, give each one its own track.");
-            ui.add_space(4.0);
-            self.device_chips(ui, "in:", "record this mic", current.map_or(TRACK_1, |p| preset_layout(p).2));
+            self.device_chips(ui, "in:", "record this mic. With Custom sound, give each mic its own track.", current.map_or(TRACK_1, |p| preset_layout(p).2));
             ui.add_space(4.0);
             if button(ui, "Refresh devices").on_hover_text("Plugged in a headset or mic? Look for it again.").clicked() {
                 self.refresh_devices();
@@ -337,10 +326,10 @@ impl App {
         card(ui, "App sound", |ui| {
             ui.horizontal_wrapped(|ui| {
                 chip(ui, &mut self.cfg.only_apps, false, "Everything (desktop audio)").on_hover_text("Records all the sound your PC plays");
-                chip(ui, &mut self.cfg.only_apps, true, "Only these apps").on_hover_text("Records only the apps you pick, so music or calls stay out");
+                chip(ui, &mut self.cfg.only_apps, true, "Only these apps")
+                    .on_hover_text("Records only the apps you pick, so music or calls stay out. Their sound goes on the same tracks as game and PC sound. Apps are matched by program, so a changing window title is fine. Your mic is set above.");
             });
             if !self.cfg.only_apps {
-                note(ui, "Records everything your playback devices play.");
                 return;
             }
             let mut remove = None;
@@ -374,16 +363,14 @@ impl App {
             if self.cfg.apps.is_empty() {
                 ui.label(RichText::new("Pick at least one app, or clips have no game or PC sound.").small().color(pal().amber));
             }
-            note(ui, "Only these apps' sound is recorded, on the same tracks as game and PC sound. Apps are matched by program, so a changing window title is fine. Your mic is set above.");
         });
         if self.cfg.noise != "off" {
             card(ui, "Mic noise filter", |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for (v, name) in [("rnnoise", "RNNoise"), ("speex", "Speex")] {
-                        chip(ui, &mut self.cfg.noise, v.to_string(), name).on_hover_text("How your mic's background noise is cleaned up");
+                    for (v, name, about) in [("rnnoise", "RNNoise", "Cleans up your mic's background noise better, but uses more CPU"), ("speex", "Speex", "Cleans up your mic's background noise with less CPU than RNNoise")] {
+                        chip(ui, &mut self.cfg.noise, v.to_string(), name).on_hover_text(about);
                     }
                 });
-                note(ui, "RNNoise cleans up better but uses more CPU. Speex is lighter.");
             });
         }
     }

@@ -11,6 +11,7 @@ mod display;
 mod drag_out;
 mod feedback;
 mod hotkey;
+mod instance;
 mod log;
 mod media;
 mod obs;
@@ -20,6 +21,7 @@ mod overlay;
 mod perf;
 mod profile;
 mod recorder;
+mod session;
 mod startup;
 mod support;
 mod player;
@@ -74,18 +76,28 @@ fn main() -> eframe::Result {
         use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories};
         let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
     }
+    // The uninstaller: this copy, if it's running, quits the normal way first (see `session`).
+    if std::env::args().any(|a| a == "--quit") {
+        session::ask_to_quit(std::time::Duration::from_secs(30));
+        return Ok(());
+    }
     // Started by Windows at login: stay in the tray.
     let minimized = std::env::args().any(|a| a == "--minimized");
-    // Only one copy at a time: a second launch brings up the running one and quits.
-    if !first_instance() {
-        if !minimized {
-            overlay::show_existing();
-        }
+    // Only one copy at a time: a second launch brings up the running one and quits, or waits for
+    // one that's closing. If it's another copy of the app (one in another folder), it says so
+    // instead.
+    if let Err(lock) = take_lock()
+        && !wait_for_turn(&lock, minimized)
+    {
         return Ok(());
     }
     log::catch_panics();
     log::write(&format!("App started (version {}{}).", env!("CARGO_PKG_VERSION"), if DEV_BUILD { ", dev build" } else { "" }));
     startup::repair();
+    // Shutting down or signing out never closes the window, so on_exit wouldn't run.
+    if session::watch(session_notice).is_none() {
+        log::write("Couldn't listen for Windows shutting down; a recording running then may be cut off. Display changes won't be noticed either.");
+    }
     // Draw the UI with DirectX 12, not Vulkan: Vulkan loads every installed overlay layer
     // (OBS, Overwolf, Steam, Epic) into this process. Safe here: no other threads exist yet.
     unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
@@ -100,17 +112,129 @@ fn main() -> eframe::Result {
     eframe::run_native(APP_TITLE, options, Box::new(move |cc| Ok(Box::new(App::new(cc, minimized)))))
 }
 
-/// Holds a named mutex for the life of the process; false if another copy already holds it.
-fn first_instance() -> bool {
+/// The one-copy-at-a-time lock (a named mutex) another copy holds. The handle is never closed:
+/// Windows releases the mutex when this process exits.
+struct Lock(windows::Win32::Foundation::HANDLE);
+
+impl Lock {
+    /// Waits up to `ms` for the copy holding it to let go; true once this one holds it.
+    fn wait(&self, ms: u32) -> bool {
+        use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+        let got = unsafe { windows::Win32::System::Threading::WaitForSingleObject(self.0, ms) };
+        got == WAIT_OBJECT_0 || got == WAIT_ABANDONED
+    }
+}
+
+/// Takes the lock for the life of the process, or gives it back to wait on if another copy holds
+/// it. A dev build has its own, so it and a release copy can run side by side.
+fn take_lock() -> Result<(), Lock> {
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows::Win32::System::Threading::CreateMutexW;
-    // The handle is never closed: Windows releases the mutex when this process exits. A dev build
-    // has its own, so it and a release copy can run side by side.
     let name = if DEV_BUILD { windows::core::w!("Local\\ReplayVaultDev") } else { windows::core::w!("Local\\ReplayVault") };
     match unsafe { CreateMutexW(None, true, name) } {
-        Ok(_) => (unsafe { GetLastError() }) != ERROR_ALREADY_EXISTS,
-        Err(_) => true,
+        Ok(h) if (unsafe { GetLastError() }) == ERROR_ALREADY_EXISTS => Err(Lock(h)),
+        _ => Ok(()),
     }
+}
+
+/// Exists while a copy is closing (stopping its recorder can take a while), so a launch meanwhile
+/// waits for it rather than bringing up its window or saying another copy is running.
+fn closing_name() -> windows::core::PCWSTR {
+    if DEV_BUILD { windows::core::w!("Local\\ReplayVaultDev.closing") } else { windows::core::w!("Local\\ReplayVault.closing") }
+}
+
+/// Marks this copy as closing until it exits (the handle is never closed).
+fn mark_closing() {
+    let _ = unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, closing_name()) };
+}
+
+/// Whether a copy has said it's closing.
+fn other_closing() -> bool {
+    use windows::Win32::System::Threading::{OpenEventW, SYNCHRONIZATION_SYNCHRONIZE};
+    match unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, closing_name()) } {
+        Ok(h) => {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// What a launch waiting for the lock does after one look around.
+#[derive(Debug, PartialEq)]
+enum Turn {
+    /// This same copy is running and not closing: bring up its window and quit.
+    BringUp,
+    /// Wait a little more for the lock.
+    Wait,
+    /// Waited long enough: say why and quit.
+    GiveUp(Busy),
+}
+
+/// Why a launch gave up.
+#[derive(Debug, PartialEq)]
+enum Busy {
+    OtherCopy,
+    StillClosing,
+}
+
+/// One pass of `wait_for_turn`: `closing` is whether a copy is closing right now, `window` whether
+/// this same copy's window is there, `seen_closing` whether any pass saw one closing, and
+/// `waited` how long this launch has waited. A copy that's closing gets up to 30 s (finishing a
+/// recording alone can take 15 s); otherwise about 2 s is enough for a copy started a moment ago
+/// to show its window.
+fn next_turn(closing: bool, window: bool, seen_closing: bool, waited: std::time::Duration) -> Turn {
+    if window && !closing {
+        return Turn::BringUp;
+    }
+    if waited < std::time::Duration::from_secs(if seen_closing { 30 } else { 2 }) {
+        Turn::Wait
+    } else if closing {
+        Turn::GiveUp(Busy::StillClosing)
+    } else {
+        Turn::GiveUp(Busy::OtherCopy)
+    }
+}
+
+/// A launch that found `lock` taken. Brings up this same copy's window if it's running (not when
+/// started at sign-in), or waits for a copy that's closing (quitting, or restarting into a
+/// portable update) and then starts; see `next_turn`. True when this launch got the lock and
+/// should start.
+fn wait_for_turn(lock: &Lock, minimized: bool) -> bool {
+    let start = std::time::Instant::now();
+    let mut seen_closing = false;
+    loop {
+        let running = overlay::running_copy();
+        let closing = other_closing() || matches!(running, Some(overlay::Running::Closing));
+        seen_closing |= closing;
+        match (next_turn(closing, matches!(running, Some(overlay::Running::Window(_))), seen_closing, start.elapsed()), running) {
+            (Turn::BringUp, Some(overlay::Running::Window(window))) => {
+                if !minimized {
+                    overlay::show_existing(window);
+                }
+                return false;
+            }
+            (Turn::GiveUp(why), _) => {
+                busy(why);
+                return false;
+            }
+            _ => {}
+        }
+        if lock.wait(250) {
+            return true;
+        }
+    }
+}
+
+/// Tells a launch why it isn't starting. Also for a launch at sign-in (`--minimized`), or two
+/// copies both set to start with Windows would fail silently.
+fn busy(why: Busy) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MessageBoxW};
+    let text = match why {
+        Busy::OtherCopy => windows::core::w!("Another copy of Replay Vault is already running. Quit it from its tray icon (right-click, Quit), then open this one again."),
+        Busy::StillClosing => windows::core::w!("Replay Vault is still closing. Open it again in a moment."),
+    };
+    unsafe { MessageBoxW(None, text, &windows::core::HSTRING::from(APP_TITLE), MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND) };
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -130,11 +254,13 @@ enum Tab {
 
 impl Tab {
     /// The settings pages, in the sidebar's order under SETTINGS.
-    const SETTINGS: [Tab; 5] = [Tab::General, Tab::Keybinds, Tab::Video, Tab::Audio, Tab::Feedback];
+    const SETTINGS: [Tab; 4] = [Tab::General, Tab::Keybinds, Tab::Video, Tab::Audio];
+    /// The small links at the bottom of the sidebar.
+    const LINKS: [Tab; 3] = [Tab::Help, Tab::WhatsNew, Tab::Feedback];
     const ALL: [Tab; 8] = [Tab::Clips, Tab::General, Tab::Keybinds, Tab::Video, Tab::Audio, Tab::Feedback, Tab::Help, Tab::WhatsNew];
 
-    /// Its name (in the sidebar and title, and its key for More options and tips), its sidebar
-    /// glyph, the line under its title, and its sidebar link's hover text.
+    /// Its name (in the sidebar and title, and its key for More options), its sidebar glyph, the
+    /// line under its title, and its sidebar link's hover text.
     fn info(self) -> (&'static str, char, &'static str, &'static str) {
         match self {
             Tab::Clips => ("Clips", icon::CLIPS, "", "Your saved clips, to play, trim and share"),
@@ -182,6 +308,8 @@ struct App {
     connected: bool,
     buffer: bool,
     start_with_windows: bool,
+    /// The startup entry is there but turned off in Task Manager (see `refresh_startup`).
+    startup_turned_off: bool,
     devices: Vec<devices::Device>,
     /// Open apps to pick for "Only these apps", looked up with the devices.
     open_apps: Vec<config::AppSel>,
@@ -200,10 +328,12 @@ struct App {
     conflicts_checked: Option<std::time::Instant>,
     /// Every key as last registered; None until then, and while one is being set.
     registered: Option<Vec<String>>,
-    /// Keys another app held when last tried, and when that was: they're tried again every few
-    /// seconds, so they work once that app lets go (NVIDIA's overlay closing at start, say).
+    /// Keys another app held when last tried, when that was, and how long until the next try:
+    /// they're tried again so they work once that app lets go (NVIDIA's overlay closing at start,
+    /// say), less often the longer it holds them (see `next_hotkey_retry`).
     hotkey_failed: Vec<Target>,
     hotkeys_tried: std::time::Instant,
+    hotkey_retry: std::time::Duration,
     tab: Tab,
     /// The settings as last written to disk; the Save bar shows while `cfg` differs.
     saved: Config,
@@ -252,11 +382,20 @@ struct App {
     imported: Option<String>,
     /// Clips tab: the folder's clips (re-read every few seconds), their frames and lengths.
     clip_list: Vec<clips::Clip>,
+    /// The games in clip_list (see `games_in`), worked out once per read of the folder.
+    clip_games: std::rc::Rc<[Game]>,
     clips_checked: std::time::Instant,
-    /// The clips folder being read on another thread: (folder, clips, free space).
+    /// Read the clips folder again on the next frame, without waiting out the 3 s (see `rescan_clips`).
+    rescan_now: bool,
+    /// The clips folder being read on another thread.
     clips_scan: Option<std::sync::mpsc::Receiver<ClipsScan>>,
+    /// Clips moved in the window so far, so a read begun before the last one is dropped.
+    clip_moves: u64,
     /// Free space on the clips drive, from the last scan.
     clips_free: Option<u64>,
+    /// The folders the last scan read in full (`clips::list_read`): share links are judged
+    /// orphaned only in those.
+    clips_read: Vec<std::path::PathBuf>,
     /// The archive folder and its clips (None: its drive or NAS isn't connected), looked at in the
     /// background while the Archive view is up (a NAS that's off can take a while to answer).
     archive_list: Option<(std::path::PathBuf, Option<Vec<clips::Clip>>)>,
@@ -264,11 +403,11 @@ struct App {
     archive_checked: std::time::Instant,
     previews: clips::Previews,
     /// Frame textures by (path, tenths of a second); None when the clip can't be decoded.
-    textures: std::collections::HashMap<(std::path::PathBuf, u32), Option<egui::TextureHandle>>,
+    textures: Textures,
+    /// The Clips page's cards, made again only when what they show changes.
+    clip_cards: CardsCache,
     /// Game covers by game; None when the file can't be read.
     covers: std::collections::HashMap<String, Option<egui::TextureHandle>>,
-    /// The first of the Recent clips shown (the row's arrows move it).
-    recent_at: usize,
     lengths: std::collections::HashMap<std::path::PathBuf, f64>,
     /// The hover-scrub frame being decoded (path, seconds); one at a time.
     scrub_wait: Option<(std::path::PathBuf, f64)>,
@@ -276,11 +415,15 @@ struct App {
     clips_msg: Option<String>,
     /// The clip playing in the window, if any.
     player: Option<(std::path::PathBuf, player::Player)>,
-    /// What the Clips page shows: the games, everything, or one folder.
+    /// A clip being opened in the player (see `Opening`).
+    opening: Option<Opening>,
+    /// What the Clips page shows: every clip, one game's, the starred ones, a tag's or the archive.
     view: ClipsView,
     /// Share links, running uploads/deletes, and a clip waiting for the upload notice to be accepted.
     links: std::collections::BTreeMap<String, upload::Link>,
     uploads: std::collections::HashMap<std::path::PathBuf, Arc<upload::Job>>,
+    /// Share links of clips that are gone, and deleting them.
+    link_cleanup: LinkCleanup,
     confirm_upload: Option<std::path::PathBuf>,
     /// Running share exports, and the last one done (its message and file, for the Copy button).
     exports: std::collections::HashMap<std::path::PathBuf, Arc<ExportJob>>,
@@ -300,6 +443,11 @@ struct App {
     confirm_discord: Option<std::path::PathBuf>,
     /// Starred clips, by path.
     favorites: std::collections::BTreeSet<String>,
+    /// Marked clips a change of the clips folder couldn't carry over (see `refolder`).
+    lost: std::collections::BTreeSet<String>,
+    /// Set when a change of the clips folder couldn't save every store under it: auto-cleanup holds
+    /// off until a start re-keys them (see `refolder`).
+    unfiled: bool,
     /// The clip being renamed and the name typed so far.
     renaming: Option<(std::path::PathBuf, String)>,
     /// Tags by clip path, and the clips getting a new tag with the name typed so far.
@@ -327,6 +475,9 @@ struct App {
     search: String,
     /// Montage mode, while it's on.
     montage: Option<Montage>,
+    /// Why auto-cleanup and the archive won't work in the clips folder being set, for the folder
+    /// and the folder confirmed anyway it was worked out for (see `clips_folder_risk`).
+    folder_risk: Option<((String, String), Option<String>)>,
     /// What auto-cleanup would remove right now (clips, bytes), for the rule it was worked out for.
     cleanup_preview: Option<(clips::Cleanup, std::time::Instant, usize, u64)>,
     /// What the archive would move right now (clips, bytes), for the rule it was worked out for.
@@ -337,6 +488,62 @@ struct App {
     encoder_hint: Option<(u64, u8)>,
     /// How far the app has slimmed down since the window was hidden.
     slim: Slim,
+    /// The mic is muted with its key (until unmuted or the app closes).
+    mic_muted: bool,
+    /// A display change the recorder hasn't been restarted for yet (see `follow_displays`).
+    display_wait: Option<DisplayWait>,
+    /// When a display change last restarted the recorder.
+    display_restarted: Option<std::time::Instant>,
+}
+
+/// A display change waiting to restart the recorder: what the recorder took from the monitors
+/// when it was started, when to look again, and the last hold that was logged.
+struct DisplayWait {
+    running: Option<recorder::DisplayKey>,
+    next: std::time::Instant,
+    logged: Option<DisplayHold>,
+}
+
+/// What to do about a display change (`display_step`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DisplayStep {
+    Restart,
+    /// What the recorder takes from the monitors is as it was: nothing to do.
+    Unchanged,
+    Hold(DisplayHold),
+}
+
+/// Why a display change waits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DisplayHold {
+    /// A full recording runs: a restart would end it.
+    Recording,
+    /// A display change restarted the recorder less than `DISPLAY_RESTART_GAP` ago; this long is left.
+    TooSoon(std::time::Duration),
+    /// A game is in front: a restart would lose the replay so far, and a game in exclusive full
+    /// screen changes the resolution only while it runs (the capture is fitted to the canvas meanwhile).
+    Game,
+}
+
+/// Display changes restart the recorder at most this often.
+const DISPLAY_RESTART_GAP: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often a held display change is looked at again.
+const DISPLAY_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a display change restarts the recorder now: `running` and `now` are what the recorder
+/// took from the monitors when started and what it would take now, `since_restart` how long ago a
+/// display change last restarted it, `game` whether a game is in front (asked last, as it costs most).
+fn display_step(running: &Option<recorder::DisplayKey>, now: &Option<recorder::DisplayKey>, recording: bool, since_restart: Option<std::time::Duration>, game: impl FnOnce() -> bool) -> DisplayStep {
+    if recording {
+        return DisplayStep::Hold(DisplayHold::Recording);
+    }
+    if running == now {
+        return DisplayStep::Unchanged;
+    }
+    if let Some(since) = since_restart.filter(|s| *s < DISPLAY_RESTART_GAP) {
+        return DisplayStep::Hold(DisplayHold::TooSoon(DISPLAY_RESTART_GAP - since));
+    }
+    if game() { DisplayStep::Hold(DisplayHold::Game) } else { DisplayStep::Restart }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -358,12 +565,38 @@ fn trim_memory() {
     }
 }
 
-/// Set from the hotkey thread to hide the window on the UI thread, so a playing clip is paused
-/// first (the player can only be touched from the UI thread).
-static HIDE_REQUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static PLAYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Show / hide key presses counted on the hotkey thread, for the UI thread to act on. Showing or
+/// hiding the window from another thread waits on the UI thread, which may itself be waiting on
+/// the hotkey thread (`hotkey::set_combo`), so the hotkey thread never does. A minimized or hidden
+/// window still runs `App::logic` when asked for a repaint, and a playing clip is paused in `ui`
+/// once the window is hidden.
+static TOGGLE_PRESSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether the presses since the last pass leave the window toggled: each press toggles, so quick
+/// show then hide ends where it started.
+fn toggles(presses: u32) -> bool {
+    presses % 2 == 1
+}
 
 const STEPS: [&str; 3] = ["Your clips", "This PC", "You're ready"];
+
+/// Stores the look in `cfg` for the theme to draw with, and returns it (to see when it changes).
+fn store_look(cfg: &Config) -> (u8, u32, bool, bool) {
+    let custom = parse_hex(&cfg.custom_accent).map_or(0x8448F0, |c| u32::from_be_bytes([0, c.r(), c.g(), c.b()]));
+    let look = (cfg.accent, custom, cfg.theme == "retro", cfg.light_mode);
+    ACCENT.store(look.0, std::sync::atomic::Ordering::Relaxed);
+    CUSTOM.store(look.1, std::sync::atomic::Ordering::Relaxed);
+    RETRO.store(look.2, std::sync::atomic::Ordering::Relaxed);
+    LIGHT.store(look.3, std::sync::atomic::Ordering::Relaxed);
+    EFFECTS.store(!cfg.reduce_effects, std::sync::atomic::Ordering::Relaxed);
+    look
+}
+
+/// The save popup's accent bar and VCR face, from the look stored last.
+fn toast_look() {
+    *toast::BAR.lock().unwrap() = [accent().r(), accent().g(), accent().b()];
+    toast::VCR.store(ui::theme::look().vcr_popup, std::sync::atomic::Ordering::Relaxed);
+}
 
 impl App {
     fn new(cc: &eframe::CreationContext, minimized: bool) -> Self {
@@ -410,6 +643,9 @@ impl App {
         let obs_exe = obs_install::find();
         let needs_setup = !cfg.setup_done || obs_exe.is_none();
 
+        // A start in the tray saves clips before the window ever draws, so the popups need the look now.
+        store_look(&cfg);
+        toast_look();
         toast::start();
         let clips_root = std::path::PathBuf::from(&cfg.folder);
         let archive = (cfg.archive_days > 0 && !cfg.archive_folder.trim().is_empty()).then(|| std::path::PathBuf::from(cfg.archive_folder.trim()));
@@ -442,11 +678,7 @@ impl App {
         let hook = hotkey::install(move |action| {
             let cmd = match action {
                 hotkey::Action::Overlay => {
-                    if overlay::is_visible() && PLAYING.load(std::sync::atomic::Ordering::Relaxed) {
-                        HIDE_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
-                    } else {
-                        overlay::toggle();
-                    }
+                    TOGGLE_PRESSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     ctx.request_repaint();
                     return;
                 }
@@ -454,6 +686,7 @@ impl App {
                 hotkey::Action::Screenshot => Cmd::Screenshot,
                 hotkey::Action::Replay => Cmd::ToggleReplay,
                 hotkey::Action::Mic => Cmd::ToggleMic,
+                hotkey::Action::SaveKey => Cmd::save_key_pressed(),
             };
             let _ = hotkey_cmds.send(cmd);
         });
@@ -469,6 +702,7 @@ impl App {
         let mut app = Self {
             status: "Starting...".into(),
             start_with_windows: startup::is_enabled(),
+            startup_turned_off: startup::turned_off_in_task_manager(),
             // Setup needs the window, even at a Windows-startup launch.
             minimized: minimized && !needs_setup,
             tray,
@@ -482,12 +716,15 @@ impl App {
             favorites: clips::favorites(),
             tags: clips::tags(),
             notes: clips::notes(),
+            lost: clips::lost(),
             feedback: feedback::Form::load(),
             ..Self::base(cfg, cmd_tx, ev_rx, hw, previews)
         };
         if needs_setup {
             app.status.clear();
         }
+        // Once: stars an earlier clips folder kept from before they followed a change of folder.
+        clips::adopt_stray_stars(&mut app.lost, &app.favorites, &app.cfg.folder, &app.cfg.archive_folder);
         // The window's last place and page.
         let placement = overlay::load_placement();
         overlay::restore_placement(&placement);
@@ -502,18 +739,28 @@ impl App {
             app.status = format!("OBS was updated to {v}.");
             log::write(&app.status);
         }
-        match hook {
-            Ok(()) => app.sync_hotkeys(),
-            Err(e) => app.hotkey_error = Some(format!("Couldn't start listening for keys: {e}")),
+        // Logged already, with where the damaged file's copy went. The popup too, as the status
+        // line soon shows the recorder's and a start at sign-in stays in the tray.
+        if let Some(notice) = config::take_notice() {
+            app.status = notice;
+            toast::show(toast::Kind::Warning, "Settings file was damaged", "Open Replay Vault to check your settings".into());
         }
         if let Some(e) = tray_error {
             app.status = format!("Couldn't create the tray icon: {e}");
         }
         app.refresh_devices();
+        // Display changes from the monitors listed above on (`follow_displays`).
+        let ctx = cc.egui_ctx.clone();
+        display::watch(&app.monitors, move || ctx.request_repaint());
         // Persists the generated recorder password (and a new user's recommended settings). If
         // that fails (the status says so), the app still runs with them.
         if !app.write_settings() {
             app.saved = app.cfg.clone();
+        }
+        // The keys as saved, now that they are.
+        match hook {
+            Ok(()) => app.sync_hotkeys(),
+            Err(e) => app.hotkey_error = Some(format!("Couldn't start listening for keys: {e}")),
         }
         // The recorder starts once setup is done (OBS present, settings picked).
         app.put_in_effect(None);
@@ -536,6 +783,7 @@ impl App {
             connected: false,
             buffer: false,
             start_with_windows: false,
+            startup_turned_off: false,
             devices: Vec::new(),
             open_apps: Vec::new(),
             monitors: display::list(),
@@ -549,6 +797,7 @@ impl App {
             registered: None,
             hotkey_failed: Vec::new(),
             hotkeys_tried: std::time::Instant::now(),
+            hotkey_retry: HOTKEY_RETRY,
             tab: Tab::General,
             saved: Config::default(),
             started: std::time::Instant::now(),
@@ -576,24 +825,30 @@ impl App {
             obs_settings_found: false,
             imported: None,
             clip_list: Vec::new(),
-            clips_checked: std::time::Instant::now().checked_sub(std::time::Duration::from_secs(60)).unwrap_or_else(std::time::Instant::now),
+            clip_games: Default::default(),
+            clips_checked: std::time::Instant::now(),
+            rescan_now: true,
             archive_list: None,
             archive_scan: None,
             clips_scan: None,
+            clip_moves: 0,
             clips_free: None,
+            clips_read: Vec::new(),
             archive_checked: std::time::Instant::now(),
             previews,
             textures: Default::default(),
+            clip_cards: Default::default(),
             covers: Default::default(),
-            recent_at: 0,
             lengths: Default::default(),
             scrub_wait: None,
             trim: None,
             clips_msg: None,
             player: None,
-            view: ClipsView::Games,
+            opening: None,
+            view: ClipsView::All,
             links: Default::default(),
             uploads: Default::default(),
+            link_cleanup: Default::default(),
             confirm_upload: None,
             confirm_discord: None,
             exports: Default::default(),
@@ -605,6 +860,8 @@ impl App {
             update_error: None,
             import: None,
             favorites: Default::default(),
+            lost: Default::default(),
+            unfiled: false,
             renaming: None,
             tags: Default::default(),
             tagging: None,
@@ -619,11 +876,15 @@ impl App {
             export_queue: Default::default(),
             search: String::new(),
             montage: None,
+            folder_risk: None,
             cleanup_preview: None,
             archive_preview: None,
             perf: None,
             encoder_hint: None,
             slim: Slim::Visible,
+            mic_muted: false,
+            display_wait: None,
+            display_restarted: None,
         }
     }
 
@@ -637,6 +898,7 @@ impl App {
                 }
                 Event::EncoderSkipped { frames, effort } => self.encoder_hint = Some((frames, effort)),
                 Event::Recording(on) => self.recording = on,
+                Event::MicMuted(on) => self.mic_muted = on,
             }
         }
         // A recorder that went away took its recording with it.
@@ -653,7 +915,7 @@ impl App {
         // The menu's handlers run while the window is hidden, so they read and leave state here.
         REPLAY_ON.store(self.buffer, std::sync::atomic::Ordering::Relaxed);
         if STARTUP_TOGGLED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            self.start_with_windows = startup::is_enabled();
+            self.refresh_startup();
         }
         if let Some((_, menu)) = &mut self.tray {
             let status = match (self.connected, self.buffer) {
@@ -674,10 +936,73 @@ impl App {
         }
     }
 
+    /// Monitors changed (`display::changed`): the app shows them as they are now, and the recorder
+    /// is restarted, the way Save does, when what it takes from them changed (`display_step`):
+    /// never during a full recording or while a game is in front, and at most every 30 s.
+    fn follow_displays(&mut self, ctx: &egui::Context) {
+        if let Some(now) = display::changed() {
+            let running = recorder::display_key(&self.saved, &self.monitors);
+            self.monitors = now;
+            // During setup the recorder isn't running; it starts with the monitors as they are.
+            // A change the recorder doesn't care about (another monitor) needs nothing more.
+            if self.wizard.is_none() && self.display_wait.is_none() && recorder::display_key(&self.saved, &self.monitors) != running {
+                self.display_wait = Some(DisplayWait { running, next: std::time::Instant::now(), logged: None });
+            }
+        }
+        let Some(wait) = &self.display_wait else { return };
+        // A recording's end comes as an event, which repaints; other holds are looked at again later.
+        if !self.recording && std::time::Instant::now() < wait.next {
+            return;
+        }
+        let now = if self.recording { None } else { recorder::display_key(&self.saved, &self.monitors) };
+        let folder = std::path::Path::new(&self.saved.folder);
+        let step = display_step(&wait.running, &now, self.recording, self.display_restarted.map(|t| t.elapsed()), || autopause::game_in_front(folder));
+        match step {
+            DisplayStep::Restart => {
+                log::write("The display changed (a monitor, its resolution or HDR); restarting the recorder to match.");
+                self.display_restarted = Some(std::time::Instant::now());
+                self.apply();
+            }
+            DisplayStep::Unchanged => {
+                if wait.logged.is_some() {
+                    log::write("The display is back as the recorder has it; no restart needed.");
+                }
+                self.display_wait = None;
+            }
+            DisplayStep::Hold(hold) => {
+                let again = match hold {
+                    DisplayHold::TooSoon(left) => left,
+                    _ => DISPLAY_RECHECK,
+                };
+                if wait.logged != Some(hold) && !matches!(hold, DisplayHold::TooSoon(_)) {
+                    log::write(match hold {
+                        DisplayHold::Recording => "The display changed; the recorder restarts to match once the full recording is stopped.",
+                        _ => "The display changed; the recorder restarts to match once no game is in front.",
+                    });
+                }
+                if let Some(wait) = &mut self.display_wait {
+                    if !matches!(hold, DisplayHold::TooSoon(_)) {
+                        wait.logged = Some(hold);
+                    }
+                    if hold != DisplayHold::Recording {
+                        wait.next = std::time::Instant::now() + again;
+                        ctx.request_repaint_after(again);
+                    }
+                }
+            }
+        }
+    }
+
     /// (Re)starts the recorder with the saved settings.
     fn apply(&mut self) {
+        // It starts with the monitors as they are now.
+        self.display_wait = None;
         self.applied = recorder_settings(&self.saved);
         let _ = self.cmds.send(Cmd::Start(Box::new(self.saved.clone())));
+        // OBS saves on its own key; the app notices the key too, to check the clip lands.
+        if let Err(e) = hotkey::watch_save(hotkey::Combo::parse(&self.saved.hotkey).filter(|c| c.obs_binding().is_some())) {
+            log::write(&format!("Can't notice the save key: {e}"));
+        }
     }
 
     /// Writes the settings to disk as they are now. False (and says why) if that failed.
@@ -697,6 +1022,8 @@ impl App {
     /// The Save button (and setup, as it goes): keeps the changes for next time and puts them
     /// into effect.
     fn keep_settings(&mut self) {
+        // Higher video settings can leave the clip length past what fits in memory.
+        self.cap_length();
         let before = self.saved.clone();
         if self.write_settings() {
             self.put_in_effect(Some(&before));
@@ -714,12 +1041,15 @@ impl App {
 
     /// Puts the saved settings into effect: the Windows tweaks that changed since `before` (at
     /// start, None: the ones that are on), what the recorder thread and the cleanup and archive
-    /// read, and a recorder restart when a setting it runs with changed (not during setup).
+    /// read, and a recorder restart when a setting it runs with changed (not during setup). A copy
+    /// that may not change Windows settings skips Game Bar, NVIDIA and AMD, so nothing is logged
+    /// as done that wasn't.
     fn put_in_effect(&mut self, before: Option<&Config>) {
         let start = before.is_none();
         let before = before.cloned().unwrap_or_default();
         let s = &self.saved;
         if s.game_bar_off != before.game_bar_off
+            && tweaks::shared_allowed()
             && let Err(e) = tweaks::set_game_bar_off(s.game_bar_off) {
             log::write(&format!("Couldn't change Game Bar: {e:#}"));
             if !start {
@@ -727,7 +1057,7 @@ impl App {
             }
         }
         // At every start too, in case an NVIDIA update switched it back on.
-        if s.nvidia_off != before.nvidia_off {
+        if s.nvidia_off != before.nvidia_off && tweaks::shared_allowed() {
             match tweaks::set_nvidia_overlay_off(s.nvidia_off) {
                 // At start, closing it waits on another thread, so the window isn't held up.
                 Ok(()) if s.nvidia_off && start => {
@@ -755,7 +1085,7 @@ impl App {
         // AMD Software's Instant Replay and hotkeys (untested), at every start too. Only switched
         // off on a PC that has AMD Software, so nothing is written for it anywhere else.
         let amd_off = self.saved.amd_off;
-        if amd_off != before.amd_off && (!amd_off || amd::detect().is_some()) {
+        if amd_off != before.amd_off && tweaks::shared_allowed() && (!amd_off || amd::detect().is_some()) {
             match tweaks::set_amd_off(amd_off) {
                 Ok(()) if start => {}
                 Ok(()) if amd_off => log::write("Turned AMD Software's Instant Replay and hotkeys off (untested); it picks this up when it next starts."),
@@ -769,13 +1099,25 @@ impl App {
             }
             self.amd = None;
         }
+        // Before cleanup gets the new folder: stars there must be filed under it first. At start,
+        // also when it changed outside Save (settings edited or restored, or a crash before they
+        // followed): from the folder they were last filed against.
+        if start {
+            match clips::refile_at_start(clips::filed().as_deref(), &self.saved.folder) {
+                clips::Refile::Nothing => {}
+                clips::Refile::Record => clips::save_filed(&self.saved.folder),
+                clips::Refile::From(old) => self.refolder(&old),
+            }
+        } else if before.folder != self.saved.folder {
+            self.refolder(&before.folder);
+        }
         let s = &self.saved;
         obs::SAVE_POPUP.store(s.save_popup, std::sync::atomic::Ordering::Relaxed);
         obs::SORT_BY_GAME.store(s.sort_by_game, std::sync::atomic::Ordering::Relaxed);
         obs::SAVE_SOUND.store(s.save_sound, std::sync::atomic::Ordering::Relaxed);
         obs::CENTER_SOUND.store(s.center_sound, std::sync::atomic::Ordering::Relaxed);
-        clips::set_cleanup(&s.folder, cleanup_rule(s));
-        clips::set_archive(&s.folder, archive_rule(s));
+        clips::set_cleanup(&s.folder, &s.shared_folder_ok, cleanup_rule(s));
+        clips::set_archive(&s.folder, &s.shared_folder_ok, archive_rule(s));
         if self.wizard.is_none() && recorder_settings(s) != self.applied {
             self.apply();
         }
@@ -801,107 +1143,140 @@ impl App {
         self.cfg = config::restore_page(&self.cfg, &self.defaults(), page);
     }
 
-    /// Left side: the name, the pages and your games, and at the bottom the replay switch and
-    /// the live status.
+    /// Left side: the name, Clips with your games under it, the settings pages, and at the bottom
+    /// the small links and the status box.
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        // The height kept free at the bottom for the status: a line more when it says why it
-        // isn't recording.
-        let mut status_h = if self.connected && self.buffer { 92.0 } else { 108.0 };
-        // And a small row each for "Version X is out" and "Key clash" when they show.
-        let row = ui.text_style_height(&egui::TextStyle::Small).max(ui.spacing().interact_size.y) + ui.spacing().item_spacing.y;
-        if self.saved.check_updates && app_update::found().is_some() {
-            status_h += row + 8.0;
-        }
-        if !self.conflicts.is_empty() {
-            status_h += row;
-        }
         // A hairline on its right edge. The whole panel, margins too.
         let panel = ui.max_rect().expand2(egui::vec2(12.0, 0.0));
         let back = ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(panel);
         back.vline(panel.right() - 0.5, panel.y_range(), egui::Stroke::new(1.0, pal().border));
-        ui.add_space(22.0);
+        // The heights as laid out before, per theme (it sets them): the games between Clips and
+        // Settings get the room that's left, so the status box always stays on screen. A window
+        // too short for the usual spacing draws compact; that's decided from the usual spacing's
+        // heights and the bottom's (the same either way), never from the compact one's, so it
+        // can't flip between frames.
+        let heights_id = ui.scope_id().with(("side heights", self.cfg.theme.as_str()));
+        let seen = ui.data(|d| d.get_temp::<SideHeights>(heights_id)).unwrap_or(SideHeights { fixed: [None; 2], bottom: 190.0 });
+        let compact = seen.fixed[0].is_some_and(|(head, settings)| head + settings + seen.bottom > ui.available_height());
+        let nav = if compact { look().nav.compact } else { look().nav.normal };
+        let top = ui.cursor().top();
+        ui.add_space(nav.brand);
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             brand(ui);
         });
-        ui.add_space(22.0);
-        // Minimalist rows sit close, like a list; Retro's tape labels keep their room.
-        let row_gap = if retro() { ui.spacing().item_spacing.y } else { 2.0 };
+        ui.add_space(nav.brand);
+        // Rows sit close, like a list; tapes keep their room.
+        let row_gap = nav.gap.unwrap_or(ui.spacing().item_spacing.y);
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = row_gap;
-            self.nav_item(ui, Tab::Clips);
-            ui.add_space(if retro() { 14.0 } else { 18.0 });
+            self.nav_item(ui, Tab::Clips, nav.height);
+        });
+        let head = ui.cursor().top() - top;
+        let settings_h = seen.fixed[compact as usize].or(seen.fixed[0]).map_or(200.0, |(_, settings)| settings);
+        // Less the gap under the list.
+        let room = ui.available_height() - settings_h - seen.bottom - ui.spacing().item_spacing.y;
+        let games = std::rc::Rc::clone(&self.clip_games);
+        self.side_games(ui, room, &games);
+        let top = ui.cursor().top();
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = row_gap;
+            ui.add_space(nav.after_clips);
             side_heading(ui, "Settings");
             ui.add_space(2.0);
             for tab in Tab::SETTINGS {
-                self.nav_item(ui, tab);
+                self.nav_item(ui, tab, nav.height);
             }
-            ui.add_space(16.0);
-            self.nav_item(ui, Tab::Help);
-            self.nav_item(ui, Tab::WhatsNew);
         });
-
-        // The games, played last first, each opening its clips. Left out of a window too short
-        // for their heading and one row, so the status below stays on screen.
-        let games = self.games();
-        if !games.is_empty() && ui.available_height() - status_h >= 44.0 + 46.0 {
-            ui.add_space(20.0);
-            side_heading(ui, "Your games");
-            ui.add_space(2.0);
-            let room = (ui.available_height() - status_h).max(46.0);
-            egui::ScrollArea::vertical().id_salt("side games").auto_shrink(false).max_height(room).show(ui, |ui| {
-                for g in &games {
-                    let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), egui::Sense::click());
-                    let open = self.tab == Tab::Clips && self.view == ClipsView::Game(g.name.clone());
-                    if open || r.hovered() {
-                        ui.painter().rect_filled(rect, R_SMALL, pal().card);
-                    }
-                    let pic = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 6.0), egui::vec2(34.0, 34.0));
-                    match self.game_picture(ui.ctx(), g) {
-                        Some(tex) => paint_fill(ui, &tex, pic, R_SMALL),
-                        None => _ = ui.painter().rect_filled(pic, R_SMALL, pal().raised),
-                    }
-                    let x = pic.right() + 10.0;
-                    let name = g.name.as_deref().unwrap_or("Not sorted");
-                    // One line, cut with "…", so a long name never runs into the clip count.
-                    let mut job = egui::text::LayoutJob::simple_singleline(name.into(), egui::FontId::new(13.0, egui::FontFamily::Name("strong".into())), pal().text);
-                    job.wrap = egui::text::TextWrapping::truncate_at_width(rect.right() - x - 4.0);
-                    let galley = ui.painter().layout_job(job);
-                    let cut = galley.elided;
-                    ui.painter().galley(egui::pos2(x, rect.top() + 6.0), galley, pal().text);
-                    let what = count(g.count, "clip");
-                    ui.painter().text(egui::pos2(x, rect.bottom() - 7.0), egui::Align2::LEFT_BOTTOM, what, egui::FontId::proportional(12.0), pal().muted);
-                    let tip = if cut { format!("{name}: shows this game's clips") } else { "Shows this game's clips".into() };
-                    if r.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        self.tab = Tab::Clips;
-                        self.player = None;
-                        self.view = ClipsView::Game(g.name.clone());
-                    }
-                }
-            });
-        }
-        ui.add_space((ui.available_height() - status_h).max(0.0));
+        let settings = ui.cursor().top() - top;
+        ui.add_space((ui.available_height() - seen.bottom).max(0.0));
+        let top = ui.cursor().top();
+        self.side_links(ui);
         self.side_status(ui);
+        let mut heights = SideHeights { fixed: seen.fixed, bottom: ui.cursor().top() - top };
+        heights.fixed[compact as usize] = Some((head, settings));
+        if heights != seen {
+            ui.data_mut(|d| d.insert_temp(heights_id, heights));
+            ui.ctx().request_repaint();
+        }
     }
 
-    /// Across the top of every page: the clip search and Save clip.
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            // Narrower in a small window, so Save clip still fits beside it.
-            let width = (ui.available_width() - 140.0).clamp(140.0, 300.0);
-            let search = egui::TextEdit::singleline(&mut self.search).hint_text("Search clips").desired_width(width).min_size(egui::vec2(0.0, H_BIG)).margin(egui::vec2(12.0, 8.0));
-            if ui.add(search).on_hover_text("Type part of a clip's name, game, tag or note to find it").changed() && !self.search.trim().is_empty() {
-                self.tab = Tab::Clips;
-            }
-            if primary(ui, self.buffer, strong("Save clip", 14.0), egui::Vec2::ZERO)
-                .on_hover_text(format!("Saves the last {}. Same as pressing {}.", mmss(self.saved.buffer_secs), self.saved.hotkey))
-                .on_disabled_hover_text(if self.connected { "Instant replay is off: turn it on with the switch at the bottom left" } else { "The recorder isn't running yet" })
-                .clicked()
-            {
-                let _ = self.cmds.send(Cmd::Save);
+    /// Under Clips: All games, each game (played last first) and Not sorted, with how many clips
+    /// each has; a click shows just those on the Clips page. Scrolls inside `room` when there are
+    /// many, and isn't shown when not even one row fits.
+    fn side_games(&mut self, ui: &mut egui::Ui, room: f32, games: &[Game]) {
+        if games.is_empty() || room < SIDE_ROW {
+            return;
+        }
+        // Not sorted only beside real games: on its own it's the same as All games.
+        let sorted = games.iter().any(|g| g.name.is_some());
+        let rows = std::iter::once((ClipsView::All, "All games", self.clip_list.len(), None))
+            .chain(games.iter().filter(|g| g.name.is_some()).map(|g| (ClipsView::Game(g.name.clone()), g.name.as_deref().unwrap_or_default(), g.count, tape_color(g.tape))))
+            .chain(games.iter().filter(|g| g.name.is_none() && sorted).map(|g| (ClipsView::Game(None), "Not sorted", g.count, tape_color(g.tape))));
+        egui::ScrollArea::vertical().id_salt("side games").auto_shrink([false, true]).max_height(room).min_scrolled_height(SIDE_ROW).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (view, name, n, tape) in rows {
+                self.side_game(ui, view, name, n, tape);
             }
         });
-        ui.add_space(18.0);
+    }
+
+    /// One row under Clips: the name (cut with "...", all of it on hover) and its clip count, on a
+    /// soft surface while it's the filter shown; a small mark in its tape color, if it has one.
+    fn side_game(&mut self, ui: &mut egui::Ui, view: ClipsView, name: &str, n: usize, tape: Option<Color32>) {
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), SIDE_ROW), egui::Sense::click());
+        let open = self.tab == Tab::Clips && self.view == view;
+        // Painted below, so say what it is for screen readers (and tests that find it by name).
+        r.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, open, name));
+        if open || r.hovered() {
+            ui.painter().rect_filled(rect, R_SMALL, pal().card);
+        }
+        let (face, size) = look().side_row;
+        let count = ui.painter().layout_no_wrap(n.to_string(), face.font(size), pal().muted);
+        // Lined up with the page names above it.
+        let (x, right) = (rect.left() + 38.0, rect.right() - 10.0);
+        if let Some(c) = tape {
+            ui.painter().rect_filled(egui::Rect::from_center_size(egui::pos2(x - 10.0, rect.center().y), egui::vec2(4.0, 12.0)), 1.0, c);
+        }
+        let color = if open { pal().text } else { pal().muted.lerp_to_gamma(pal().text, 0.5) };
+        let mut job = egui::text::LayoutJob::simple_singleline(name.into(), face.font(size), color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(right - count.size().x - 8.0 - x);
+        let galley = ui.painter().layout_job(job);
+        let cut = galley.elided;
+        ui.painter().galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, color);
+        ui.painter().galley(egui::pos2(right - count.size().x, rect.center().y - count.size().y / 2.0), count, pal().muted);
+        let tip = match &view {
+            ClipsView::All => "Shows every clip".to_string(),
+            ClipsView::Game(None) => "Shows the clips that aren't in a game's folder".to_string(),
+            _ if cut => format!("{name}: shows this game's clips"),
+            _ => "Shows this game's clips".to_string(),
+        };
+        if r.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            self.tab = Tab::Clips;
+            self.player = None;
+            self.view = view;
+        }
+    }
+
+    /// Help, What's new and Feedback as a row of small links, the open one marked.
+    fn side_links(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.spacing_mut().item_spacing.x = 14.0;
+            let (face, size, caps) = look().side_links;
+            for tab in Tab::LINKS {
+                let (name, _, _, hint) = tab.info();
+                let open = self.tab == tab;
+                let text = RichText::new(if caps { name.to_uppercase() } else { name.to_string() }).family(face.family()).size(size).color(if open { pal().text } else { pal().muted });
+                let r = ui.add(egui::Label::new(if open { text.underline() } else { text }).selectable(false).sense(egui::Sense::click()));
+                // A tab to screen readers (and tests that find it by name), like the pages above.
+                r.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, open, name));
+                if r.on_hover_text(hint).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.tab = tab;
+                }
+            }
+        });
+        ui.add_space(8.0);
     }
 
     /// "More options" under a page's main cards: a row that opens or closes the rest of the page
@@ -929,9 +1304,9 @@ impl App {
         });
     }
 
-    /// The bottom of the sidebar: the replay switch and a status light (REC, PAUSE or NO SIGNAL)
-    /// in the on-screen display font, with one line under it: what a save keeps while recording,
-    /// otherwise why it isn't.
+    /// The bottom of the sidebar: "Version X is out" when there is one, then the status box: the
+    /// Instant replay switch, a line with a light (red while recording, amber while paused) saying
+    /// what a save keeps or else why it isn't recording, a key clash if there is one, and Save clip.
     fn side_status(&mut self, ui: &mut egui::Ui) {
         if self.saved.check_updates
             && let Some(n) = app_update::found()
@@ -945,90 +1320,148 @@ impl App {
             });
             ui.add_space(8.0);
         }
-        let (dot, color, text) = match (self.connected, self.buffer) {
-            (true, true) => (RED, pal().phosphor, "REC"),
-            (true, false) => (pal().amber, pal().amber, "PAUSE"),
-            _ => (RED, pal().red, "NO SIGNAL"),
-        };
-        ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), egui::Stroke::new(1.0, pal().border));
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            let mut on = self.buffer;
-            if ui.add_enabled(self.connected, toggle(&mut on)).on_hover_text("Turn instant replay on or off").changed() {
-                let _ = self.cmds.send(Cmd::SetReplay(on));
-            }
-            ui.add_space(4.0);
-            let mut job = egui::text::LayoutJob::default();
-            job.append("\u{25CF} ", 0.0, egui::TextFormat { font_id: egui::FontId::proportional(12.0), color: dot, valign: egui::Align::Center, ..Default::default() });
-            let font = if retro() { egui::FontId::new(21.0, egui::FontFamily::Name("osd".into())) } else { egui::FontId::new(15.0, egui::FontFamily::Name("strong".into())) };
-            job.append(text, 0.0, egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() });
-            ui.label(job).on_hover_text(&self.status);
-        });
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            if self.connected && self.buffer {
-                let what = format!("Last {} \u{B7} {} saves", mmss(self.saved.buffer_secs), self.saved.hotkey);
-                ui.add(egui::Label::new(RichText::new(what).small().color(pal().muted)).truncate())
-                    .on_hover_text(format!("Press {} anywhere, even in a game, to save the last {}.", self.saved.hotkey, mmss(self.saved.buffer_secs)));
-            } else {
-                // Why it isn't recording: on up to two lines (the sidebar keeps room for them),
-                // all of it on hover.
-                let small = egui::TextStyle::Small.resolve(ui.style());
-                let paused = self.connected && autopause::PAUSED.load(std::sync::atomic::Ordering::Relaxed);
-                let status = if paused { "Paused: no game open. Starts again when one is.".to_string() } else { self.status.clone() };
-                let mut why = egui::text::LayoutJob::simple(status, small, pal().muted, ui.available_width());
-                why.wrap.max_rows = 2;
-                ui.add(egui::Label::new(why).wrap()).on_hover_text(&self.status);
-            }
-        });
-        // A key another program took since the keys were set (Keybinds says who and what to do),
-        // so it isn't first noticed when a save does nothing.
-        self.check_conflicts();
-        if let Some((target, text)) = self.conflicts.first().cloned() {
+        let sbox = look().status_box;
+        let fill = if sbox.display { pal().display } else { pal().card };
+        let frame = egui::Frame::new().fill(fill).stroke(egui::Stroke::new(1.0, pal().border)).corner_radius(sbox.radius).inner_margin(12);
+        frame.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
             ui.horizontal(|ui| {
-                ui.add_space(4.0);
+                // The VCR's display says whether it's on, in its green.
+                if sbox.display {
+                    let (face, size) = look().status;
+                    let (text, color) = if self.buffer { ("REPLAY ON", pal().phosphor) } else { ("REPLAY OFF", pal().muted) };
+                    ui.label(RichText::new(text).family(face.family()).size(size).color(color)).on_hover_text("Instant replay");
+                } else {
+                    ui.label(RichText::new("Instant replay").color(pal().text));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut on = self.buffer;
+                    if ui.add_enabled(self.connected, toggle(&mut on)).on_hover_text("Turn instant replay on or off").changed() {
+                        let _ = self.cmds.send(Cmd::SetReplay(on));
+                    }
+                });
+            });
+            self.status_line(ui);
+            if self.mic_muted {
+                let line = egui::Label::new(RichText::new("Mic muted").small().color(pal().amber)).sense(egui::Sense::click());
+                let key = &self.saved.hotkey_mic;
+                let hover = |ui: &mut egui::Ui| {
+                    ui.label(if key.is_empty() { "Your mic isn't in clips or recordings.\nClick to unmute it.".to_string() } else { format!("Your mic isn't in clips or recordings.\nClick to unmute it, or press {key}.") });
+                };
+                if ui.add(line).on_hover_ui(hover).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    let _ = self.cmds.send(Cmd::ToggleMic);
+                }
+            }
+            // A key another program took since the keys were set (Keybinds says who and what to
+            // do), so it isn't first noticed when a save does nothing.
+            self.check_conflicts();
+            if let Some((target, text)) = self.conflicts.first().cloned() {
                 let more = if self.conflicts.len() > 1 { format!(" (+{} more)", self.conflicts.len() - 1) } else { String::new() };
                 let line = egui::Label::new(RichText::new(format!("Key clash: {}{more}", target.name())).small().color(pal().amber)).truncate().sense(egui::Sense::click());
                 if ui.add(line).on_hover_text(format!("{}: {text}\nClick to open Keybinds.", target.name())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.tab = Tab::Keybinds;
                 }
-            });
-        }
+            }
+            self.save_button(ui);
+        });
         ui.add_space(14.0);
+    }
+
+    /// The status box's line: "Keeping the last 5:00" while recording, otherwise why it isn't
+    /// (paused with no game open, replay off, the recorder not running) on up to two lines, all of
+    /// it on hover. The light in front keeps REC (red), PAUSE (amber) and NO SIGNAL (red) apart.
+    fn status_line(&mut self, ui: &mut egui::Ui) {
+        let paused = self.connected && autopause::PAUSED.load(std::sync::atomic::Ordering::Relaxed);
+        let keeping = self.connected && self.buffer;
+        let (dot, text, color) = match (self.connected, self.buffer) {
+            (true, true) if look().status_box.display => (RED, format!("REC  ·  LAST {}", mmss(self.saved.buffer_secs)), pal().text),
+            (true, true) => (RED, format!("Keeping the last {}", mmss(self.saved.buffer_secs)), pal().text),
+            (true, false) if paused => (pal().amber, "Paused: no game open. Starts again when one is.".to_string(), pal().muted),
+            (true, false) => (pal().amber, self.status.clone(), pal().muted),
+            _ => (RED, self.status.clone(), pal().muted),
+        };
+        let (face, size) = look().status;
+        let hover = if keeping { format!("Press {} anywhere, even in a game, to save the last {}.", self.saved.hotkey, mmss(self.saved.buffer_secs)) } else { self.status.clone() };
+        ui.horizontal_top(|ui| {
+            // The light, on the middle of the first line; a second line starts under the text.
+            let first = ui.painter().layout_no_wrap("A".into(), face.font(size), color).size().y;
+            let (light, _) = ui.allocate_exact_size(egui::vec2(8.0, first), egui::Sense::hover());
+            ui.painter().circle_filled(light.center(), 3.5, dot);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let mut job = egui::text::LayoutJob::simple(text, face.font(size), color, ui.available_width());
+            job.wrap.max_rows = 2;
+            ui.add(egui::Label::new(job).wrap()).on_hover_text(hover);
+        });
+    }
+
+    /// Save clip across the status box, with the save key on it in a small chip (left out when it
+    /// doesn't fit); the same as pressing the key.
+    fn save_button(&mut self, ui: &mut egui::Ui) {
+        // The words and the key are painted over a main button without a label of its own.
+        let r = primary(ui, self.buffer, RichText::new(""), egui::vec2(ui.available_width(), 0.0));
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, self.buffer, "Save clip"));
+        let ink = if self.buffer { on_accent() } else { pal().muted };
+        let p = ui.painter();
+        // In the look's key text when it has one (SAVE CLIP and ALT+F10 on a VCR's keys).
+        let (label, key) = match look().key_text {
+            Some(k) => (p.layout_no_wrap("SAVE CLIP".into(), k.face.font(k.size), ink), p.layout_no_wrap(self.saved.hotkey.to_uppercase(), k.face.font(k.size - 2.0), ink)),
+            None => (p.layout_no_wrap("Save clip".into(), egui::FontId::new(14.0, egui::FontFamily::Name("strong".into())), ink), p.layout_no_wrap(self.saved.hotkey.clone(), egui::FontId::proportional(11.0), ink)),
+        };
+        let (chip, gap) = (key.size() + egui::vec2(10.0, 4.0), 8.0);
+        let fits = !self.saved.hotkey.is_empty() && label.size().x + gap + chip.x <= r.rect.width() - 16.0;
+        let w = label.size().x + if fits { gap + chip.x } else { 0.0 };
+        let (mut x, y) = (r.rect.center().x - w / 2.0, r.rect.center().y);
+        p.galley(egui::pos2(x, y - label.size().y / 2.0), label.clone(), ink);
+        if fits {
+            x += label.size().x + gap;
+            let chip = egui::Rect::from_min_size(egui::pos2(x, y - chip.y / 2.0), chip);
+            p.rect_filled(chip, 4.0, if self.buffer { Color32::from_black_alpha(60) } else { pal().card });
+            p.galley(chip.min + egui::vec2(5.0, 2.0), key, ink);
+        }
+        if r.on_hover_text(format!("Saves the last {}. Same as pressing {}.", mmss(self.saved.buffer_secs), self.saved.hotkey))
+            .on_disabled_hover_text(if self.connected { "Instant replay is off: turn it on with the switch above" } else { "The recorder isn't running yet" })
+            .clicked()
+        {
+            let _ = self.cmds.send(Cmd::Save);
+        }
     }
 
     /// One page link in the sidebar. Retro: a tape on the site's shelf, a dark spine with a
     /// handwritten paper label and a colored stripe; the open page's tape is pulled out a little and
     /// outlined in its color. Minimalist: a quiet list row, the open page's marked with an accent bar.
-    fn nav_item(&mut self, ui: &mut egui::Ui, tab: Tab) {
+    fn nav_item(&mut self, ui: &mut egui::Ui, tab: Tab, height: f32) {
         let (name, glyph, _, hint) = tab.info();
-        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), if retro() { 40.0 } else { 36.0 }), egui::Sense::click());
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
         let selected = self.tab == tab;
         // Painted below, so say what it is for screen readers (and tests that find it by name).
         r.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, name));
         let painter = ui.ctx().layer_painter(ui.layer_id());
-        if retro() {
+        if look().nav.style == NavStyle::Tape {
             let stripe = tab.stripe();
             let pull = if selected { 10.0 } else if r.hovered() { 4.0 } else { 0.0 };
             let spine = egui::Rect::from_min_max(rect.min, egui::pos2(rect.right() - 10.0 + pull, rect.bottom())).shrink2(egui::vec2(0.0, 2.0));
-            // In light mode the spines are a soft lilac a shade under the shelf, not black, so they
-            // don't sit like holes in it or ring the labels in heavy outlines.
-            let spine_fill = if pal().light { pal().edge } else if selected { Color32::BLACK } else { Color32::from_rgb(8, 6, 11) };
-            painter.rect_filled(spine, 4.0, spine_fill);
-            if selected {
-                painter.rect_stroke(spine, 4.0, egui::Stroke::new(2.0, stripe), egui::StrokeKind::Inside);
-            }
             let label = spine.shrink2(egui::vec2(6.0, 5.0));
+            if pal().light {
+                // No dark spine in light mode: the cream label and its stripe carry it, on a soft
+                // lip, and the open page's is outlined in its color.
+                painter.rect_filled(label.translate(egui::vec2(0.0, 2.0)), 3.0, pal().lip);
+                if selected {
+                    painter.rect_stroke(label.expand(3.0), 5.0, egui::Stroke::new(2.0, stripe), egui::StrokeKind::Inside);
+                }
+            } else {
+                painter.rect_filled(spine, 4.0, if selected { Color32::BLACK } else { Color32::from_rgb(8, 6, 11) });
+                if selected {
+                    painter.rect_stroke(spine, 4.0, egui::Stroke::new(2.0, stripe), egui::StrokeKind::Inside);
+                }
+            }
             painter.rect_filled(label, 3.0, if selected { PAPER } else { PAPER.lerp_to_gamma(pal().sidebar, 0.25) });
             painter.rect_filled(label.with_max_x(label.left() + 6.0), egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 }, stripe);
             let mut x = label.left() + 14.0;
             if paint_icon(&painter, egui::pos2(x, label.center().y), egui::Align2::LEFT_CENTER, glyph, 13.0, INK) {
                 x += 22.0;
             }
-            let font = egui::FontId::new(15.0, egui::FontFamily::Name("marker".into()));
-            painter.text(egui::pos2(x, label.center().y), egui::Align2::LEFT_CENTER, name, font, INK);
+            painter.text(egui::pos2(x, label.center().y), egui::Align2::LEFT_CENTER, name, Face::Marker.font(15.0), INK);
         } else {
             // A quiet list row: the open page on a raised surface with an accent bar, the others
             // bare until hovered.
@@ -1086,6 +1519,11 @@ impl App {
         let progress = self.update_job.as_ref().map(|j| j.lock().unwrap().clone());
         if let Some(r) = progress.as_ref().and_then(|p| p.result.clone()) {
             self.update_job = None;
+            // Cancelled: back to the popup as it was, the part downloaded thrown away.
+            if r.as_ref().is_err_and(|e| e == obs_install::CANCELLED) {
+                log::write(&format!("Cancelled the download of Replay Vault {}.", n.version));
+                return;
+            }
             match r.and_then(|()| app_update::apply().map_err(|e| format!("couldn't put the new version in place: {e}"))) {
                 Ok(()) => {
                     log::write(&format!("Installing Replay Vault {}; closing for the installer.", n.version));
@@ -1103,9 +1541,9 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         let mut later = false;
-        let r = egui::Modal::new(egui::Id::unique("update_popup")).show(ctx, |ui| {
+        let r = dialog(ctx, "update_popup").show(ctx, |ui| {
             ui.set_max_width(420.0);
-            ui.label(RichText::new(format!("Replay Vault {} is out", n.version)).strong().size(16.0));
+            dialog_title(ui, &format!("Replay Vault {} is out", n.version));
             ui.label(RichText::new(format!("You have {}. Your settings and clips stay.", env!("CARGO_PKG_VERSION"))).color(pal().muted));
             if !n.notes.is_empty() {
                 ui.add_space(4.0);
@@ -1115,6 +1553,13 @@ impl App {
             if let Some(p) = &progress {
                 ui.label(format!("Downloading: {} of {}", clips::size(p.done), clips::size(p.total)));
                 ui.add(egui::ProgressBar::new(if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 }));
+                ui.add_space(4.0);
+                let label = if p.cancel { "Cancelling..." } else { "Cancel" };
+                if cap(ui, !p.cancel, egui::Button::new(label)).on_hover_text("Stops the download and throws away the part that came. This copy stays as it is.").clicked()
+                    && let Some(job) = &self.update_job
+                {
+                    obs_install::cancel(job);
+                }
                 return;
             }
             if let Some(e) = &self.update_error {
@@ -1193,6 +1638,7 @@ impl App {
                     [one] => ui.label(format!("{}\n\nYou can get it back from the Recycle Bin.", one.file_name().unwrap_or_default().to_string_lossy())),
                     _ => ui.label("You can get them back from the Recycle Bin."),
                 };
+                self.recycle_links_box(ui, &paths);
                 (true, false)
             }) {
                 Some(true) => self.recycle_picked(&paths),
@@ -1245,7 +1691,7 @@ impl App {
                 .collect();
             let stars = file.favorites.difference(&self.favorites).count();
             let notes = file.notes.keys().filter(|k| !self.notes.contains_key(*k)).count();
-            let confirm = Confirm { label: "Import", hint: "Adds the stars and tags and fills in these settings; Save to use them", danger: false };
+            let confirm = Confirm { label: "Import", hint: "Adds the stars and tags and fills in these settings; Save to use them. Passwords and the Discord webhook stay as they are here.", danger: false };
             match modal(ctx, "import_settings", 460.0, "Import settings?", confirm, CANCEL, |ui| {
                 if !shown.is_empty() {
                     egui::Grid::new("import_values").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
@@ -1269,7 +1715,6 @@ impl App {
                 for w in &warnings {
                     ui.label(RichText::new(format!("Check this: {w}")).color(pal().amber));
                 }
-                note(ui, "Nothing is changed until you click Import; the settings then apply when you Save. Passwords and the Discord webhook stay as they are here.");
                 (true, false)
             }) {
                 Some(true) => {
@@ -1373,51 +1818,15 @@ fn uninstall_app() -> anyhow::Result<()> {
 }
 
 impl App {
-    /// A one-line hint at the top of a page, until its x is clicked. Kept right away, no Save.
-    fn tip(&mut self, ui: &mut egui::Ui) {
-        let page = self.tab.name();
-        if !self.cfg.show_tips || self.cfg.tips_seen.iter().any(|p| p == page) {
-            return;
-        }
-        let text = match self.tab {
-            Tab::Clips => format!("Press {} in a game to save the last {}. Click a card to play it.", self.saved.hotkey, mmss(self.saved.buffer_secs)),
-            Tab::General => "Changes here wait for the Save button at the bottom.".into(),
-            Tab::Keybinds => "Click a key, then press the keys you want. They work even in a game.".into(),
-            Tab::Video => "Not sure what to pick? Use recommended settings sets it up for this PC.".into(),
-            Tab::Audio => "Keep your mic on its own track to change its volume when you trim.".into(),
-            Tab::Help => "If clips stop saving, the status here says why. Copy it or make a support zip to ask for help.".into(),
-            Tab::Feedback => "For a bug, say what you did and what happened. Leaving the PC summary ticked helps a lot.".into(),
-            Tab::WhatsNew => "Each update lists what's new, what got fixed and what changed.".into(),
-        };
-        let mut close = false;
-        egui::Frame::new().fill(pal().card.lerp_to_gamma(accent(), 0.1)).corner_radius(R_CARD).inner_margin(egui::Margin::symmetric(12, 6)).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(icon(icon::TIP, 14.0).color(accent_light()));
-                ui.label(text);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    close = bare_icon(ui, true, icon::CANCEL, "Got it");
-                });
-            });
-        });
-        ui.add_space(12.0);
-        if close {
-            self.keep_view(|c| c.tips_seen.push(page.to_string()));
-        }
-    }
-
     /// The bar that appears while settings are changed but not saved.
     fn footer(&mut self, ui: &mut egui::Ui) {
         let restart = recorder_settings(&self.cfg) != self.applied;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(strong("Unsaved changes", 14.0).color(pal().text));
-                let note = if restart {
-                    "Saving restarts the recorder, so what it kept so far is cleared."
-                } else {
-                    "Save keeps them for next time. Discard goes back to what was saved."
-                };
-                if tips_on() {
-                    ui.label(RichText::new(note).small().color(pal().muted));
+                // A warning, so it always shows.
+                if restart {
+                    ui.label(RichText::new("Saving restarts the recorder, so what it kept so far is cleared.").small().color(pal().muted));
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1453,24 +1862,63 @@ fn updated_app(last_version: &str, set_up: bool) -> bool {
     if last_version.is_empty() { set_up } else { last_version != env!("CARGO_PKG_VERSION") }
 }
 
-/// How often a hotkey another app held is tried again.
+/// How soon a hotkey another app held is first tried again, and the longest wait between tries.
 const HOTKEY_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
+const HOTKEY_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Don't leave the hidden recorder running after the app closes, or NVIDIA's overlay off.
-fn shutdown() {
-    obs::end_session("app closed");
-    log::write("App closed.");
-    obs::QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
-    recorder::stop();
-    tweaks::give_back_nvidia_overlay();
+/// The wait before the next try of a key still held after waiting `last`: twice as long, up to a
+/// minute, so a key another program keeps doesn't wake the app every few seconds for good.
+fn next_hotkey_retry(last: std::time::Duration) -> std::time::Duration {
+    (last * 2).min(HOTKEY_RETRY_MAX)
 }
 
-/// A read of the clips folder: (folder, clips, free space).
-type ClipsScan = (String, Vec<clips::Clip>, Option<u64>);
+/// Don't leave the hidden recorder running after the app closes, or NVIDIA's overlay off. The
+/// window closing, the tray's Quit and Windows ending the session (`end_session`) can each get
+/// here, on different threads: it's done once, and a second caller waits for that.
+fn shutdown() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        mark_closing();
+        obs::end_session("app closed");
+        log::write("App closed.");
+        obs::QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+        recorder::stop();
+        tweaks::give_back_nvidia_overlay();
+    });
+}
+
+/// Windows is ending the session, an installer is closing the app, or the uninstaller asked it to
+/// quit (`session::watch`): finishes a recording and a clip being saved, as Quit does, then ends.
+fn end_session(why: &str) {
+    log::write(&format!("Closing: {why}."));
+    shutdown();
+    std::process::exit(0);
+}
+
+/// What the session window passes on, on its thread: the end of the session, or a look at the
+/// monitors (a change there reaches the UI thread through `display::changed`).
+fn session_notice(notice: session::Notice) {
+    match notice {
+        session::Notice::Quit(why) => end_session(why),
+        session::Notice::Displays => display::look_again(),
+    }
+}
 
 /// "1 clip", "2 clips": `n` and `one`, made plural with an s past 1.
 fn count(n: usize, one: &str) -> String {
     if n == 1 { format!("1 {one}") } else { format!("{n} {one}s") }
+}
+
+/// The height of a game's row under Clips in the sidebar.
+const SIDE_ROW: f32 = 28.0;
+
+/// The sidebar's heights as laid out (see `App::sidebar`): above the games (the name and Clips)
+/// and the Settings links, with the usual spacing and compact, and the bottom (the small links
+/// and the status box), which is the same either way.
+#[derive(Clone, Copy, PartialEq)]
+struct SideHeights {
+    fixed: [Option<(f32, f32)>; 2],
+    bottom: f32,
 }
 
 /// Seconds as m:ss.
@@ -1490,6 +1938,15 @@ impl eframe::App for App {
         }
     }
 
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The show / hide key, pressed on the hotkey thread. Here and not in `ui`: eframe runs
+        // only `logic` for a minimized window, so the key would be dead there and the next
+        // restore would hide the window. A visible or hidden window runs this just before `ui`.
+        if toggles(TOGGLE_PRESSES.swap(0, std::sync::atomic::Ordering::Relaxed)) {
+            overlay::toggle();
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // eframe shows the window itself once its first frame is painted; undo that when
         // started minimized. Hidden passes only run when something asks for one, so this stops
@@ -1499,6 +1956,8 @@ impl eframe::App for App {
             ui.ctx().request_repaint();
         }
         self.handle_events();
+        // From the tray too: the recorder follows a display change while the window is hidden.
+        self.follow_displays(ui.ctx());
         self.pump_jobs(ui.ctx());
         // The window's place and page, for next start (the tray's Quit skips on_exit).
         if self.placement_checked.elapsed() >= std::time::Duration::from_secs(1) {
@@ -1520,7 +1979,7 @@ impl eframe::App for App {
         self.sync_hotkeys();
         // Keeps trying a key another app held, even from the tray.
         if !self.hotkey_failed.is_empty() {
-            ui.ctx().request_repaint_after(HOTKEY_RETRY);
+            ui.ctx().request_repaint_after(self.hotkey_retry.saturating_sub(self.hotkeys_tried.elapsed()));
         }
         // Setup has no Save button: what's picked there is kept as it goes.
         if self.wizard.is_some() && self.cfg != self.saved {
@@ -1543,23 +2002,16 @@ impl eframe::App for App {
             clips::save_tags(&self.tags);
             clips::save_notes(&self.notes);
         }
-        NOTES.store(self.cfg.show_tips, std::sync::atomic::Ordering::Relaxed);
         app_update::ENABLED.store(self.saved.check_updates, std::sync::atomic::Ordering::Relaxed);
         autopause::ENABLED.store(self.saved.pause_without_game, std::sync::atomic::Ordering::Relaxed);
         // The look previews as it's picked, before Save. Kept per window (egui context), so a new
         // one gets it on its first frame too.
-        let custom = parse_hex(&self.cfg.custom_accent).map_or(0x8448F0, |c| u32::from_be_bytes([0, c.r(), c.g(), c.b()]));
-        let look = (self.cfg.accent, custom, self.cfg.theme == "retro", self.cfg.light_mode);
-        ACCENT.store(look.0, std::sync::atomic::Ordering::Relaxed);
-        CUSTOM.store(look.1, std::sync::atomic::Ordering::Relaxed);
-        RETRO.store(look.2, std::sync::atomic::Ordering::Relaxed);
-        LIGHT.store(look.3, std::sync::atomic::Ordering::Relaxed);
-        EFFECTS.store(look.2 && !self.cfg.reduce_effects, std::sync::atomic::Ordering::Relaxed);
+        let look = store_look(&self.cfg);
         let id = egui::Id::NULL.with("applied look");
         if ui.ctx().data(|d| d.get_temp(id)) != Some(look) {
             ui.ctx().data_mut(|d| d.insert_temp(id, look));
             set_visuals(ui.ctx());
-            *toast::BAR.lock().unwrap() = [accent().r(), accent().g(), accent().b()];
+            toast_look();
         }
 
         // In the tray, stay out of the game's way: eframe still runs this when something asks
@@ -1596,6 +2048,12 @@ impl eframe::App for App {
                 Slim::Trimmed => {}
             }
             return;
+        }
+        if self.slim != Slim::Visible {
+            // Shown again: a key another app held is tried again soon, as the user may have just
+            // freed it, and Start with Windows may have been turned off in Task Manager meanwhile.
+            self.hotkey_retry = HOTKEY_RETRY;
+            self.refresh_startup();
         }
         self.slim = Slim::Visible;
 
@@ -1658,9 +2116,6 @@ impl eframe::App for App {
         if self.tab != Tab::Help {
             self.perf = None;
         }
-        if HIDE_REQUEST.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            overlay::close();
-        }
         // Read before this frame's dialogs and text fields, so the Enter that closes the rename box
         // or leaves the search box doesn't also play a clip.
         let clip_keys = !self.dialog_open() && !ui.ctx().egui_wants_keyboard_input();
@@ -1670,7 +2125,6 @@ impl eframe::App for App {
             // A child window draws over everything, dialogs included.
             p.set_visible(!dialog_open);
         }
-        PLAYING.store(self.player.as_ref().is_some_and(|(_, p)| p.is_playing()), std::sync::atomic::Ordering::Relaxed);
         let page = egui::Frame::new().fill(pal().bg).inner_margin(egui::Margin { left: 28, right: 28, top: 22, bottom: 12 });
         egui::CentralPanel::default().frame(page).show(ui, |ui| {
             room(ui, egui::Rect::from_min_max(ui.max_rect().min - egui::vec2(28.0, 22.0), ui.max_rect().max + egui::vec2(28.0, 12.0)));
@@ -1679,35 +2133,19 @@ impl eframe::App for App {
                 self.player_page(ui);
                 return;
             }
-            self.top_bar(ui);
             if self.tab == Tab::Clips {
                 self.clips_header(ui);
             } else {
                 // Same width as the settings column below.
                 ui.scope(|ui| {
                     ui.set_max_width(ui.available_width().min(760.0));
-                    ui.horizontal(|ui| {
-                        retro_title(ui, self.tab.name(), 38.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if let Some(page) = self.tab.page()
-                                && button(ui, "Restore defaults").on_hover_text("Puts this page back the way a fresh install sets it up on this PC. Nothing changes until you Save.").clicked()
-                            {
-                                self.restore_defaults(page);
-                            }
-                        });
-                    });
-                    if tips_on() {
-                        ui.label(RichText::new(self.tab.info().2).color(pal().muted));
-                    }
+                    retro_title(ui, self.tab.name(), 38.0);
+                    ui.label(RichText::new(self.tab.info().2).color(pal().muted));
                     ui.add_space(14.0);
                 });
             }
-            ui.scope(|ui| {
-                if self.tab != Tab::Clips {
-                    ui.set_max_width(ui.available_width().min(760.0));
-                }
-                self.tip(ui);
-            });
+            // Cards on a page are striped in its tape's color.
+            set_card_tape(ui.ctx(), self.tab.stripe());
             egui::ScrollArea::vertical().id_salt(("tab", self.tab as u8)).auto_shrink(false).show(ui, |ui| {
                 // Settings read best in a column, not stretched across a wide window.
                 if self.tab != Tab::Clips {
@@ -1724,6 +2162,18 @@ impl eframe::App for App {
                     Tab::Feedback => self.feedback_card(ui),
                     Tab::WhatsNew => self.whats_new_tab(ui),
                 }
+                // At the bottom, out of the way of the first click.
+                if let Some(page) = self.tab.page() {
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let restore = cap(ui, true, egui::Button::new(key_label("Restore defaults")));
+                            key_named(&restore, true, "Restore defaults");
+                            if restore.on_hover_text("Puts this page back the way a fresh install sets it up on this PC. Nothing changes until you Save.").clicked() {
+                                self.restore_defaults(page);
+                            }
+                        });
+                    });
+                }
             });
         });
         focus_ring(ui.ctx());
@@ -1735,20 +2185,71 @@ mod tests {
     use super::*;
     mod demos;
 
+    /// Every show / hide key press counts, even several before one pass: show then hide quickly
+    /// ends where it started, a third press toggles again.
+    #[test]
+    fn show_hide_presses_toggle_on_an_odd_count() {
+        assert!(!toggles(0));
+        assert!(toggles(1));
+        assert!(!toggles(2));
+        assert!(toggles(3));
+    }
+
+    /// Copy A is closing; launches B and C both wait. Once A is gone and B has opened, C brings up
+    /// B's window instead of waiting out A's deadline.
+    #[test]
+    fn launch_waits_for_a_closing_copy_then_brings_up_the_new_one() {
+        let s = std::time::Duration::from_secs;
+        // A's window is still there, but A is closing: wait.
+        assert_eq!(next_turn(true, true, true, s(0)), Turn::Wait);
+        assert_eq!(next_turn(true, false, true, s(10)), Turn::Wait);
+        // A has gone and B is up: C brings it up, although it saw A closing.
+        assert_eq!(next_turn(false, true, true, s(12)), Turn::BringUp);
+        // The running copy, not closing, comes up on the very first pass.
+        assert_eq!(next_turn(false, true, false, s(0)), Turn::BringUp);
+        // B took the lock but has no window yet: keep waiting past 2 s, since a copy was closing.
+        assert_eq!(next_turn(false, false, true, s(5)), Turn::Wait);
+    }
+
+    /// Why a launch gives up: a copy still closing after 30 s, or another copy after about 2 s.
+    #[test]
+    fn launch_gives_up_with_the_right_reason() {
+        let s = std::time::Duration::from_secs;
+        assert_eq!(next_turn(false, false, false, s(1)), Turn::Wait);
+        assert_eq!(next_turn(false, false, false, s(2)), Turn::GiveUp(Busy::OtherCopy));
+        assert_eq!(next_turn(true, false, true, s(29)), Turn::Wait);
+        assert_eq!(next_turn(true, true, true, s(30)), Turn::GiveUp(Busy::StillClosing));
+        assert_eq!(next_turn(false, false, true, s(30)), Turn::GiveUp(Busy::OtherCopy));
+    }
+
+    /// A key another program keeps is tried after 3 s, then twice as long each time, never more
+    /// than a minute apart.
+    #[test]
+    fn held_keys_are_tried_less_often() {
+        let s = std::time::Duration::from_secs;
+        let waits: Vec<_> = std::iter::successors(Some(HOTKEY_RETRY), |w| Some(next_hotkey_retry(*w))).take(7).collect();
+        assert_eq!(waits, [s(3), s(6), s(12), s(24), s(48), s(60), s(60)]);
+    }
+
     impl App {
-        /// The app with the saved settings and nothing running (no recorder, tray, hotkeys or
-        /// window), for rendering its screens in tests.
+        /// The app with default settings and nothing running (no recorder, tray, hotkeys or
+        /// window), for rendering its screens in tests. Never this PC's own settings, GPU or clips:
+        /// the clips folder is an empty one of the tests' own, and tests that need clips set theirs.
         fn preview(cc: &eframe::CreationContext) -> App {
             apply_theme(&cc.egui_ctx);
             let (cmds, _) = mpsc::channel();
             let (_, events) = mpsc::channel();
             let ctx = cc.egui_ctx.clone();
+            let folder = std::env::temp_dir().join("replay-vault-preview-clips");
+            let _ = std::fs::create_dir_all(&folder);
+            let cfg = Config { folder: folder.display().to_string(), ..Config::default() };
+            let hw = profile::Hardware { gpu: recorder::Gpu::Nvidia, gpu_name: "NVIDIA GeForce RTX 4070".into(), vram_mb: 12288, ram_mb: 32768, integrated: false };
             let mut app = App {
                 status: "Instant replay is on.".into(),
                 connected: true,
                 buffer: true,
                 start_with_windows: true,
-                ..App::base(Config::load(), cmds, events, profile::detect(), clips::Previews::new(move || ctx.request_repaint()))
+                ..App::base(cfg, cmds, events, hw, clips::Previews::new(move || ctx.request_repaint()))
             };
             app.refresh_devices();
             app.applied = recorder_settings(&app.cfg);
@@ -1761,12 +2262,16 @@ mod tests {
     /// Renders each tab to target\screens\<tab>.png, to look at the design without opening the
     /// app. Reads the clip folder (for thumbnails) and changes nothing. Run on demand:
     /// cargo test screens -- --ignored
+    /// SCREENS_ONLY=general-cleanup,setup2 renders only those pages (names as in `pages`, or
+    /// waveform, trim-parts, trim-gif).
     #[test]
     #[ignore]
     fn screens() {
         unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
         // SCREENS_OUT / SCREENS_FOLDER: render elsewhere, from another clips folder (for the website).
         let out = std::env::var("SCREENS_OUT").map(std::path::PathBuf::from).unwrap_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(r"target\screens"));
+        let only: Option<Vec<String>> = std::env::var("SCREENS_ONLY").ok().map(|s| s.split(',').map(|n| n.trim().to_string()).collect());
+        let wanted = |name: &str| only.as_ref().is_none_or(|o| o.iter().any(|n| n == name));
         std::fs::create_dir_all(&out).unwrap();
         let demo = demo_folder();
         let size: Vec<f32> = std::env::var("SCREEN_SIZE").unwrap_or("480x640".into()).split('x').map(|n| n.parse().unwrap()).collect();
@@ -1781,7 +2286,8 @@ mod tests {
             .chain([(Tab::Video, None, "video-untested".to_string()), (Tab::Audio, None, "audio-chat".to_string()), (Tab::Audio, None, "audio-custom".to_string())])
             .chain([(Tab::Clips, None, "clips-starred".to_string()), (Tab::General, None, "general-cleanup".to_string())])
             .chain([(Tab::Clips, None, "clips-search".to_string()), (Tab::Clips, None, "clips-rename".to_string())])
-            .chain([(Tab::Clips, None, "clips-games".to_string()), (Tab::Clips, None, "clips-game".to_string())])
+            .chain([(Tab::Clips, None, "clips-games".to_string()), (Tab::Clips, None, "clips-game".to_string()), (Tab::Clips, None, "clips-game-side".to_string())])
+            .chain([(Tab::Clips, None, "clips-starred-only".to_string())])
             .chain([(Tab::Clips, None, "clips-selected".to_string()), (Tab::Clips, None, "clips-scrub".to_string())])
             .chain([(Tab::Clips, None, "clips-export".to_string()), (Tab::Clips, None, "clips-export-menu".to_string())])
             .chain([(Tab::Clips, None, "clips-tags".to_string()), (Tab::Clips, None, "clips-tag-menu".to_string()), (Tab::Clips, None, "clips-new-tag".to_string())])
@@ -1795,8 +2301,7 @@ mod tests {
             .chain([(Tab::General, None, "general-archive".to_string())])
             .chain([(Tab::General, None, "general-move".to_string()), (Tab::General, None, "general-import".to_string()), (Tab::General, None, "general-import-network".to_string())])
             .chain([(Tab::Clips, None, "clips-discord-confirm".to_string())])
-            .chain(tabs.map(|(t, n)| (t, None, format!("{n}-tip"))))
-            .chain([(Tab::General, None, "general-accent".to_string()), (Tab::General, None, "general-no-tips".to_string()), (Tab::Clips, None, "clips-selected-accent".to_string())])
+            .chain([(Tab::General, None, "general-accent".to_string()), (Tab::Clips, None, "clips-selected-accent".to_string())])
             .chain([(Tab::Video, None, "video-hint".to_string())])
             .chain(["keybinds-nvidia", "keybinds-nvidia-off", "keybinds-amd", "keybinds-amd-off", "keybinds-both"].map(|n| (Tab::Keybinds, None, n.to_string())))
             .chain(["feedback-draft", "feedback-sent", "feedback-error", "feedback-limit"].map(|n| (Tab::Feedback, None, n.to_string())))
@@ -1805,7 +2310,13 @@ mod tests {
             // Each theme in each mode, and a custom accent.
             .chain(["minimalist-dark", "minimalist-light", "retro-dark", "retro-light"].into_iter().flat_map(|look| [(Tab::General, None, format!("general-{look}")), (Tab::Clips, None, format!("clips-{look}"))]))
             .chain([(Tab::General, None, "general-custom-color".to_string()), (Tab::General, None, "general-custom-color-light".to_string())])
-            .chain((0..STEPS.len()).map(|s| (Tab::Clips, Some(s), format!("setup{}", s + 1))));
+            .chain((0..STEPS.len()).map(|s| (Tab::Clips, Some(s), format!("setup{}", s + 1))))
+            .chain(["general-cleanup-shared", "general-cleanup-hold", "general-clips-shared"].map(|n| (Tab::General, None, n.to_string())))
+            .chain([(Tab::Clips, Some(0), "setup-clips-shared".to_string())])
+            .chain(["clips-muted", "clips-picked-recycle-links"].map(|n| (Tab::Clips, None, n.to_string())))
+            .chain([(Tab::General, None, "general-sharing-orphans".to_string())])
+            .chain([(Tab::General, None, "general-startup-taskmanager".to_string()), (Tab::Clips, None, "clips-update-cancel".to_string()), (Tab::Clips, None, "clips-opening".to_string())])
+            .filter(|(_, _, n)| wanted(n));
         // Copies of the newest clips sorted into game folders, for the games pages; the clips
         // folder is only read.
         let games = out.join("games");
@@ -1819,6 +2330,13 @@ mod tests {
             }
         }
         for (tab, wizard, name) in pages {
+            // A made-up newer release for the update popup, cleared before the next page.
+            let _found = (name == "clips-update-cancel").then(|| {
+                app_update::set_found(Some(nine()));
+                ForgetFound
+            });
+            // Keeps a clip opening (see clips-opening) until the page is rendered.
+            let mut _opening = None;
             let builder = egui_kittest::Harness::builder().with_max_steps(12).with_size([size[0], size[1]]).with_accessibility_check(false);
             let mut h = builder.wgpu().build_eframe(|cc| {
                 let mut app = App::preview(cc);
@@ -1869,7 +2387,7 @@ mod tests {
                     (app.cfg.accent, app.cfg.custom_accent) = (CUSTOM_ACCENT, if name.ends_with("-light") { "#8448F0" } else { "#1FA39A" }.into());
                 }
                 // More options open where the page's state is (a view choice; nothing is saved).
-                let more = ["general-discord", "general-discord-bad", "general-archive", "general-move", "general-cleanup", "video-hint", "video-follow", "video-hdr", "audio-apps"];
+                let more = ["general-discord", "general-discord-bad", "general-archive", "general-move", "general-cleanup", "general-cleanup-shared", "general-cleanup-hold", "video-hint", "video-follow", "video-hdr", "audio-apps"];
                 if name.ends_with("-more") || more.contains(&name.as_str()) {
                     app.cfg.more_open = ["General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
                     app.saved.more_open = app.cfg.more_open.clone();
@@ -1905,16 +2423,13 @@ mod tests {
                     app.cfg.accent = if name == "general-accent" { 2 } else { 1 };
                     app.saved.accent = app.cfg.accent;
                 }
-                if name == "general-no-tips" {
-                    app.cfg.show_tips = false;
-                    app.saved.show_tips = false;
-                }
                 // General opens on the tab the render is about.
                 app.general_part = match name.as_str() {
-                    n if n.starts_with("general-discord") => GeneralPart::Sharing,
-                    "general-archive" | "general-cleanup" => GeneralPart::Storage,
+                    n if n.starts_with("general-discord") || n == "general-sharing-orphans" => GeneralPart::Sharing,
+                    n if n == "general-archive" || n.starts_with("general-cleanup") => GeneralPart::Storage,
                     n if n == "general-move" || n.starts_with("general-import") => GeneralPart::Backup,
-                    n if n == "general-accent" || n == "general-no-tips" || n.starts_with("general-custom-color") => GeneralPart::Appearance,
+                    n if n == "general-accent" || n.starts_with("general-custom-color") => GeneralPart::Appearance,
+                    "general-startup-taskmanager" => GeneralPart::Startup,
                     _ => GeneralPart::Clips,
                 };
                 // NVIDIA's overlay on, then switched off but still running (only shown; nothing changed).
@@ -1964,14 +2479,13 @@ mod tests {
                 if name == "setup1" {
                     app.obs_settings_found = true;
                 }
-                // First-run tips only on the "-tip" pages.
-                if !name.ends_with("-tip") {
-                    app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
-                    app.saved.tips_seen = app.cfg.tips_seen.clone();
-                }
-                // Stars the second-newest clip (in memory only; favorites.json isn't written).
-                if name == "clips-starred" {
+                // Stars the second-newest clip (in memory only; favorites.json isn't written), then
+                // shows only the starred ones.
+                if name.starts_with("clips-starred") {
                     app.favorites = clips::list(&app.cfg.folder, 2).iter().skip(1).map(|c| c.path.display().to_string()).collect();
+                }
+                if name == "clips-starred-only" {
+                    app.view = ClipsView::Starred;
                 }
                 // A search that matches one clip, and the rename box (only shown; nothing is renamed).
                 if name == "clips-search" {
@@ -2083,8 +2597,26 @@ mod tests {
                     if let Some(p) = app.picked.first() {
                         clips::set_tag(&mut app.tags, p, "Aces", true);
                     }
-                    if name == "clips-picked-recycle" {
+                    if name.starts_with("clips-picked-recycle") {
                         app.confirm_recycle = Some(app.picked.clone());
+                    }
+                    // A made-up share link on the first one (nothing is uploaded or deleted).
+                    if name == "clips-picked-recycle-links"
+                        && let Some(p) = app.picked.first()
+                    {
+                        app.links.insert(p.display().to_string(), upload::Link { link: "https://kappa.lol/made-up".into(), key: "made-up".into() });
+                    }
+                }
+                // The mic muted, as after the mic key (only shown; the recorder isn't touched).
+                if name == "clips-muted" {
+                    app.mic_muted = true;
+                }
+                // Made-up share links of two clips gone from the clips folder (nothing is deleted).
+                if name == "general-sharing-orphans" {
+                    for n in ["VALORANT 2026-09-14 21-07-33.mp4", "Elden Ring 2026-09-02 23-41-10.mp4"] {
+                        let gone = std::path::Path::new(&app.cfg.folder).join(n).display().to_string();
+                        app.links.insert(gone.clone(), upload::Link { link: "https://kappa.lol/made-up".into(), key: "made-up".into() });
+                        app.link_cleanup.orphans.push(gone);
                     }
                 }
                 if name == "clips-new-tag" {
@@ -2122,6 +2654,23 @@ mod tests {
                     (app.cfg.archive_days, app.cfg.archive_folder) = (14, r"\\nas\clips".into());
                     app.saved = app.cfg.clone();
                 }
+                // Cleanup and the archive on in a clips folder judged shared (made up: the risk is
+                // put in its cache, so the demo folder is still the one listed).
+                if name == "general-cleanup-shared" {
+                    (app.cfg.keep_days, app.cfg.archive_days, app.cfg.archive_folder) = (30, 30, r"Q:\Archive".into());
+                    app.saved = app.cfg.clone();
+                }
+                if name.ends_with("-shared") {
+                    app.folder_risk = Some(((app.cfg.folder.clone(), app.cfg.shared_folder_ok.clone()), Some("your Videos folder".into())));
+                }
+                // Cleanup on hold for a starred clip from an earlier clips folder (in memory only).
+                if name == "general-cleanup-hold" {
+                    app.cfg.keep_days = 30;
+                    app.saved = app.cfg.clone();
+                    let lost = r"Q:\Old clips\a.mp4".to_string();
+                    app.favorites.insert(lost.clone());
+                    app.lost.insert(lost);
+                }
                 // A made-up settings file picked for import (only shown; nothing is applied).
                 if name.starts_with("general-import") {
                     let mut cfg = app.cfg.clone();
@@ -2137,6 +2686,22 @@ mod tests {
                 if name == "clips-discord-confirm" {
                     app.confirm_discord = clips::list(&app.cfg.folder, 1).first().map(|c| c.path.clone());
                 }
+                // Start with Windows turned off in Task Manager (made up; the registry isn't read,
+                // as it's only read again when the window is shown or the box is ticked).
+                if name == "general-startup-taskmanager" {
+                    app.startup_turned_off = true;
+                }
+                // The new version downloading, with Cancel (made up; nothing is downloaded).
+                if name == "clips-update-cancel" {
+                    let progress = obs_install::Progress { stage: "Downloading".into(), done: 38 << 20, total: 92 << 20, ..Default::default() };
+                    app.update_job = Some(Arc::new(std::sync::Mutex::new(progress)));
+                }
+                // The newest clip opening (nothing is read: no answer comes while the sender is kept).
+                if name == "clips-opening"
+                    && let Some(c) = clips::list(&app.cfg.folder, 1).first()
+                {
+                    _opening = Some(app.opening_unanswered(&c.path));
+                }
                 app
             });
             // Thumbnails decode on another thread; give them time to arrive.
@@ -2146,22 +2711,22 @@ mod tests {
                 if name == "clips-scrub" && i == 30 {
                     h.hover_at(egui::pos2(420.0, 215.0));
                 }
-                // The first card's menu open on Export for sharing.
+                // The first card's menu open on Export for sharing (the header's menu comes first).
                 if name == "clips-export-menu" {
                     use egui_kittest::kittest::Queryable;
                     if i == 30 {
-                        h.query_all_by_label(&icon::MORE.to_string()).next().unwrap().click();
+                        h.query_all_by_label(&icon::MORE.to_string()).nth(1).unwrap().click();
                     }
                     if i == 35 {
                         h.get_by_label("Export for sharing").hover();
                     }
                 }
                 // Scrolled down to the Discord card.
-                if (name.starts_with("general-discord") || name == "general-archive" || name == "general-move" || name == "general-accent" || name == "general-no-tips" || name.starts_with("general-custom-color")) && i == 30 {
+                if (name.starts_with("general-discord") || name == "general-archive" || name == "general-move" || name == "general-accent" || name.starts_with("general-custom-color")) && i == 30 {
                     use egui_kittest::kittest::Queryable;
                     let label = match name.as_str() {
                         "general-move" => "Export settings...",
-                        "general-accent" | "general-no-tips" => "Accent color",
+                        "general-accent" => "Accent color",
                         "general-custom-color" | "general-custom-color-light" => "Custom color",
                         "general-archive" => "Move clips older than",
                         _ => "Webhook",
@@ -2186,6 +2751,16 @@ mod tests {
                     use egui_kittest::kittest::Queryable;
                     h.get_by_label("Refresh").scroll_to_me();
                 }
+                // Setup scrolled down to the note under its clips folder.
+                if name == "setup-clips-shared" && i == 30 {
+                    use egui_kittest::kittest::Queryable;
+                    h.query_all_by_label_contains("This is your Videos folder").next().unwrap().scroll_to_me();
+                }
+                // A game picked from its row in the sidebar.
+                if name == "clips-game-side" && i == 30 {
+                    use egui_kittest::kittest::Queryable;
+                    h.get_by_role_and_label(egui::Role::Tab, "VALORANT").click();
+                }
                 if name == "clips-sort-menu" && i == 30 {
                     use egui_kittest::kittest::Queryable;
                     h.get_by_label("Sort: Longest").click();
@@ -2197,7 +2772,7 @@ mod tests {
                 if name == "clips-tag-menu" || name == "clips-discord-menu" {
                     use egui_kittest::kittest::Queryable;
                     if i == 30 {
-                        h.query_all_by_label(&icon::MORE.to_string()).next().unwrap().click();
+                        h.query_all_by_label(&icon::MORE.to_string()).nth(1).unwrap().click();
                     }
                     if i == 35 && name == "clips-tag-menu" {
                         h.get_by_label("Tags").hover();
@@ -2212,44 +2787,50 @@ mod tests {
         // part kept, with its loud moments marked.
         let wave: Vec<f32> = (0..30 * media::PEAKS_PER_SEC).map(|i| if (200..260).contains(&i) { 0.9 } else if i == 80 || i == 440 { 0.7 } else { 0.05 + 0.1 * ((i as f32) * 0.7).sin().abs() }).collect();
         let parts_wave = wave.clone();
-        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([size[0] - 260.0, 100.0]).wgpu().build_ui(move |ui| {
-            apply_theme(ui.ctx());
-            let (mut view, mut start, mut end) = ((0.0, 30.0), 6.0, 18.0);
-            egui::Frame::new().fill(pal().card).inner_margin(12).show(ui, |ui| {
-                range_bar(ui, 30.0, &mut view, &mut start, &mut end, 8.0, false, &wave, &media::loud_moments(&wave), &[]);
-            });
-        });
-        h.step();
-        h.render().unwrap().save(out.join("waveform.png")).unwrap();
-        // Two parts kept (green) and a third being picked, with their chips and the save button.
-        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([size[0] - 260.0, 150.0]).wgpu().build_ui(move |ui| {
-            apply_theme(ui.ctx());
-            let mut t = TrimEdit { path: "x.mp4".into(), len: 30.0, start: 14.0, end: 18.0, view: (0.0, 30.0), gains: vec![], want_split: false, wave: Arc::default(), job: None, parts: vec![(2.0, 5.5), (20.0, 26.0)], gif: None, gif_msg: None, loud: None };
-            egui::Frame::new().fill(pal().card).inner_margin(12).show(ui, |ui| {
-                range_bar(ui, 30.0, &mut t.view, &mut t.start, &mut t.end, 15.0, false, &parts_wave, &[], &t.parts);
-                parts_row(ui, &mut t, false);
-                primary(ui, true, RichText::new(format!("Save {} parts as one clip", t.parts.len())).strong(), egui::Vec2::ZERO);
-            });
-        });
-        h.step();
-        h.render().unwrap().save(out.join("trim-parts.png")).unwrap();
-        // Save as GIF: a 4 s part (ready), the whole 30 s (too long), and one being made.
-        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([520.0, 140.0]).wgpu().build_ui(move |ui| {
-            apply_theme(ui.ctx());
-            let gif = Arc::new(ExportJob::default());
-            gif.pct.store(40, std::sync::atomic::Ordering::Relaxed);
-            for (start, end, gif) in [(6.0, 10.0, None), (0.0, 30.0, None), (6.0, 10.0, Some(gif))] {
-                let busy = gif.is_some();
-                let mut t = TrimEdit { path: "x.mp4".into(), len: 30.0, start, end, view: (0.0, 30.0), gains: vec![], want_split: false, wave: Arc::default(), job: None, parts: vec![], gif, gif_msg: None, loud: None };
-                ui.horizontal(|ui| {
-                    primary(ui, !busy, RichText::new("Save trimmed copy").strong(), egui::Vec2::ZERO);
-                    gif_button(ui, &mut t, busy);
-                    ui.label(RichText::new(format!("{} s selected", end - start)).small().color(pal().muted));
+        if wanted("waveform") {
+            let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([size[0] - 260.0, 100.0]).wgpu().build_ui(move |ui| {
+                apply_theme(ui.ctx());
+                let (mut view, mut start, mut end) = ((0.0, 30.0), 6.0, 18.0);
+                egui::Frame::new().fill(pal().card).inner_margin(12).show(ui, |ui| {
+                    range_bar(ui, 30.0, &mut view, &mut start, &mut end, 8.0, false, &wave, &media::loud_moments(&wave), &[]);
                 });
-            }
-        });
-        h.step();
-        h.render().unwrap().save(out.join("trim-gif.png")).unwrap();
+            });
+            h.step();
+            h.render().unwrap().save(out.join("waveform.png")).unwrap();
+        }
+        // Two parts kept (green) and a third being picked, with their chips and the save button.
+        if wanted("trim-parts") {
+            let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([size[0] - 260.0, 150.0]).wgpu().build_ui(move |ui| {
+                apply_theme(ui.ctx());
+                let mut t = TrimEdit { path: "x.mp4".into(), len: 30.0, start: 14.0, end: 18.0, view: (0.0, 30.0), gains: vec![], want_split: false, wave: Arc::default(), job: None, parts: vec![(2.0, 5.5), (20.0, 26.0)], gif: None, gif_msg: None, loud: None };
+                egui::Frame::new().fill(pal().card).inner_margin(12).show(ui, |ui| {
+                    range_bar(ui, 30.0, &mut t.view, &mut t.start, &mut t.end, 15.0, false, &parts_wave, &[], &t.parts);
+                    parts_row(ui, &mut t, false);
+                    primary(ui, true, RichText::new(format!("Save {} parts as one clip", t.parts.len())).strong(), egui::Vec2::ZERO);
+                });
+            });
+            h.step();
+            h.render().unwrap().save(out.join("trim-parts.png")).unwrap();
+        }
+        // Save as GIF: a 4 s part (ready), the whole 30 s (too long), and one being made.
+        if wanted("trim-gif") {
+            let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([520.0, 140.0]).wgpu().build_ui(move |ui| {
+                apply_theme(ui.ctx());
+                let gif = Arc::new(ExportJob::default());
+                gif.pct.store(40, std::sync::atomic::Ordering::Relaxed);
+                for (start, end, gif) in [(6.0, 10.0, None), (0.0, 30.0, None), (6.0, 10.0, Some(gif))] {
+                    let busy = gif.is_some();
+                    let mut t = TrimEdit { path: "x.mp4".into(), len: 30.0, start, end, view: (0.0, 30.0), gains: vec![], want_split: false, wave: Arc::default(), job: None, parts: vec![], gif, gif_msg: None, loud: None };
+                    ui.horizontal(|ui| {
+                        primary(ui, !busy, RichText::new("Save trimmed copy").strong(), egui::Vec2::ZERO);
+                        gif_button(ui, &mut t, busy);
+                        ui.label(RichText::new(format!("{} s selected", end - start)).small().color(pal().muted));
+                    });
+                }
+            });
+            h.step();
+            h.render().unwrap().save(out.join("trim-gif.png")).unwrap();
+        }
     }
 
     /// How long one frame takes (the app's own pass: layout, painting and tessellation), headless,
@@ -2268,7 +2849,6 @@ mod tests {
                 let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).wgpu().build_eframe(|cc| {
                     let mut app = App::preview(cc);
                     (app.cfg.folder, app.cfg.theme, app.cfg.light_mode, app.tab) = (demo.clone(), theme.into(), light, tab);
-                    app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
                     app.cfg.more_open = ["General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
                     app.saved = app.cfg.clone();
                     app.applied = recorder_settings(&app.cfg);
@@ -2316,7 +2896,6 @@ mod tests {
         let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size(size).with_accessibility_check(false).wgpu().build_eframe(|cc| {
             let mut app = App::preview(cc);
             app.cfg.folder = demo.clone();
-            app.cfg.tips_seen = ["Clips", "General", "Keybinds", "Video", "Audio", "Feedback", "Help", "What's new"].map(String::from).to_vec();
             setup(&mut app);
             app.saved = app.cfg.clone();
             app.applied = recorder_settings(&app.cfg);
@@ -2600,6 +3179,12 @@ mod tests {
                     assert!(contrast(c, s) >= 4.5, "{name} on {} (light {}) is {}", hex(s), p.light, contrast(c, s));
                 }
             }
+            // On a VCR remote's key and on the status box as the VCR's display.
+            for (name, c) in [("text", p.text), ("muted", p.muted), ("phosphor", p.phosphor), ("amber", p.amber)] {
+                for (on, s) in [("key", p.key), ("display", p.display)] {
+                    assert!(contrast(c, s) >= 4.5, "{name} on {on} (light {}) is {}", p.light, contrast(c, s));
+                }
+            }
             assert!(contrast(p.outline, p.card) >= 3.0, "outline (light {})", p.light);
             assert!(contrast(p.outline, p.bg) >= 3.0, "outline on page (light {})", p.light);
         }
@@ -2611,7 +3196,7 @@ mod tests {
     fn app_only_settings_keep_the_recorder() {
         let base = Config::default();
         let mut c = base.clone();
-        (c.show_tips, c.nvidia_off, c.game_bar_off, c.accent) = (false, true, true, 3);
+        (c.nvidia_off, c.game_bar_off, c.accent) = (true, true, 3);
         (c.theme, c.light_mode, c.custom_accent, c.reduce_effects) = ("retro".into(), true, "#123456".into(), true);
         c.overlay_hotkey = "Ctrl+Q".into();
         c.clip_sort = 3;
@@ -2721,7 +3306,7 @@ mod tests {
             app
         });
         h.run();
-        let item = "Del now works on a clip picked in Recent clips too, not only in All clips.";
+        let item = "The sidebar, the Clips page and the settings pages have a cleaner layout, and the Retro theme now reaches every screen.";
         assert!(h.query_by_label(item).is_some());
         h.get_by_label_contains("(this version)").click();
         // Past the closing animation.
@@ -2733,7 +3318,6 @@ mod tests {
     #[test]
     fn new_version_link_in_sidebar() {
         use egui_kittest::kittest::Queryable;
-        let _one_at_a_time = FOUND_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         app_update::set_found(Some(nine()));
         let harness = |check: bool| {
             let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(move |cc| {
@@ -2750,8 +3334,14 @@ mod tests {
         assert!(!off, "no link with the check turned off");
     }
 
-    /// The found release is global, so the tests that set it take turns.
-    static FOUND_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Clears the found release when dropped, so a failing test doesn't leave it set.
+    struct ForgetFound;
+
+    impl Drop for ForgetFound {
+        fn drop(&mut self) {
+            app_update::set_found(None);
+        }
+    }
 
     fn nine() -> app_update::Newer {
         app_update::Newer {
@@ -2787,13 +3377,12 @@ mod tests {
         }
     }
 
-    /// The sidebar link opens the new-version popup with what's new; this test copy isn't
+    /// The sidebar link opens the new-version popup with what's new; the exe tests run from isn't
     /// installed, so it updates itself from the release's exe: Install now, not the download
     /// page. Later closes it.
     #[test]
     fn new_version_popup() {
         use egui_kittest::kittest::Queryable;
-        let _one_at_a_time = FOUND_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         app_update::set_found(Some(nine()));
         let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| App::preview(cc));
         h.run();
@@ -2840,6 +3429,9 @@ mod tests {
         assert!(h.state().cfg == saved);
         assert!(h.query_by_label("Unsaved changes").is_none());
 
+        // At the bottom of the page now: scrolled to first, as a person would.
+        h.get_by_label("Restore defaults").scroll_to_me();
+        h.run();
         h.get_by_label("Restore defaults").click();
         h.run();
         assert_eq!(h.state().cfg.hotkey, Config::default().hotkey);
@@ -3081,7 +3673,6 @@ mod tests {
         let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
             let mut app = App::preview(cc);
             app.tab = Tab::Clips;
-            // The keys work on the clip lists (Home's rows don't take them).
             app.view = ClipsView::All;
             app.saved.folder = folder.clone();
             app.cfg.folder = folder;
@@ -3176,16 +3767,16 @@ mod tests {
         assert_eq!(h.state().confirm_recycle.as_ref().map(Vec::len), Some(2), "Delete after Ctrl+clicks");
         h.state_mut().confirm_recycle = None;
         h.run_steps(2);
-        // On Recent too: a click on a clip there, then Delete.
-        (h.state_mut().view, h.state_mut().selected) = (ClipsView::Games, None);
+        // With a game picked too (here Not sorted): a click on a clip there, then Delete.
+        (h.state_mut().view, h.state_mut().selected) = (ClipsView::Game(None), None);
         h.state_mut().picked.clear();
         h.run_steps(2);
         egui_kittest::kittest::Queryable::get_all_by_label(&h, "b").next().unwrap().click();
         h.run_steps(2);
-        assert_eq!(h.state().selected.as_ref(), Some(&dir.join("b.png")), "picked on Recent");
+        assert_eq!(h.state().selected.as_ref(), Some(&dir.join("b.png")), "picked with a game picked");
         h.key_press(egui::Key::Delete);
         h.run_steps(2);
-        assert_eq!(h.state().confirm_recycle.as_ref().map(Vec::len), Some(1), "Delete on Recent");
+        assert_eq!(h.state().confirm_recycle.as_ref().map(Vec::len), Some(1), "Delete with a game picked");
         h.state_mut().confirm_recycle = None;
         h.run_steps(2);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "nothing recycled");
@@ -3317,6 +3908,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The games under Clips follow the folder: a renamed clip stays counted, a new game's folder
+    /// shows up, and a game whose last clip is gone leaves the list. In a temp folder.
+    #[test]
+    fn games_follow_the_clips_folder() {
+        let dir = game_folder("instant-replay-games-follow");
+        let folder = dir.display().to_string();
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_accessibility_check(false).build_eframe(|cc| {
+            let mut app = App::preview(cc);
+            (app.tab, app.cfg.folder) = (Tab::Clips, folder);
+            app.saved.folder = app.cfg.folder.clone();
+            app
+        });
+        h.run_steps(2);
+        // In name order: the files are about as new as each other.
+        let names = |app: &App| app.clip_games.iter().map(|g| (g.name.clone(), g.count)).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names(h.state()), [(None, 1), (Some("VALORANT".into()), 1)].into());
+        h.state_mut().rename_clip(&dir.join(r"VALORANT\a.png"), "c");
+        std::fs::create_dir_all(dir.join("Elden Ring")).unwrap();
+        std::fs::write(dir.join(r"Elden Ring\d.png"), b"not really a picture").unwrap();
+        h.run_steps(2);
+        assert_eq!(names(h.state()), [(None, 1), (Some("Elden Ring".into()), 1), (Some("VALORANT".into()), 1)].into());
+        std::fs::remove_file(dir.join(r"VALORANT\c.png")).unwrap();
+        h.state_mut().rescan_clips();
+        h.run_steps(2);
+        assert_eq!(names(h.state()), [(None, 1), (Some("Elden Ring".into()), 1)].into());
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The AMD switch-off, once saved, says to restart the PC and check AMD Software (it's
+    /// untested), and Desktop capture says popups end up in clips; neither only on hover.
+    #[test]
+    fn amd_off_and_desktop_say_so() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 2400.0]).with_accessibility_check(false).build_eframe(|cc| {
+            let mut app = App::preview(cc);
+            app.tab = Tab::Keybinds;
+            app.nvidia = Some((false, false));
+            (app.cfg.amd_off, app.saved.amd_off) = (true, true);
+            app.amd = Some(Some(amd::Amd { replay_on: false, hotkeys_off: true, hotkeys: vec![] }));
+            app
+        });
+        h.run_steps(2);
+        assert!(h.query_by_label_contains("AMD Software reads this when it starts: restart the PC").is_some());
+        let app = h.state_mut();
+        (app.tab, app.cfg.capture) = (Tab::Video, "desktop".into());
+        app.cfg.more_open = vec!["Video".into()];
+        h.run_steps(2);
+        assert!(h.query_by_label_contains("Popups and notifications on that monitor show up in clips.").is_some());
+    }
+
     /// Only tags of clips still in the folder are offered (in memory; tags.json isn't written).
     #[test]
     fn tags_of_gone_clips_are_not_offered() {
@@ -3336,6 +3978,184 @@ mod tests {
         clips::set_tag(&mut app.tags, &dir.join("a.png"), "Aces", true);
         clips::set_tag(&mut app.tags, &dir.join("gone.png"), "Old", true);
         assert_eq!(app.tags_in_use(), ["Aces"]);
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The status box's Save clip sends a save, the same as the save key (there's no recorder
+    /// here: the command only goes into a channel).
+    #[test]
+    fn status_box_save_clip_saves() {
+        use egui_kittest::kittest::Queryable;
+        let (tx, rx) = mpsc::channel();
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(move |cc| {
+            let mut app = App::preview(cc);
+            (app.cmds, app.tab) = (tx, Tab::Keybinds);
+            app
+        });
+        h.run_steps(2);
+        h.get_by_role_and_label(egui::Role::Button, "Save clip").click();
+        h.run_steps(2);
+        assert!(rx.try_iter().any(|c| matches!(c, Cmd::Save)));
+    }
+
+    /// A muted mic shows in the status box until it's unmuted; clicking it unmutes.
+    #[test]
+    fn status_box_shows_a_muted_mic() {
+        use egui_kittest::kittest::Queryable;
+        let (tx, rx) = mpsc::channel();
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(move |cc| {
+            let mut app = App::preview(cc);
+            (app.cmds, app.tab) = (tx, Tab::Keybinds);
+            app
+        });
+        h.run_steps(2);
+        assert!(h.query_by_label("Mic muted").is_none());
+        h.state_mut().mic_muted = true;
+        h.run_steps(2);
+        h.get_by_label("Mic muted").click();
+        h.run_steps(2);
+        assert!(rx.try_iter().any(|c| matches!(c, Cmd::ToggleMic)));
+    }
+
+    /// Pictures in a temp folder `name`: a.png in VALORANT's folder, b.png not sorted.
+    fn game_folder(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("VALORANT")).unwrap();
+        std::fs::write(dir.join(r"VALORANT\a.png"), b"not really a picture").unwrap();
+        std::fs::write(dir.join("b.png"), b"not really a picture").unwrap();
+        dir
+    }
+
+    /// Each game keeps its tape color: the same clips give the same colors, and neither a newer
+    /// clip of another game (which moves that game to the front) nor another order changes any.
+    /// The first four games get four different colors in Retro; Minimalist hands out none.
+    #[test]
+    fn tape_colors_stay_with_their_game() {
+        let clip = |game: Option<&str>, secs: u64| clips::Clip {
+            path: format!("{secs}.mp4").into(),
+            name: format!("{secs}.mp4"),
+            bytes: 1,
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            group: game.map(String::from),
+            is_picture: false,
+        };
+        let slots = |list: &[clips::Clip]| games_in(list).into_iter().map(|g| (g.name, g.tape)).collect::<std::collections::BTreeMap<_, _>>();
+        let list = vec![clip(Some("VALORANT"), 30), clip(None, 20), clip(Some("Elden Ring"), 10), clip(Some("apex"), 5)];
+        let before = slots(&list);
+        assert_eq!(slots(&list), before);
+        let newer: Vec<clips::Clip> = std::iter::once(clip(Some("Elden Ring"), 40)).chain(list.iter().cloned()).collect();
+        assert_eq!(games_in(&newer)[0].name.as_deref(), Some("Elden Ring"), "played last, so first");
+        assert_eq!(slots(&newer), before);
+        let oldest_first: Vec<clips::Clip> = list.iter().rev().cloned().collect();
+        assert_eq!(slots(&oldest_first), before);
+        assert_eq!(before[&None], 3, "Not sorted last");
+        let colors: std::collections::BTreeSet<[u8; 4]> = before.values().map(|&s| RETRO_LOOK.tape_colors[s % RETRO_LOOK.tape_colors.len()].to_array()).collect();
+        assert_eq!(colors.len(), 4);
+        assert!(MINIMALIST.tape_colors.is_empty());
+    }
+
+    /// A game's row under Clips in the sidebar opens the Clips page showing just that game, and
+    /// All games shows every clip again.
+    #[test]
+    fn sidebar_game_rows_filter_clips() {
+        use egui_kittest::kittest::Queryable;
+        let dir = game_folder("instant-replay-side-games");
+        let folder = dir.display().to_string();
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
+            let mut app = App::preview(cc);
+            (app.tab, app.cfg.folder) = (Tab::General, folder);
+            app.saved.folder = app.cfg.folder.clone();
+            app
+        });
+        h.run_steps(2);
+        h.get_by_role_and_label(egui::Role::Tab, "VALORANT").click();
+        h.run_steps(2);
+        assert!(h.state().tab == Tab::Clips && h.state().view == ClipsView::Game(Some("VALORANT".into())));
+        assert!(h.query_by_label("a").is_some() && h.query_by_label("b").is_none(), "only VALORANT's clip");
+        h.get_by_role_and_label(egui::Role::Tab, "All games").click();
+        h.run_steps(2);
+        assert!(h.state().view == ClipsView::All);
+        assert!(h.query_by_label("a").is_some() && h.query_by_label("b").is_some(), "every clip");
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// In the smallest window the app allows, in either look and with the most the sidebar's
+    /// bottom can hold (the new-version link and a key clash), the sidebar draws compact and the
+    /// status box and its Save clip stay on screen, with no room for even one game row, so the
+    /// games aren't shown; a normal height shows them.
+    #[test]
+    fn sidebar_skips_games_when_no_row_fits() {
+        use egui_kittest::kittest::Queryable;
+        app_update::set_found(Some(nine()));
+        let forget = ForgetFound;
+        let dir = game_folder("instant-replay-side-short");
+        let folder = dir.display().to_string();
+        let sidebar = |theme: &str, height: f32, most: bool| {
+            let (folder, theme) = (folder.clone(), theme.to_string());
+            let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([860.0, height]).with_accessibility_check(false).build_eframe(move |cc| {
+                let mut app = App::preview(cc);
+                (app.tab, app.cfg.folder, app.cfg.theme) = (Tab::General, folder, theme);
+                (app.saved.folder, app.saved.check_updates) = (app.cfg.folder.clone(), most);
+                // A clash on the save key, as if just checked.
+                if most {
+                    app.conflicts = vec![(Target::Save, "Also used by another program.".into())];
+                    app.conflicts_keys = Target::ALL.into_iter().map(|t| app.hotkey_of(t).clone()).collect();
+                    app.conflicts_checked = Some(std::time::Instant::now());
+                }
+                app
+            });
+            h.run_steps(4);
+            let games = h.query_by_role_and_label(egui::Role::Tab, "VALORANT").is_some();
+            let shown = h.query_by_label_contains("Version 9.0.0 is out").is_some() && h.query_by_label_contains("Key clash").is_some();
+            let status = h.get_by_role_and_label(egui::Role::Button, "Save clip").rect().bottom();
+            (games, shown, status)
+        };
+        let short = ["minimalist", "retro"].map(|theme| (theme, sidebar(theme, 560.0, true), sidebar(theme, 560.0, false).2));
+        let normal = ["minimalist", "retro"].map(|theme| (theme, sidebar(theme, 700.0, false).0));
+        drop(forget);
+        let _ = std::fs::remove_dir_all(&dir);
+        for (theme, (games, shown, status), plain) in short {
+            assert!(shown, "{theme}: the link and the clash show");
+            assert!(!games, "{theme}: no games when no row fits");
+            assert!(status <= 560.0 && plain <= 560.0, "{theme}: status box on screen at 560, its button ends at {status} ({plain} without the link and clash)");
+        }
+        for (theme, games) in normal {
+            assert!(games, "{theme}: games at a normal height");
+        }
+    }
+
+    /// A game's chip on the Clips page is the same filter as its row in the sidebar (both show it
+    /// picked), the All games chip shows every clip again, and Starred only the starred ones.
+    #[test]
+    fn game_chips_and_starred_filter_clips() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let dir = game_folder("instant-replay-game-chips");
+        let folder = dir.display().to_string();
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(|cc| {
+            let mut app = App::preview(cc);
+            (app.tab, app.cfg.folder) = (Tab::Clips, folder);
+            app.saved.folder = app.cfg.folder.clone();
+            app
+        });
+        h.run_steps(2);
+        h.get_by_label("VALORANT 1").click();
+        h.run_steps(2);
+        assert!(h.state().view == ClipsView::Game(Some("VALORANT".into())));
+        assert_eq!(h.get_by_role_and_label(egui::Role::Tab, "VALORANT").accesskit_node().toggled(), Some(egui::accesskit::Toggled::True), "picked in the sidebar too");
+        assert!(h.query_by_label("a").is_some() && h.query_by_label("b").is_none(), "only VALORANT's clip");
+        h.get_by_role_and_label(egui::Role::Button, "All games").click();
+        h.run_steps(2);
+        assert!(h.state().view == ClipsView::All);
+        assert!(h.query_by_label("a").is_some() && h.query_by_label("b").is_some(), "every clip");
+        // Starred in memory only (favorites.json isn't written).
+        h.state_mut().favorites.insert(dir.join("b.png").display().to_string());
+        h.get_by_label("Starred").click();
+        h.run_steps(2);
+        assert!(h.state().view == ClipsView::Starred);
+        assert!(h.query_by_label("a").is_none() && h.query_by_label("b").is_some(), "only the starred clip");
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3402,5 +4222,27 @@ mod tests {
             b.wheel(b.x_of(5.0), -3.0, ctrl);
         }
         assert_eq!(b.view, (0.0, 10.0));
+    }
+
+    /// A display change restarts the recorder only when what it takes from the monitors changed,
+    /// never during a full recording or while a game is in front, and at most every 30 s.
+    #[test]
+    fn display_changes_restart_the_recorder_when_they_matter() {
+        use std::time::Duration;
+        let mon = |w: u32, h: u32| display::Monitor { id: "main".into(), width: w, height: h, hz: 144, x: 0, y: 0, primary: true, hdr: None, name: String::new() };
+        let cfg = Config::default();
+        let (old, new) = (recorder::display_key(&cfg, &[mon(2560, 1440)]), recorder::display_key(&cfg, &[mon(1920, 1080)]));
+        let no_game = || false;
+        let step = |recording, since: Option<u64>, game: bool| display_step(&old, &new, recording, since.map(Duration::from_secs), || game);
+        assert_eq!(step(false, None, false), DisplayStep::Restart);
+        assert_eq!(step(false, Some(31), false), DisplayStep::Restart);
+        assert_eq!(step(true, None, false), DisplayStep::Hold(DisplayHold::Recording));
+        assert_eq!(step(false, None, true), DisplayStep::Hold(DisplayHold::Game));
+        assert_eq!(step(false, Some(10), false), DisplayStep::Hold(DisplayHold::TooSoon(Duration::from_secs(20))));
+        // Back as it was (a game's own resolution, gone with the game): nothing to do, and the game
+        // isn't even asked about.
+        assert_eq!(display_step(&old, &old, false, None, || panic!("asked about a game")), DisplayStep::Unchanged);
+        assert_eq!(display_step(&old, &old, true, None, no_game), DisplayStep::Hold(DisplayHold::Recording), "known once the recording stops");
+        assert_eq!(display_step(&old, &None, false, None, no_game), DisplayStep::Restart, "no monitor at all");
     }
 }

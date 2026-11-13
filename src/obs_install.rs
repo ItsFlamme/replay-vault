@@ -31,9 +31,15 @@ fn base() -> PathBuf {
 /// A folder the user picked for the private OBS (so it needn't sit on the system drive).
 static INSTALL_ROOT: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
-/// Sets where the private OBS lives; empty means the default under %LOCALAPPDATA%.
+/// Sets where the private OBS lives; empty means the default under %LOCALAPPDATA%. Ignored by a
+/// copy that may not pick it (see `instance`).
 pub fn set_install_root(dir: &str) {
-    *INSTALL_ROOT.write().unwrap() = (!dir.trim().is_empty()).then(|| PathBuf::from(dir.trim()));
+    *INSTALL_ROOT.write().unwrap() = chosen_root(dir, crate::instance::current().obs_dir_allowed());
+}
+
+/// The folder picked for the private OBS, if one was and this copy may use it.
+fn chosen_root(dir: &str, allowed: bool) -> Option<PathBuf> {
+    (allowed && !dir.trim().is_empty()).then(|| PathBuf::from(dir.trim()))
 }
 
 /// The folder holding the private OBS, its pending update and the download.
@@ -220,6 +226,9 @@ pub fn private_dir() -> PathBuf {
 /// these by name, so anything else in a folder the user picked stays. Returns what couldn't go.
 pub fn recycle_install_root() -> Vec<String> {
     let root = install_root();
+    if let Some(why) = crate::instance::current().install_root_kept(&root) {
+        return vec![why];
+    }
     let ours = [private_dir(), staged_dir(), root.join("obs-studio.old"), root.join("obs-studio.partial"), root.join("obs-download.zip"), update_stamp(), crate::app_update::installer_path()];
     let problems = ours
         .iter()
@@ -287,27 +296,81 @@ pub struct Progress {
     pub total: u64,
     /// `Some` once finished: `Ok` or the error to show.
     pub result: Option<Result<(), String>>,
+    /// Set by `cancel`: a download (`download_to`) stops at its next read and ends with `CANCELLED`.
+    pub cancel: bool,
 }
 
 pub type Shared = Arc<Mutex<Progress>>;
 
+/// The error a cancelled download ends with.
+pub(crate) const CANCELLED: &str = "cancelled";
+
+/// A download that gets nothing for this long stops, however long the whole thing takes on a slow link.
+const STALL: Duration = Duration::from_secs(60);
+
+/// The progress, even if a job panicked while holding it.
+fn lock(p: &Shared) -> std::sync::MutexGuard<'_, Progress> {
+    p.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) fn set(p: &Shared, stage: &str, done: u64, total: u64) {
-    let mut g = p.lock().unwrap();
+    let mut g = lock(p);
     g.stage = stage.into();
     g.done = done;
     g.total = total;
 }
 
-/// Runs `job` on a thread, reporting into a fresh progress handle.
+/// Asks the job's download to stop; its `result` comes once it has (`CANCELLED`, partial file removed).
+pub(crate) fn cancel(p: &Shared) {
+    lock(p).cancel = true;
+}
+
+/// Runs `job` on a thread, reporting into a fresh progress handle. A job that panics ends with an
+/// error too, so whatever waits on it isn't left waiting.
 pub(crate) fn spawn(job: impl FnOnce(&Shared) -> anyhow::Result<()> + Send + 'static, repaint: impl Fn() + Send + 'static) -> Shared {
     let p: Shared = Arc::default();
     let p2 = p.clone();
     std::thread::spawn(move || {
-        let r = job(&p2).map_err(|e| format!("{e:#}"));
-        p2.lock().unwrap().result = Some(r);
+        let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&p2))) {
+            Ok(r) => r.map_err(|e| format!("{e:#}")),
+            Err(_) => Err("it stopped unexpectedly (the log has details)".into()),
+        };
+        lock(&p2).result = Some(r);
         repaint();
     });
     p
+}
+
+/// Copies a download from `reader` into `file` as it comes, reporting `stage` and how far it got
+/// out of `total` into `p`, and returns its SHA-256. Ends with `CANCELLED` once `cancel` was asked
+/// for, and says so when the connection stalled (`get` gives up after `STALL` without a byte).
+pub(crate) fn download_to(reader: &mut impl Read, file: &mut impl Write, p: &Shared, stage: &str, total: u64) -> anyhow::Result<Sha256> {
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut done = 0u64;
+    loop {
+        if lock(p).cancel {
+            anyhow::bail!(CANCELLED);
+        }
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if stalled(&e) => anyhow::bail!("nothing came in for a minute, so the download stopped. Check your internet connection and try again"),
+            Err(e) => return Err(e.into()),
+        };
+        if n == 0 {
+            return Ok(hash);
+        }
+        file.write_all(&buf[..n])?;
+        hash.update(&buf[..n]);
+        done += n as u64;
+        set(p, stage, done, total);
+    }
+}
+
+/// Whether a read failed because nothing came in time: the socket's own timeout, or ureq's per-read one.
+fn stalled(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::TimedOut || e.get_ref().and_then(|i| i.downcast_ref::<ureq::Error>()).is_some_and(|u| matches!(u, ureq::Error::Timeout(_)))
 }
 
 struct Release {
@@ -317,21 +380,23 @@ struct Release {
     sha256: String,
 }
 
-/// GET with timeouts, so a dead connection fails with a message instead of hanging setup forever.
-/// `body` caps the whole download (the OBS zip gets long enough for slow links).
-pub(crate) fn get(url: &str, body: Duration) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+/// GET with timeouts, so a dead connection fails with a message instead of hanging setup forever:
+/// one that sends nothing for `STALL` stops. `body` caps the whole answer; None for a download,
+/// which may take long on a slow link while it keeps coming.
+pub(crate) fn get(url: &str, body: Option<Duration>) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
     ureq::get(url)
         .header("User-Agent", AGENT)
         .config()
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
-        .timeout_recv_body(Some(body))
+        .timeout_per_read(Some(STALL))
+        .timeout_recv_body(body)
         .build()
         .call()
 }
 
 fn latest_release() -> anyhow::Result<Release> {
-    let mut resp = get(RELEASES, Duration::from_secs(60))?;
+    let mut resp = get(RELEASES, Some(Duration::from_secs(60)))?;
     let json: serde_json::Value = serde_json::from_str(&resp.body_mut().read_to_string()?)?;
     let version = json["tag_name"].as_str().unwrap_or_default().to_string();
     let asset = json["assets"]
@@ -369,21 +434,15 @@ fn fetch(rel: &Release, dest: &Path, p: &Shared) -> anyhow::Result<()> {
         File::options().read(true).write(true).create(true).truncate(true).share_mode(FILE_SHARE_READ).open(&zip_path)?
     };
     {
-        let mut resp = get(&rel.url, Duration::from_secs(2 * 3600))?;
-        let mut reader = resp.body_mut().as_reader();
-        let mut hash = Sha256::new();
-        let mut buf = vec![0u8; 256 * 1024];
-        let mut done = 0u64;
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
+        let downloaded = get(&rel.url, None).map_err(anyhow::Error::from).and_then(|mut resp| download_to(&mut resp.body_mut().as_reader(), &mut file, p, &format!("Downloading OBS {}", rel.version), rel.size));
+        let hash = match downloaded {
+            Ok(h) => h,
+            Err(e) => {
+                drop(file);
+                let _ = fs::remove_file(&zip_path);
+                return Err(e);
             }
-            file.write_all(&buf[..n])?;
-            hash.update(&buf[..n]);
-            done += n as u64;
-            set(p, &format!("Downloading OBS {}", rel.version), done, rel.size);
-        }
+        };
         let got: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
         if got != rel.sha256 {
             drop(file);
@@ -447,7 +506,7 @@ fn vc_runtime(p: &Shared) -> anyhow::Result<()> {
     let dir = base().join(format!("vc-{}", crate::config::random_hex()));
     fs::create_dir_all(&dir)?;
     let path = dir.join("vc_redist.x64.exe");
-    let mut resp = get(VC_REDIST, Duration::from_secs(30 * 60))?;
+    let mut resp = get(VC_REDIST, None)?;
     io::copy(&mut resp.body_mut().as_reader(), &mut File::create(&path)?)?;
     if !signed_by_microsoft(&path) {
         let _ = fs::remove_dir_all(&dir);
@@ -480,7 +539,6 @@ fn signed_by_microsoft(path: &Path) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-const FIREWALL_RULE: &str = "Replay Vault recorder";
 /// What the rule was called before the rename; still recognized and removed.
 const OLD_FIREWALL_RULE: &str = "Instant Replay recorder";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -500,9 +558,23 @@ enum Rule {
     Elsewhere(&'static str),
 }
 
+/// The rule names `inst` looks at and owns: its own first, then (if it may) the old one.
+fn rule_names(inst: &crate::instance::Instance) -> Vec<&str> {
+    names_of_rules(inst.firewall_rule(), inst.legacy_names_allowed())
+}
+
+/// `own`, then the old name if `legacy` (`rule_names`).
+fn names_of_rules(own: &str, legacy: bool) -> Vec<&str> {
+    let mut names = vec![own];
+    if legacy {
+        names.push(OLD_FIREWALL_RULE);
+    }
+    names
+}
+
 fn rule_state(exe: &Path) -> Rule {
     let mut other = None;
-    for name in [FIREWALL_RULE, OLD_FIREWALL_RULE] {
+    for name in rule_names(crate::instance::current()) {
         let Some(listing) = show_rule(name) else { continue };
         if lists_program(&listing, exe) {
             return Rule::Ok;
@@ -573,7 +645,7 @@ fn firewall_rule(exe: PathBuf, p: &Shared) -> anyhow::Result<()> {
             "Pointed the firewall rule at the private OBS copy's new folder.",
         ),
         Rule::Missing => (
-            format!("advfirewall firewall add rule name=\"{FIREWALL_RULE}\" dir=in action=block enable=yes profile=any program=\"{}\"", exe.display()),
+            format!("advfirewall firewall add rule name=\"{}\" dir=in action=block enable=yes profile=any program=\"{}\"", crate::instance::current().firewall_rule(), exe.display()),
             "Added a firewall rule blocking incoming connections to the private OBS copy.",
         ),
     };
@@ -588,7 +660,7 @@ fn firewall_rule(exe: PathBuf, p: &Shared) -> anyhow::Result<()> {
 
 /// Takes our firewall rule away again (for Remove); Windows asks for permission (UAC).
 pub fn remove_firewall_rule() -> anyhow::Result<()> {
-    for name in [FIREWALL_RULE, OLD_FIREWALL_RULE].into_iter().filter(|n| rule_exists(n)) {
+    for name in rule_names(crate::instance::current()).into_iter().filter(|n| rule_exists(n)) {
         let code = run_elevated(&crate::recorder::windows_exe("netsh.exe"), &format!("advfirewall firewall delete rule name=\"{name}\""))?;
         anyhow::ensure!(code == 0 && !rule_exists(name), "the firewall rule wasn't removed (netsh code {code})");
     }
@@ -732,6 +804,60 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A download is copied and hashed as it comes; Cancel stops it at the next read; a connection
+    /// that stalls says so; any other read error is passed on as it is.
+    #[test]
+    fn download_to_cancels_and_reports_a_stall() {
+        let p: Shared = Arc::default();
+        let mut out = Vec::new();
+        let hash = download_to(&mut &b"hello"[..], &mut out, &p, "Downloading", 5).unwrap();
+        assert_eq!(out, b"hello");
+        assert_eq!(hash.finalize()[..], Sha256::digest(b"hello")[..]);
+        let got = lock(&p).clone();
+        assert_eq!((got.done, got.total), (5, 5));
+
+        // Cancel pressed while the first chunk came in: no more is read.
+        struct Then<'a>(&'a Shared, u32);
+        impl Read for Then<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.1 += 1;
+                cancel(self.0);
+                buf[0] = 1;
+                Ok(1)
+            }
+        }
+        let p: Shared = Arc::default();
+        let mut reader = Then(&p, 0);
+        let e = download_to(&mut reader, &mut Vec::new(), &p, "Downloading", 10).unwrap_err();
+        assert_eq!(e.to_string(), CANCELLED);
+        assert_eq!(reader.1, 1, "stopped at the next read");
+
+        // Stalled: the socket's timeout, or ureq's per-read one wrapped in an io error.
+        struct Fails(fn() -> io::Error);
+        impl Read for Fails {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err((self.0)())
+            }
+        }
+        for e in [|| io::Error::from(io::ErrorKind::TimedOut), || ureq::Error::Timeout(ureq::Timeout::PerRead).into_io()] {
+            let msg = download_to(&mut Fails(e), &mut Vec::new(), &Arc::default(), "Downloading", 10).unwrap_err().to_string();
+            assert!(msg.starts_with("nothing came in for a minute"), "{msg}");
+        }
+        let msg = download_to(&mut Fails(|| io::Error::from(io::ErrorKind::ConnectionReset)), &mut Vec::new(), &Arc::default(), "Downloading", 10).unwrap_err().to_string();
+        assert!(!msg.starts_with("nothing came in"), "{msg}");
+    }
+
+    /// A job that panics still ends, with an error, so the dialog waiting on it closes.
+    #[test]
+    fn a_panicking_job_still_ends() {
+        let p = spawn(|_| panic!("test panic"), || {});
+        let result = (0..100).find_map(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            lock(&p).result.clone()
+        });
+        assert!(result.is_some_and(|r| r.is_err()));
+    }
+
     /// Real download into the private folder: `cargo test -- --ignored download`.
     #[test]
     #[ignore]
@@ -786,6 +912,15 @@ mod tests {
         assert_eq!(oem_text(&[b'a', 0x82]).chars().count(), 2);
     }
 
+    /// This copy keeps its rule's name and still finds the old one; without old names it has only
+    /// its own. netsh gets the name as one argument (show) or in quotes
+    /// (add, set, delete), so spaces and brackets in a name stay part of it.
+    #[test]
+    fn firewall_rule_names() {
+        assert_eq!(rule_names(crate::instance::current()), ["Replay Vault recorder", "Instant Replay recorder"]);
+        assert_eq!(names_of_rules("Replay Vault recorder (2)", false), ["Replay Vault recorder (2)"]);
+    }
+
     /// Tests that change the install folder take turns, since it's one global.
     static ROOT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -813,6 +948,14 @@ mod tests {
         assert_eq!(exe_in(&private_dir()), PathBuf::from(r"E:\Games\Instant Replay OBS\obs-studio\bin\64bit\obs64.exe"));
         set_install_root("  ");
         assert_eq!(install_root(), base());
+    }
+
+    /// A copy that may not pick its OBS folder never gets one, whatever is saved.
+    #[test]
+    fn obs_dir_ignored_when_not_allowed() {
+        assert_eq!(chosen_root(r"E:\Games\Replay Vault OBS", true), Some(PathBuf::from(r"E:\Games\Replay Vault OBS")));
+        assert_eq!(chosen_root(" ", true), None);
+        assert_eq!(chosen_root(r"E:\Games\Replay Vault OBS", false), None);
     }
 
     /// A folder open to every signed-in account (like one on a second drive), with a file in it,
