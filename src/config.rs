@@ -439,7 +439,15 @@ impl Config {
             v.retain(|c| !c.is_control());
         }
         if self.folder.trim().is_empty() {
-            self.folder = d.folder;
+            self.folder = d.folder.clone();
+        }
+        // Only folders this copy may keep clips in (see `instance`), so settings copied from
+        // another copy can't point its recorder, auto-cleanup or archive at that copy's clips.
+        let allowed = |dir: &str| crate::instance::current().clips_dir_allowed(dir);
+        for (v, default, name) in [(&mut self.folder, d.folder.as_str(), "Clips folder"), (&mut self.archive_folder, "", "Archive folder")] {
+            if let Some(was) = allowed_or(v, default, allowed) {
+                say_refused(&format!("{name} {} can't be used, so it's {}: {}", was.trim(), if default.is_empty() { "cleared".to_string() } else { format!("set to {default}") }, crate::instance::CLIPS_DIR_FIXED));
+            }
         }
         for n in &mut self.track_names {
             *n = n.chars().filter(|c| !c.is_control()).take(24).collect();
@@ -463,10 +471,37 @@ impl Config {
     /// mid-save, or another thread reading it (autopause, the tray), never sees half a file. A
     /// readable old file is kept as config.json.bak once a day (`clips::write_json`), for `load`
     /// to fall back on.
+    /// A clips or archive folder this copy may not use (see `sanitize`) is never written: the save
+    /// fails, saying why.
     pub fn save(&self) -> anyhow::Result<()> {
+        if let Some(f) = self.refused_folder(|d| crate::instance::current().clips_dir_allowed(d)) {
+            anyhow::bail!("{f} can't be used. {}", crate::instance::CLIPS_DIR_FIXED);
+        }
         fs::create_dir_all(dir())?;
         crate::clips::write_json(&path(), self)?;
         Ok(())
+    }
+
+    /// The clips or archive folder `allowed` refuses, as written (trimmed), if one is.
+    pub(crate) fn refused_folder(&self, allowed: impl Fn(&str) -> bool) -> Option<&str> {
+        [&self.folder, &self.archive_folder].into_iter().find(|f| !allowed(f)).map(|f| f.trim())
+    }
+}
+
+/// Puts `folder` back to `default` if `allowed` refuses it; returns the one refused.
+pub(crate) fn allowed_or(folder: &mut String, default: &str, allowed: impl Fn(&str) -> bool) -> Option<String> {
+    (!allowed(folder)).then(|| std::mem::replace(folder, default.to_string()))
+}
+
+/// Logs a folder `sanitize` refused, once a run each: many threads load the settings, and a load
+/// keeps refusing until the window has saved the folder it was put back to.
+fn say_refused(msg: &str) {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut said) = SAID.lock() else { return };
+    if !said.iter().any(|m| m == msg) {
+        said.push(msg.to_string());
+        drop(said);
+        crate::log::write(msg);
     }
 }
 
@@ -781,6 +816,22 @@ mod tests {
         let mut long = long;
         long.sanitize();
         assert!(long.chat_tracks[0], "voice chat may go on track 1 too");
+    }
+
+    /// A clips or archive folder this copy may not use goes back to its default (the archive's to
+    /// none); one it may use is kept. This copy may use any, so sanitize keeps both.
+    #[test]
+    fn refused_folders_go_back_to_defaults() {
+        let mut folder = r"D:\Videos\Replay Vault Clips".to_string();
+        assert_eq!(allowed_or(&mut folder, r"G:\Copy\replay-vault-data\clips", |_| true), None);
+        assert_eq!(folder, r"D:\Videos\Replay Vault Clips");
+        assert_eq!(allowed_or(&mut folder, r"G:\Copy\replay-vault-data\clips", |d| d.starts_with('G')).as_deref(), Some(r"D:\Videos\Replay Vault Clips"));
+        assert_eq!(folder, r"G:\Copy\replay-vault-data\clips");
+        let mut c = Config { folder: r"D:\Videos\Replay Vault Clips".into(), archive_folder: r"\\nas\old".into(), ..Config::default() };
+        c.sanitize();
+        assert_eq!((c.folder.as_str(), c.archive_folder.as_str()), (r"D:\Videos\Replay Vault Clips", r"\\nas\old"));
+        assert_eq!(c.refused_folder(|d| crate::instance::current().clips_dir_allowed(d)), None, "and Save takes them");
+        assert_eq!(c.refused_folder(|d| !d.starts_with(r"\\")), Some(r"\\nas\old"));
     }
 
     /// A file with every value out of range (hand-edited, or a hostile settings file) loads and

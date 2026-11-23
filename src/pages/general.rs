@@ -158,6 +158,13 @@ fn want_risk(key: (String, String), ctx: &egui::Context) {
     });
 }
 
+/// Under a clips or archive folder this copy may not use (see `instance`): why, as Save won't keep it.
+fn refused_note(ui: &mut egui::Ui, dir: &str) {
+    if !crate::instance::current().clips_dir_allowed(dir) {
+        ui.label(RichText::new(format!("{} This one can't be saved.", crate::instance::CLIPS_DIR_FIXED)).small().color(pal().red));
+    }
+}
+
 /// Remove from this PC's hover text.
 pub(crate) const REMOVE_ABOUT: &str = "Puts back everything the app changed on this PC, moves its private OBS copy and settings to the Recycle Bin and uninstalls the app. Asks first; your clips stay.";
 
@@ -237,6 +244,7 @@ impl App {
 
     /// Under the clips folder (here and in setup): why auto-cleanup and the archive won't run in it.
     pub(crate) fn clips_folder_note(&mut self, ui: &mut egui::Ui) {
+        refused_note(ui, &self.cfg.folder);
         if let Some(why) = self.clips_folder_risk(ui.ctx()) {
             let text = format!("This is {why}. Auto-cleanup and the archive won't run in it, as they would take your own videos and pictures too. Pick a folder just for clips, like a new one inside it.");
             ui.label(RichText::new(text).small().color(pal().amber));
@@ -357,6 +365,7 @@ impl App {
             limit(ui, &mut self.cfg.archive_days, "Move clips older than", "days", 30, 3650, rules);
             if self.cfg.archive_days > 0 {
                 row(ui, "Archive folder", |ui| folder_field(ui, &mut self.cfg.archive_folder, "Another drive or a NAS folder"));
+                refused_note(ui, &self.cfg.archive_folder);
                 let risk = self.clips_folder_risk(ui.ctx());
                 let off = risk.is_some() && archive_rule(&self.cfg).is_some();
                 let (text, color) = match archive_rule(&self.cfg) {
@@ -651,6 +660,7 @@ mod tests {
         h.run();
         assert!(on_screen(&h, &format!("Auto-cleanup is off: the clips folder ({videos}) is your Videos folder")));
         assert!(on_screen(&h, &format!("The archive is off: the clips folder ({videos}) is your Videos folder")));
+        assert!(!on_screen(&h, "can't be saved"), "this copy may keep clips and archive them anywhere");
         let anyway = h.query_all_by_label("Use this folder anyway").collect::<Vec<_>>();
         assert_eq!(anyway.len(), 2, "on both cards");
         assert!(anyway[0].accesskit_node().description().unwrap_or_default().contains("Every video and picture in it, and in the folders right inside it, then counts as a clip"));
@@ -666,6 +676,7 @@ mod tests {
         h.state_mut().cfg.folder = std::path::Path::new(&videos).parent().unwrap().display().to_string();
         h.run();
         assert!(on_screen(&h, "Auto-cleanup and the archive won't run in it"));
+        assert!(!on_screen(&h, "can't be saved"));
     }
 
     /// The folder risk thread takes the newest folder wanted, one thread at a time, and an answer

@@ -216,17 +216,16 @@ pub(crate) struct ExportJob {
 }
 
 impl ExportJob {
-    /// Makes `out` with `make` on a background thread. A failed try's file is removed; a made one
-    /// goes in the log as "`what` <out>". Repaints when done.
-    pub(crate) fn spawn(out: std::path::PathBuf, what: String, ctx: &egui::Context, make: impl FnOnce(&ExportJob, &std::path::Path) -> anyhow::Result<()> + Send + 'static) -> Arc<Self> {
+    /// Makes a new file with `make` on a background thread, under a hidden name until it's whole
+    /// (`clips::make_export`), so one cut short never looks like a clip, then names it what `pick`
+    /// picks (`clips::copy_name`, `clips::montage_name`). A failed try's file is removed; a made
+    /// one goes in the log as "`what` <out>". Repaints when done.
+    pub(crate) fn spawn(pick: impl Fn() -> std::path::PathBuf + Send + 'static, what: String, ctx: &egui::Context, make: impl FnOnce(&ExportJob, &std::path::Path) -> anyhow::Result<()> + Send + 'static) -> Arc<Self> {
         let job = Arc::new(ExportJob::default());
         let (slot, ctx) = (job.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let r = make(&slot, &out).map(|()| out.clone()).map_err(|e| {
-                let _ = std::fs::remove_file(&out);
-                format!("{e:#}")
-            });
-            if r.is_ok() {
+            let r = clips::make_export(pick, |tmp| make(&slot, tmp)).map_err(|e| format!("{e:#}"));
+            if let Ok(out) = &r {
                 log::write(&format!("{what} {}", out.display()));
             }
             *slot.done.lock().unwrap() = Some(r);
@@ -1657,7 +1656,8 @@ impl App {
     pub(crate) fn start_export(&mut self, path: &std::path::Path, share: media::Share, ctx: &egui::Context) {
         let src = path.to_path_buf();
         let what = format!("Exported {} to", src.display());
-        let job = ExportJob::spawn(clips::copy_name(path, share.label()), what, ctx, move |job, out| media::export(&src, out, share, &|f| job.progress(f)));
+        let named = src.clone();
+        let job = ExportJob::spawn(move || clips::copy_name(&named, share.label()), what, ctx, move |job, out| media::export(&src, out, share, &|f| job.progress(f)));
         self.exports.insert(path.to_path_buf(), job);
     }
 
@@ -1769,11 +1769,11 @@ impl App {
                     None => "Make montage".into(),
                 };
                 if primary(ui, !busy && !m.clips.is_empty(), RichText::new(text).strong(), egui::Vec2::ZERO).on_hover_text("Joins the clips into one new video in your clips folder").clicked() {
-                    let out = clips::montage_name(std::path::Path::new(&self.saved.folder), std::time::SystemTime::now());
+                    let (folder, now) = (std::path::PathBuf::from(&self.saved.folder), std::time::SystemTime::now());
                     let music = m.music.clone().map(|path| media::Music { path, volume: m.volume });
                     let (list, fades) = (m.clips.clone(), m.fades);
                     let what = format!("Made a montage of {} clips at", list.len());
-                    m.job = Some(ExportJob::spawn(out, what, ui.ctx(), move |job, out| {
+                    m.job = Some(ExportJob::spawn(move || clips::montage_name(&folder, now), what, ui.ctx(), move |job, out| {
                         // Each whole clip with track 1's sound, the way it plays.
                         let parts = list.iter().map(|p| Ok(media::Part { path: p.clone(), start: 0.0, end: f64::INFINITY, gains: media::track1(media::audio_tracks(p)?) }));
                         let parts = parts.collect::<anyhow::Result<Vec<_>>>()?;

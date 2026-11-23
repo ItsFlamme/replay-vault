@@ -28,11 +28,28 @@ pub fn pid() -> Option<u32> {
 /// A Windows program by its full path (`System32\<name>`, or the Windows folder for explorer), so
 /// a same-named exe next to the app or in the current folder is never run instead.
 pub fn windows_exe(name: &str) -> PathBuf {
-    let win = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()));
+    exe_under(&system_dir(), name)
+}
+
+/// Windows' System32 folder, as Windows itself says (not the SystemRoot variable, which whoever
+/// starts the app can set); `%SystemRoot%\System32` only if Windows can't say.
+fn system_dir() -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buf = [0u16; 260];
+    let n = unsafe { windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    if n > 0 && n < buf.len() {
+        return PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
+    }
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("System32")
+}
+
+/// `name` among Windows' programs in `system` (System32): explorer is in the Windows folder above
+/// it, PowerShell in its own folder below.
+fn exe_under(system: &Path, name: &str) -> PathBuf {
     match name {
-        "explorer.exe" => win.join(name),
-        "powershell.exe" => win.join(r"System32\WindowsPowerShell\v1.0").join(name),
-        _ => win.join("System32").join(name),
+        "explorer.exe" => system.parent().unwrap_or(system).join(name),
+        "powershell.exe" => system.join(r"WindowsPowerShell\v1.0").join(name),
+        _ => system.join(name),
     }
 }
 
@@ -302,8 +319,22 @@ pub const NAME_STYLES: [(&str, &str); 2] = [
     ("%MM-%DD-%CCYY %I-%mm-%ss %p", "11-06-2026 06-42-33 PM"),
 ];
 
-/// What a clip saved in VALORANT now would be called. OBS names it by the date alone; the game
-/// goes in front when the clip is moved into place.
+/// What OBS puts in front of the date on a replay it saves ("Replay 11-06-2026 06-42-33 PM.mp4"),
+/// although the settings written here leave its prefix empty. A full recording gets the date alone.
+pub const REPLAY_PREFIX: &str = "Replay ";
+
+/// Whether `s` is a date in one of `NAME_STYLES`, as OBS writes it in a file name.
+pub fn is_stamp(s: &str) -> bool {
+    NAME_STYLES.iter().any(|(_, example)| shape(s) == shape(example))
+}
+
+/// `s` with every digit as 9 and every letter as a.
+fn shape(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_digit() { '9' } else if c.is_alphabetic() { 'a' } else { c }).collect()
+}
+
+/// What a clip saved in VALORANT now would be called: the game takes the place of OBS's "Replay"
+/// when the clip is moved into place (`clips::placed_stem`).
 pub fn example_name(cfg: &Config) -> String {
     let (_, date) = NAME_STYLES[(cfg.name_style as usize).min(NAME_STYLES.len() - 1)];
     format!("VALORANT {date}.mp4")
@@ -592,16 +623,89 @@ pub fn obs_log() -> Option<PathBuf> {
         .map(|e| e.path())
 }
 
-/// The last error-looking line in the hidden OBS's log, without its timestamp.
-pub fn last_obs_error() -> Option<String> {
-    let text = String::from_utf8_lossy(&fs::read(obs_log()?).ok()?).into_owned();
-    text.lines()
-        .rev()
-        .find(|l| {
-            let l = l.to_lowercase();
-            l.contains("error") || l.contains("fail") || l.contains("stopped because")
-        })
-        .map(|l| l.split_once(": ").map_or(l, |(_, rest)| rest).trim().to_string())
+/// What an OBS log line must be about to be quoted with an error.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum About {
+    /// A save: the replay buffer's own lines (its muxer is "adv_replay_buffer").
+    Save,
+    /// Instant replay not starting: the replay buffer, or the encoder it needs.
+    Output,
+    /// The recorder can't be reached: its WebSocket server didn't start or bind its port.
+    Reach,
+}
+
+/// Where the hidden OBS's log ended at a moment (`log_mark`): what it writes after that came
+/// after the moment. By place in the log, not by its times, which are only a time of day.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LogMark {
+    file: Option<PathBuf>,
+    len: u64,
+}
+
+/// The end of the hidden OBS's log now. Looks at its logs folder: at a press, a start or a
+/// connect, never every frame.
+pub fn log_mark() -> LogMark {
+    let file = obs_log();
+    let len = file.as_ref().and_then(|f| fs::metadata(f).ok()).map_or(0, |m| m.len());
+    LogMark { file, len }
+}
+
+/// The log's end when the recorder was last started (`restart`).
+static LAUNCH_LOG: std::sync::Mutex<Option<LogMark>> = std::sync::Mutex::new(None);
+
+pub fn launch_log() -> LogMark {
+    LAUNCH_LOG.lock().unwrap().clone().unwrap_or_default()
+}
+
+/// The last error-looking line the hidden OBS logged after `mark` that is about `about`, without
+/// its timestamp. Reads the log, so call it only when an error is being reported.
+pub fn obs_error_since(mark: &LogMark, about: About) -> Option<String> {
+    let file = obs_log()?;
+    let bytes = fs::read(&file).ok()?;
+    pick_obs_error(&String::from_utf8_lossy(written_since(mark, &file, &bytes)), about)
+}
+
+/// What of the log `file` (`bytes`) was written after `mark`: what was added to the log it was in,
+/// or all of a later one (OBS starts a log per run, named by its start, so later ones sort after),
+/// and nothing of an earlier one.
+fn written_since<'a>(mark: &LogMark, file: &Path, bytes: &'a [u8]) -> &'a [u8] {
+    match &mark.file {
+        Some(m) if m.as_path() == file => bytes.get(mark.len as usize..).unwrap_or_default(),
+        Some(m) if file.file_name() <= m.file_name() => &[],
+        _ => bytes,
+    }
+}
+
+/// The text of a log line after OBS's "HH:MM:SS.mmm: " start, if it has one.
+fn log_text(line: &str) -> Option<&str> {
+    let (time, rest) = line.split_once(": ")?;
+    let (hms, ms) = time.split_once('.')?;
+    let n: Vec<u32> = hms.split(':').map(|n| n.parse().ok()).collect::<Option<_>>()?;
+    match n[..] {
+        [h, m, s] if time.len() == 12 && h < 24 && m < 60 && s < 60 && ms.parse::<u32>().is_ok() => Some(rest),
+        _ => None,
+    }
+}
+
+/// `pick_obs_error` on the log's text written after a mark: the last line that looks like an
+/// error, is about `about`, and isn't one that's never about it (game capture's hook updater,
+/// obs-websocket's messages to one client).
+fn pick_obs_error(log: &str, about: About) -> Option<String> {
+    const NEVER: [&str; 4] = ["update_hook_file", "graphics-hook", "sending message to client", "websocketserver::onmessage"];
+    const ERROR: [&str; 6] = ["error", "fail", "stopped because", "unable", "could not", "couldn't"];
+    let topic: &[&str] = match about {
+        About::Save => &["replay buffer", "replay_buffer"],
+        About::Output => &["replay buffer", "replay_buffer", "encoder"],
+        About::Reach => &["websocketserver::start", "bind", "listen", " port", "address already in use"],
+    };
+    for line in log.lines().rev() {
+        let Some(rest) = log_text(line) else { continue };
+        let l = rest.to_lowercase();
+        if ERROR.iter().any(|w| l.contains(w)) && !NEVER.iter().any(|w| l.contains(w)) && topic.iter().any(|w| l.contains(w)) {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -881,6 +985,8 @@ pub fn restart(cfg: &Config) -> anyhow::Result<()> {
     }
     *PASSWORD.lock().unwrap() = cfg.recorder_password.clone();
     *OUTPUT.lock().unwrap() = Some(PathBuf::from(&cfg.folder));
+    let mark = log_mark();
+    *LAUNCH_LOG.lock().unwrap() = Some(mark);
     let front = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
     let child = Command::new(&exe)
         .args(["--portable", "--multi", "--minimize-to-tray", "--startreplaybuffer", "--disable-updater"])
@@ -969,6 +1075,92 @@ mod tests {
     use super::*;
     use crate::config::{AppSel, DeviceSel};
     use std::time::{Duration, Instant};
+
+    /// Windows' programs are found in the folder Windows names (no environment variable), and laid
+    /// out from it as Windows has them.
+    #[test]
+    fn windows_programs_by_full_path() {
+        let system = system_dir();
+        // Windows may say "system32".
+        assert!(system.is_absolute() && system.file_name().is_some_and(|n| n.eq_ignore_ascii_case("System32")) && system.join("cmd.exe").is_file(), "{}", system.display());
+        for name in ["cmd.exe", "PING.EXE", "netsh.exe", "explorer.exe", "powershell.exe"] {
+            let exe = windows_exe(name);
+            assert!(exe.is_absolute() && exe.is_file(), "{}", exe.display());
+        }
+        let sys = Path::new(r"D:\Win\System32");
+        assert_eq!(exe_under(sys, "cmd.exe"), Path::new(r"D:\Win\System32\cmd.exe"));
+        assert_eq!(exe_under(sys, "explorer.exe"), Path::new(r"D:\Win\explorer.exe"));
+        assert_eq!(exe_under(sys, "powershell.exe"), Path::new(r"D:\Win\System32\WindowsPowerShell\v1.0\powershell.exe"));
+    }
+
+    /// The name General shows is the one a replay OBS saves now gets once it's moved into place,
+    /// in each name style.
+    #[test]
+    fn example_name_matches_placed_clips() {
+        for (i, (_, date)) in NAME_STYLES.iter().enumerate() {
+            let cfg = Config { name_style: i as u8, ..Config::default() };
+            let placed = crate::clips::placed_stem(&format!("{REPLAY_PREFIX}{date}"), "VALORANT");
+            assert_eq!(example_name(&cfg), format!("{placed}.mp4"));
+            assert!(is_stamp(date) && !is_stamp(&placed));
+        }
+        assert_eq!(example_name(&Config { name_style: 1, ..Config::default() }), "VALORANT 11-06-2026 06-42-33 PM.mp4");
+    }
+
+    /// Only an error line about the save (or the port) is quoted: never game capture's hook
+    /// updater or obs-websocket's per-client messages, the two lines a real 0.2.2 log wrongly
+    /// blamed, nor another error that only shares a word with a save (a path, an output, writing,
+    /// the full recording).
+    #[test]
+    fn obs_error_picks_only_relevant_lines() {
+        let log = "12:05:20.100: [ffmpeg muxer: 'adv_replay_buffer'] Wrote 900 MB\n\
+                   12:05:21.002: [ffmpeg muxer: 'adv_replay_buffer'] Error writing to 'D:/Clips/Replay 11-15-2026 12-05-20 AM.mp4': No space left on device\n\
+                   12:05:30.511: update_hook_file: failed to update C:\\ProgramData\\obs-studio-hook\\graphics-hook32.dll (32)\n\
+                   12:05:30.600: [obs-websocket] [WebSocketServer::onMessage] Sending message to client failed: Bad Connection\n\
+                   not a log line with an error\n";
+        assert_eq!(pick_obs_error(log, About::Save).as_deref(), Some("[ffmpeg muxer: 'adv_replay_buffer'] Error writing to 'D:/Clips/Replay 11-15-2026 12-05-20 AM.mp4': No space left on device"));
+        assert_eq!(pick_obs_error(log, About::Output).as_deref(), Some("[ffmpeg muxer: 'adv_replay_buffer'] Error writing to 'D:/Clips/Replay 11-15-2026 12-05-20 AM.mp4': No space left on device"));
+        // Only the two misattributed lines: nothing.
+        let after = log.split_once("No space left on device\n").unwrap().1;
+        assert_eq!(pick_obs_error(after, About::Save), None);
+        assert_eq!(pick_obs_error(after, About::Reach), None);
+        // Errors that only share a word with a save.
+        let unrelated = "12:06:00.000: [ffmpeg muxer: 'adv_file_output'] Error writing to 'D:/Clips/Recordings/2026-11-15 12-00-00.mp4'\n\
+                         12:06:01.000: [game-capture: 'Game'] failed to write hook path\n\
+                         12:06:02.000: Output 'virtualcam_output': failed to start\n\
+                         12:06:03.000: [recording] could not open the output path\n\
+                         12:06:04.000: [jim-nvenc] encoder error: out of memory\n";
+        assert_eq!(pick_obs_error(unrelated, About::Save), None);
+        assert_eq!(pick_obs_error(unrelated, About::Output).as_deref(), Some("[jim-nvenc] encoder error: out of memory"), "instant replay needs the encoder");
+        let port = "12:00:01.000: [obs-websocket] [WebSocketServer::Start] Error: Failed to bind to port 4466: address already in use\n\
+                    12:00:09.000: update_hook_file: failed to update C:\\ProgramData\\obs-studio-hook\\graphics-hook64.dll (32)\n";
+        assert_eq!(pick_obs_error(port, About::Reach).as_deref(), Some("[obs-websocket] [WebSocketServer::Start] Error: Failed to bind to port 4466: address already in use"));
+        assert_eq!(pick_obs_error(port, About::Output), None);
+        assert_eq!(log_text("12:05:20.100: x"), Some("x"));
+        assert_eq!(log_text("Error: no time"), None);
+        assert_eq!(log_text("25:00:00.000: x"), None);
+    }
+
+    /// What the log had at the mark is never quoted, whatever its times say: a log that sat
+    /// quiet for a day (its last line from yesterday at a later time of day than the press), or
+    /// across midnight. A log started after the mark counts whole; an older one not at all.
+    #[test]
+    fn obs_errors_only_after_the_mark() {
+        let logs = Path::new(r"C:\obs\logs");
+        let file = logs.join("2026-11-21 09-00-00.txt");
+        // Yesterday 23:10 the replay buffer failed; the press is today at 12:05, after a quiet day.
+        let old = "23:10:00.000: [ffmpeg muxer: 'adv_replay_buffer'] Error writing, disk full\n";
+        let mark = LogMark { file: Some(file.clone()), len: old.len() as u64 };
+        let now = format!("{old}12:05:22.000: [ffmpeg muxer: 'adv_replay_buffer'] Error writing to 'D:/Clips/x.mp4'\n");
+        let since = |text: &str, f: &Path| String::from_utf8_lossy(written_since(&mark, f, text.as_bytes())).into_owned();
+        assert_eq!(pick_obs_error(&since(old, &file), About::Save), None, "nothing new since the press");
+        assert_eq!(pick_obs_error(&since(&now, &file), About::Save).as_deref(), Some("[ffmpeg muxer: 'adv_replay_buffer'] Error writing to 'D:/Clips/x.mp4'"));
+        // A later run's log, all of it; an earlier one's, none of it; no log at the mark: all.
+        assert_eq!(since(old, &logs.join("2026-11-22 12-00-00.txt")), old);
+        assert_eq!(since(old, &logs.join("2026-11-20 08-00-00.txt")), "");
+        assert_eq!(String::from_utf8_lossy(written_since(&LogMark::default(), &file, old.as_bytes())), old);
+        // A log that's shorter than at the mark (not OBS's way) gives nothing.
+        assert_eq!(since("23:10", &file), "");
+    }
 
     /// A trimmed OBS (`obs_install::prune`) really records: a copy of OBS at `RV_OBS_COPY` (its
     /// obs-studio folder, a throwaway copy) is trimmed, started on port 4477 with this app's settings, saves a clip

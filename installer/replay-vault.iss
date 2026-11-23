@@ -36,6 +36,8 @@ RestartApplications=no
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
+; A file that leaves this list goes into [InstallDelete] in the same commit, so an update takes
+; the old copy's one away.
 Source: "{#SrcDir}\replay-vault.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SrcDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SrcDir}\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
@@ -48,6 +50,8 @@ Name: "{autodesktop}\Replay Vault"; Filename: "{app}\replay-vault.exe"; Tasks: d
 [Registry]
 ; "Start with Windows" lives in the user's Run list; take it out on uninstall.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Replay Vault"; Flags: uninsdeletevalue dontcreatekey
+; And Task Manager's on or off for it, which Windows keeps apart from the Run list.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: none; ValueName: "Replay Vault"; Flags: uninsdeletevalue dontcreatekey
 
 [Run]
 Filename: "{app}\replay-vault.exe"; Description: "{cm:LaunchProgram,Replay Vault}"; Flags: nowait postinstall skipifsilent

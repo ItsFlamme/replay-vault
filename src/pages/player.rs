@@ -174,7 +174,8 @@ pub(crate) fn trim_controls(ui: &mut egui::Ui, p: &mut player::Player, t: &mut T
             let gains = (!untouched).then(|| t.gains.clone());
             let parts: Vec<media::Part> = t.parts.iter().map(|&(start, end)| media::Part { path: t.path.clone(), start, end, gains: t.gains.clone() }).collect();
             let what = format!("Trimmed {} to", src.display());
-            t.job = Some(ExportJob::spawn(clips::copy_name(&t.path, "trim"), what, ui.ctx(), move |job, out| match &gains {
+            let named = src.clone();
+            t.job = Some(ExportJob::spawn(move || clips::copy_name(&named, "trim"), what, ui.ctx(), move |job, out| match &gains {
                 _ if !parts.is_empty() => media::join(&parts, out, false, None, &|f| job.progress(f), &|| false),
                 Some(g) => media::trim_mixed(&src, out, start, end, g),
                 None => media::trim(&src, out, start, end),
@@ -211,7 +212,8 @@ pub(crate) fn gif_button(ui: &mut egui::Ui, t: &mut TrimEdit, busy: bool) {
     if gif.clicked() {
         let (src, start, end) = (t.path.clone(), t.start, t.end);
         let what = format!("Made a GIF of {} at", src.display());
-        t.gif = Some(ExportJob::spawn(clips::copy_name(&t.path.with_extension("gif"), "GIF"), what, ui.ctx(), move |job, out| media::save_gif(&src, out, start, end, &|f| job.progress(f))));
+        let named = t.path.with_extension("gif");
+        t.gif = Some(ExportJob::spawn(move || clips::copy_name(&named, "GIF"), what, ui.ctx(), move |job, out| media::save_gif(&src, out, start, end, &|f| job.progress(f))));
         t.gif_msg = None;
     }
 }

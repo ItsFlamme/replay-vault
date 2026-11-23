@@ -45,7 +45,7 @@ fn has_entry() -> bool {
 /// Whether the entry is there but turned off in Task Manager's Startup apps (or Settings > Apps >
 /// Startup), so Windows skips it.
 pub fn turned_off_in_task_manager() -> bool {
-    has_entry() && read_binary(HKEY_CURRENT_USER, APPROVED_KEY, &run_value()).is_some_and(|b| approved(&b) == Some(false))
+    has_entry() && read_binary(HKEY_CURRENT_USER, APPROVED_KEY, PCWSTR(run_value().as_ptr())).is_some_and(|b| approved(&b) == Some(false))
 }
 
 /// What Task Manager keeps for an entry: on or off by the first byte (2 or 6 on, 3 or 7 off: the
@@ -57,7 +57,7 @@ fn approved(bytes: &[u8]) -> Option<bool> {
 /// Task Manager's "on" for an entry: what it writes itself when one is turned back on.
 const APPROVED_ON: [u8; 12] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
-fn read_binary(root: HKEY, key: PCWSTR, value: &HSTRING) -> Option<Vec<u8>> {
+fn read_binary(root: HKEY, key: PCWSTR, value: PCWSTR) -> Option<Vec<u8>> {
     let mut buf = [0u8; 64];
     let mut size = buf.len() as u32;
     let err = unsafe { RegGetValueW(root, key, value, RRF_RT_REG_BINARY, None, Some(buf.as_mut_ptr().cast()), Some(&mut size)) };
@@ -65,10 +65,12 @@ fn read_binary(root: HKEY, key: PCWSTR, value: &HSTRING) -> Option<Vec<u8>> {
 }
 
 /// Adds or removes this exe from the current user's Windows startup list. Adding it also turns it
-/// back on if it was turned off in Task Manager, so it really starts.
+/// back on if it was turned off in Task Manager, so it really starts. Removing it also takes away
+/// Task Manager's on or off for it; with none, a new entry simply counts as on.
 pub fn set_enabled(on: bool) -> anyhow::Result<()> {
     if !on {
         let _ = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &run_value()) };
+        let _ = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, APPROVED_KEY, &run_value()) };
         return Ok(());
     }
     write_entry()?;
@@ -114,6 +116,18 @@ pub fn repair() {
             Err(e) => crate::log::write(&format!("Couldn't fix the Start with Windows entry: {e:#}")),
         }
     }
+}
+
+/// The pre-rename entry ("OBS Instant Replay") as it is now: (whether it's in Run, whether Task
+/// Manager still keeps its on or off). For `tidy`, which decides; reads only.
+pub(crate) fn old_entry() -> (bool, bool) {
+    (read_string(HKEY_CURRENT_USER, RUN_KEY, OLD_RUN_VALUE).is_some(), read_binary(HKEY_CURRENT_USER, APPROVED_KEY, OLD_RUN_VALUE).is_some())
+}
+
+/// Takes away what Task Manager keeps for the pre-rename entry (for `tidy`, once the entry is gone).
+pub(crate) fn drop_old_approved() -> anyhow::Result<()> {
+    unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, APPROVED_KEY, OLD_RUN_VALUE) }.ok()?;
+    Ok(())
 }
 
 pub fn obs_exe() -> Option<PathBuf> {

@@ -23,7 +23,7 @@ fn missed_lately(missed: &HashMap<String, (Instant, bool)>, game: &str, online: 
 }
 
 /// Tests use their own folder, filled only by `steam_lookup_live`.
-fn dir() -> PathBuf {
+pub(crate) fn dir() -> PathBuf {
     if cfg!(test) { std::env::temp_dir().join("instant-replay-covers-test") } else { crate::config::dir().join("covers") }
 }
 
@@ -122,30 +122,10 @@ pub fn note_title(game: &str, title: &str) {
     }
 }
 
-/// Removes the markers (`.skip`, `.none`, a half-downloaded `.part`) of games with no folder in
-/// the clips folder or the archive any more, and those older versions wrote for every window
-/// seen. Covers stay. Does nothing if either folder isn't there (a drive or NAS that's off).
-pub fn tidy(clips: &Path, archive: Option<&Path>) {
-    tidy_in(&dir(), clips, archive);
-}
-
-fn tidy_in(dir: &Path, clips: &Path, archive: Option<&Path>) {
-    let roots: Vec<&Path> = std::iter::once(clips).chain(archive).collect();
-    if !roots.iter().all(|r| r.is_dir()) {
-        return;
-    }
-    let Ok(files) = std::fs::read_dir(dir) else { return };
-    let mut removed = 0;
-    for path in files.flatten().map(|f| f.path()) {
-        let marker = path.extension().is_some_and(|e| ["skip", "none", "part"].iter().any(|m| e.eq_ignore_ascii_case(m)));
-        if marker && path.file_stem().is_some_and(|game| !roots.iter().any(|r| r.join(game).is_dir())) && std::fs::remove_file(&path).is_ok() {
-            removed += 1;
-        }
-    }
-    if removed > 0 {
-        crate::log::write(&format!("Removed {removed} cover notes for games with no clips."));
-    }
-}
+/// What a game's file in the covers folder is kept as besides its cover: a note that it's not a
+/// game, that Steam has no match, or a cover half downloaded (`fetch`). `tidy` removes those of
+/// games with no folder any more.
+pub(crate) const MARKERS: [&str; 3] = ["skip", "none", "part"];
 
 /// Looks the game up on Steam and saves its cover, or a `.none` marker when there's no exact match.
 fn fetch(dir: &Path, game: &str) -> anyhow::Result<()> {
@@ -280,27 +260,6 @@ mod tests {
         std::fs::write(dir.join("Inbox (3).skip"), b"").unwrap();
         assert_eq!(state(&dir, "Inbox (3)", now), State::Missing, "named after a browser tab: never asked");
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Markers of games with no clips folder go, everything else stays; nothing goes if the
-    /// clips folder is missing.
-    #[test]
-    fn tidy_removes_orphan_markers() {
-        let root = std::env::temp_dir().join("instant-replay-covers-tidy");
-        let _ = std::fs::remove_dir_all(&root);
-        let (dir, clips) = (root.join("covers"), root.join("clips"));
-        std::fs::create_dir_all(&dir).unwrap();
-        for f in ["Inbox (3).skip", "Gone.none", "Gone.part", "Gone.jpg", "Kept.skip", "Kept.none"] {
-            std::fs::write(dir.join(f), b"").unwrap();
-        }
-        tidy_in(&dir, &clips, None);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 6, "no clips folder: nothing removed");
-        std::fs::create_dir_all(clips.join("Kept")).unwrap();
-        tidy_in(&dir, &clips, None);
-        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|f| f.unwrap().file_name().to_string_lossy().into_owned()).collect();
-        left.sort();
-        assert_eq!(left, ["Gone.jpg", "Kept.none", "Kept.skip"]);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A game with no cover isn't looked for again until RECHECK has gone by, unless it's now

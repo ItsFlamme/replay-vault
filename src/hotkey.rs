@@ -63,12 +63,15 @@ static REQUEST: Mutex<Option<(Action, Option<Combo>, Reply)>> = Mutex::new(None)
 struct Capture {
     active: bool,
     result: Option<Combo>,
-    on_done: Option<Callback>,
+    /// The last press refused while capturing (see `refusal`), so the page can say why.
+    rejected: Option<Combo>,
+    /// Asks for a repaint: when capture ends, and when a press is refused.
+    on_change: Option<Callback>,
     /// When the last capture ended: the key that ended it is likely still down.
     ended: Option<std::time::Instant>,
 }
 
-static CAPTURE: Mutex<Capture> = Mutex::new(Capture { active: false, result: None, on_done: None, ended: None });
+static CAPTURE: Mutex<Capture> = Mutex::new(Capture { active: false, result: None, rejected: None, on_change: None, ended: None });
 
 /// While a key is being set, and just after: a press then is the new key, not a command.
 fn setting_key() -> bool {
@@ -84,8 +87,9 @@ pub enum Held {
     Shared,
 }
 
-/// Starts the thread that owns the app's hotkeys and calls `on_press` when one fires.
-pub fn install(on_press: impl Fn(Action) + Send + 'static) -> anyhow::Result<()> {
+/// Starts the thread that owns the app's hotkeys and calls `on_press` when one fires, with when
+/// it was noticed (taken first, before anything else this thread does with it).
+pub fn install(on_press: impl Fn(Action, std::time::Instant) + Send + 'static) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut msg = MSG::default();
@@ -96,17 +100,19 @@ pub fn install(on_press: impl Fn(Action) + Send + 'static) -> anyhow::Result<()>
             let _ = tx.send(GetCurrentThreadId());
             while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                 if msg.message == WM_HOTKEY {
+                    let at = std::time::Instant::now();
                     if let Some(a) = Action::from_id(msg.wParam.0)
                         && !setting_key() {
                         crate::log::write(&format!("Key pressed: {a:?}."));
-                        on_press(a);
+                        on_press(a, at);
                     }
                 } else if msg.message == WM_TIMER && msg.hwnd.is_invalid() && msg.wParam.0 == shared.timer {
+                    let at = std::time::Instant::now();
                     // Polled even while a key is being set, so a key held then doesn't count later.
                     let pressed = shared.poll();
                     for a in pressed.into_iter().filter(|_| !setting_key()) {
                         crate::log::write(&format!("Key pressed: {a:?} (shared key)."));
-                        on_press(a);
+                        on_press(a, at);
                     }
                 } else if msg.message == WM_APP
                     && let Some((action, combo, reply)) = REQUEST.lock().unwrap().take() {
@@ -213,13 +219,15 @@ pub fn watch_save(combo: Option<Combo>) -> Result<(), String> {
     set_combo(Action::SaveKey, combo).map(|_| ())
 }
 
-/// Waits for the next combo the user presses and calls `on_done`. Escape cancels.
-pub fn start_capture(on_done: impl Fn() + Send + 'static) {
+/// Waits for the next combo the user presses and calls `on_change` when it's done, and when a
+/// press is refused (capture goes on). Escape cancels.
+pub fn start_capture(on_change: impl Fn() + Send + 'static) {
     {
         let mut c = CAPTURE.lock().unwrap();
         c.active = true;
         c.result = None;
-        c.on_done = Some(Box::new(on_done));
+        c.rejected = None;
+        c.on_change = Some(Box::new(on_change));
     }
     std::thread::spawn(|| {
         // Keys held when capture starts (like the one that clicked the button) don't count.
@@ -267,6 +275,11 @@ pub fn take_captured() -> Option<Combo> {
     CAPTURE.lock().unwrap().result.take()
 }
 
+/// The last press refused while a key is being set, if any.
+pub fn rejected() -> Option<Combo> {
+    CAPTURE.lock().unwrap().rejected
+}
+
 fn down(vk: u16) -> bool {
     (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0
 }
@@ -283,7 +296,7 @@ fn poll_capture(held: &[u16]) {
         c.active = false;
         c.ended = Some(std::time::Instant::now());
         c.result = None;
-        if let Some(f) = &c.on_done {
+        if let Some(f) = &c.on_change {
             f();
         }
         return;
@@ -294,11 +307,17 @@ fn poll_capture(held: &[u16]) {
             continue;
         }
         let combo = Combo { vk, ctrl: down(0x11), alt: down(0x12), shift: down(0x10), win: down(0x5B) || down(0x5C) };
-        if vk == VK_ESCAPE || combo.has_modifier() || allowed_bare(vk) {
+        if vk == VK_ESCAPE || refusal(combo).is_none() {
             c.active = false;
             c.ended = Some(std::time::Instant::now());
             c.result = (vk != VK_ESCAPE).then_some(combo);
-            if let Some(f) = &c.on_done {
+            if let Some(f) = &c.on_change {
+                f();
+            }
+        } else if c.rejected != Some(combo) {
+            // Once per refused press, not every poll while it's held.
+            c.rejected = Some(combo);
+            if let Some(f) = &c.on_change {
                 f();
             }
         }
@@ -310,6 +329,12 @@ fn poll_capture(held: &[u16]) {
 /// fire while typing.
 fn allowed_bare(vk: u16) -> bool {
     matches!(vk, 0x70..=0x87 | 0x13 | 0x91 | 0x2C | 0x2D | 0x21..=0x24)
+}
+
+/// Why `c` can't be a hotkey, or None if it can: a key that would fire while typing needs
+/// Ctrl, Alt, Shift or Win with it.
+pub fn refusal(c: Combo) -> Option<String> {
+    (!c.has_modifier() && !allowed_bare(c.vk)).then(|| format!("{c} needs Ctrl, Alt, Shift or Win with it. Press another key."))
 }
 
 /// Name shown in the app, and OBS's name for the same key.
@@ -445,7 +470,7 @@ mod tests {
     #[ignore]
     fn live_shared_keys() {
         use super::{Action, Held, install, set_combo};
-        install(|a| println!("heard {a:?}")).unwrap();
+        install(|a, _| println!("heard {a:?}")).unwrap();
         for (a, k) in [(Action::Record, "Alt+R"), (Action::Screenshot, "Alt+F1")] {
             let held = set_combo(a, Combo::parse(k)).unwrap();
             println!("{k}: {}", if held == Held::Shared { "shared with the program that holds it" } else { "free, this app's alone" });
@@ -505,6 +530,27 @@ mod tests {
         assert_eq!(Combo::parse("Alt+`").unwrap().to_string(), "Alt+~");
         assert!(Combo::parse("Alt+").is_none());
         assert!(Combo::parse("C").is_none(), "a bare letter would fire while typing");
+    }
+
+    /// Keys that would fire while typing are refused on their own, with a reason that names the
+    /// key; F-keys and the other quiet keys work bare, and any key works with a modifier.
+    #[test]
+    fn refuses_bare_typing_keys() {
+        use super::refusal;
+        let bare = |vk| Combo { vk, ctrl: false, alt: false, shift: false, win: false };
+        assert_eq!(refusal(bare(0x41)).as_deref(), Some("A needs Ctrl, Alt, Shift or Win with it. Press another key."));
+        for vk in [0x41, 0x5A, 0x30, 0x39, 0x20, 0x09, 0x0D, 0x08, 0x2E, 0x25, 0x60, 0xBD, 0xC0] {
+            assert!(refusal(bare(vk)).is_some(), "{} bare", bare(vk));
+        }
+        assert!(refusal(bare(0x20)).unwrap().starts_with("Space needs"));
+        for vk in (0x70..=0x87).chain([0x13, 0x91, 0x2C, 0x2D, 0x21, 0x22, 0x23, 0x24]) {
+            assert_eq!(refusal(bare(vk)), None, "{} bare", bare(vk));
+        }
+        for m in 0..4 {
+            let c = Combo { vk: 0x41, ctrl: m == 0, alt: m == 1, shift: m == 2, win: m == 3 };
+            assert_eq!(refusal(c), None, "{c}");
+        }
+        assert_eq!(refusal(Combo { vk: 0x20, ctrl: true, alt: false, shift: false, win: false }), None);
     }
 
     #[test]

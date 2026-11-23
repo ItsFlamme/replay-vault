@@ -2,6 +2,31 @@
 
 Notable changes in each release. The app's What's new page is built from this file.
 
+## 0.2.3
+
+### Changed
+
+- Saving a clip shows Saving clip... with the game as soon as the app sees the click or the save key, until Clip saved replaces it.
+- When a clip isn't saved, the popup says so, to press the save key again and about how long the moment stays in the replay, and the status box and the tray menu offer Save again until then. The app never asks the recorder to save again by itself, so one press never makes two clips. If instant replay stopped or started over since the press, nothing is offered and the app says the moment is no longer in the replay. If the recorder restarted or stopped answering, it says the moment may no longer be there.
+- On a slow drive the app says once how long clips take to save there.
+- Keybinds says when a new key takes effect, and why a key it can't use was skipped.
+- The tray menu has Open last clip's folder.
+- New clips are named after the game and the time, like VALORANT 2026-11-21 17-53-32, without the word Replay. Clips you already have keep their names.
+- At start the app clears what its own cut-short work left behind: a half-done OBS download or update, the Visual C++ installer's folder, half-written settings files and covers, and, to the Recycle Bin, a half-done archive copy, centered copy or export. It only removes files it can tell it made, and never touches your clips, recordings, screenshots or named exports. A centered copy left by an older version still shows as a clip, for you to keep or delete.
+
+### Fixed
+
+- A clip that takes longer than 10 seconds to write, as on a slow hard drive, no longer shows Clip not saved before it's saved. One the recorder is still writing 2 minutes after the press shows Clip not saved.
+- Clip not saved no longer quotes unrelated lines from the OBS log, like game capture's hook updater. It only quotes a line about the save, or none.
+- Pressing the save key while the recorder is starting or not running now shows a popup saying the clip wasn't saved and why. So does a Save clip that fails.
+- A clip found after OBS missed telling the app it was saved is checked to play before it shows as saved. One that doesn't play shows Found an unfinished clip and is kept as it is.
+- A trim, share copy, GIF or montage cut short by a crash or power cut no longer leaves a broken file that looks like a clip. It's made under a hidden name and only shows once it's whole. If another file took its name meanwhile, it gets the next free name. If another program holds it open, it's kept and the app says where it is and how to keep it.
+- A crash while the app centers a clip's sound no longer leaves a copy that shows in your clips. The copy is made under a hidden name.
+- Remove from this PC on a portable copy no longer deletes your own files called LICENSE, NOTICE, README.md, THIRD-PARTY-NOTICES.md or debug.log next to the app. Only the notices that came with this version go, to the Recycle Bin.
+- Turning off Start with Windows, Remove from this PC and uninstalling also clear what Task Manager's Startup apps keeps for the app.
+- The check for a newer OBS runs once a day, as meant, instead of every 6 hours.
+- Pressing the save key just as instant replay comes on no longer says Instant replay is paused.
+
 ## 0.2.2
 
 ### Changed

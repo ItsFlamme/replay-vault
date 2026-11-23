@@ -90,7 +90,10 @@ pub(crate) fn clash_text(key: &str, holder: &Holder) -> String {
 }
 
 /// How a key is set, on every key's hover text.
-const PRESS: &str = "Click, then press the keys you want; Esc cancels. Use Ctrl, Alt, Shift or Win with a letter or number; F-keys, Pause, Insert, Home, End, Page Up/Down, Print Screen and Scroll Lock also work on their own.";
+const PRESS: &str = "Click, then press the keys you want; Esc cancels. Use Ctrl, Alt, Shift or Win with a letter or number; F-keys, Pause, Insert, Home, End, Page Up/Down, Print Screen and Scroll Lock also work on their own. Mouse buttons can't be used.";
+
+/// Under a key changed on the page: it's registered when the settings are saved.
+const UNSAVED_KEY: &str = "Takes effect when you Save.";
 
 /// How often the Keybinds page looks again for keys other programs took.
 const CONFLICT_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
@@ -216,6 +219,7 @@ impl App {
         }
         self.registered = None;
         self.capturing = Some(target);
+        self.capture_error = None;
         let ctx = ctx.clone();
         hotkey::start_capture(move || ctx.request_repaint());
     }
@@ -250,10 +254,8 @@ impl App {
             *self.hotkey_of(target) = name;
             None
         };
+        self.capture_error = error.map(|e| (target, e));
         self.sync_hotkeys();
-        if error.is_some() {
-            self.hotkey_error = error;
-        }
     }
 
     /// The button that shows and sets `target`'s key, at least `width` wide (one width for a
@@ -334,6 +336,19 @@ impl App {
                     self.hotkey_of(target).clear();
                 } else if slot {
                     self.start_capture(target, ui.ctx());
+                }
+                // Under the row: why a press was skipped while it's being set, or that a changed
+                // key isn't registered until Save (it goes once saved or discarded), and why the
+                // key just picked couldn't be used (it goes when a key is next being set).
+                if self.capturing == Some(target) {
+                    if let Some(why) = hotkey::rejected().and_then(hotkey::refusal) {
+                        ui.label(RichText::new(why).small().color(pal().amber));
+                    }
+                } else if target.key(&self.cfg) != target.key(&self.saved) {
+                    ui.label(RichText::new(UNSAVED_KEY).small().color(pal().muted));
+                }
+                if let Some((_, why)) = self.capture_error.as_ref().filter(|(t, _)| *t == target) {
+                    ui.label(RichText::new(why).small().color(pal().red));
                 }
             }
             if let Some(err) = &self.hotkey_error {
@@ -470,6 +485,52 @@ mod tests {
         h.run();
         assert!(h.state().cfg.hotkey_record.is_empty());
         assert_eq!(slot(&h, Target::Record).map(|s| s.0), Some("Set"));
+    }
+
+    /// A key changed on the page says, under its own row and above the next, that it takes effect
+    /// on Save; the note goes once the settings are discarded or saved.
+    #[test]
+    fn a_changed_key_says_it_takes_effect_on_save() {
+        let mut h = crate::ui::widgets::testing::page(|app| app.cfg.hotkey_record = "Ctrl+F7".into(), |ui, app| app.keybinds_tab(ui));
+        h.run();
+        let notes: Vec<_> = h.query_all_by_label(UNSAVED_KEY).map(|n| n.rect()).collect();
+        assert_eq!(notes.len(), 1, "only the changed key");
+        let (record, next) = (h.get_by_label(Target::Record.name()).rect(), h.get_by_label(Target::Screenshot.name()).rect());
+        assert!(notes[0].top() >= record.bottom() - 0.5 && notes[0].bottom() <= next.top() + 0.5, "between its row and the next: {notes:?} {record:?} {next:?}");
+        h.state_mut().discard_settings();
+        h.run();
+        assert!(h.query_by_label(UNSAVED_KEY).is_none(), "discarded");
+        let app = h.state_mut();
+        app.cfg.hotkey_mic = "Ctrl+F8".into();
+        app.saved = app.cfg.clone();
+        h.run();
+        assert!(h.query_by_label(UNSAVED_KEY).is_none(), "saved");
+    }
+
+    /// A picked key that can't be used says why under the row it was picked for, between that row
+    /// and the next, and the key stays as it was; a key picked after that which works clears it.
+    #[test]
+    fn a_refused_key_says_why_under_its_row() {
+        let _one = crate::tests::CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut h = crate::ui::widgets::testing::page(|app| app.cfg.hotkey = "Alt+F10".into(), |ui, app| app.keybinds_tab(ui));
+        h.run();
+        let app = h.state_mut();
+        app.capturing = Some(Target::Save);
+        hotkey::fake_capture(hotkey::Combo::parse("Ctrl+Key200").unwrap());
+        app.finish_capture();
+        assert_eq!(app.cfg.hotkey, "Alt+F10", "not taken");
+        h.run();
+        let why = "OBS can't use Ctrl+Key200 as a key. Pick another.";
+        let note = h.get_by_label(why).rect();
+        let (save, next) = (h.get_by_label(Target::Save.name()).rect(), h.get_by_label(Target::Overlay.name()).rect());
+        assert!(note.top() >= save.bottom() - 0.5 && note.bottom() <= next.top() + 0.5, "between its row and the next: {note:?} {save:?} {next:?}");
+        assert_eq!(h.query_all_by_label(why).count(), 1, "not at the bottom too");
+        let app = h.state_mut();
+        app.capturing = Some(Target::Save);
+        hotkey::fake_capture(hotkey::Combo::parse("Alt+F9").unwrap());
+        app.finish_capture();
+        h.run();
+        assert!(h.query_by_label(why).is_none(), "a key that works clears it");
     }
 
     /// One of NVIDIA's shortcuts is named NVIDIA's even when this app registered the key first

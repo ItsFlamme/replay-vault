@@ -166,24 +166,14 @@ fn check_and_keep() -> String {
 }
 
 /// Checks a minute after start, then once a day while `ENABLED`; `repaint` runs after each check.
-/// Also deletes what an update left behind: its installer, or a portable copy's old exe. A copy
-/// that may not update does neither: nothing is left behind.
+/// First deletes what an update left behind: its installer, or a portable copy's old exe
+/// (`tidy::app_update_phase`). A copy that may not update does neither: nothing is left behind.
 pub fn start(repaint: impl Fn() + Send + 'static) {
     if !allowed() {
         return;
     }
     std::thread::spawn(move || {
-        let _ = fs::remove_file(installer_path());
-        if let Ok(exe) = std::env::current_exe() {
-            // The old exe can take a moment to be let go of after the restart.
-            for _ in 0..10 {
-                let left = [beside(&exe, "old"), beside(&exe, "new")].into_iter().filter(|p| fs::remove_file(p).is_err() && p.exists()).count();
-                if left == 0 {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        }
+        crate::tidy::app_update_phase();
         std::thread::sleep(Duration::from_secs(60));
         loop {
             if ENABLED.load(Ordering::Relaxed) {
@@ -227,8 +217,11 @@ fn installed_in(dir: &Path) -> bool {
 /// Where a downloaded installer waits to be run: in the app's private folder, which no other
 /// account can write to (see `obs_install::secure_install_root`).
 pub fn installer_path() -> PathBuf {
-    obs_install::install_root().join("replay-vault-setup.exe")
+    obs_install::install_root().join(INSTALLER)
 }
+
+/// The downloaded installer's name in the install folder.
+pub(crate) const INSTALLER: &str = "replay-vault-setup.exe";
 
 /// What to download for this copy: the installer for an installed one, the exe for a portable one.
 pub fn pick(n: &Newer) -> Option<Installer> {
@@ -237,7 +230,7 @@ pub fn pick(n: &Newer) -> Option<Installer> {
 
 /// `exe` with ".old" or ".new" after it: where a portable update parks the old exe and stages
 /// the new one, beside it (so the swap is a rename on the same drive).
-fn beside(exe: &Path, what: &str) -> PathBuf {
+pub(crate) fn beside(exe: &Path, what: &str) -> PathBuf {
     let mut name = exe.as_os_str().to_owned();
     name.push(format!(".{what}"));
     PathBuf::from(name)
@@ -279,8 +272,17 @@ pub fn apply() -> std::io::Result<()> {
 fn restart(exe: &Path) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let line = format!("ping -n 3 127.0.0.1 >nul & start \"\" \"{}\"", exe.display());
-    std::process::Command::new("cmd").arg("/c").raw_arg(format!("\"{line}\"")).current_dir(std::env::temp_dir()).creation_flags(CREATE_NO_WINDOW).spawn().map(|_| ())
+    let ping = crate::recorder::windows_exe("PING.EXE");
+    let (line, vars) = restart_line(exe, &ping);
+    std::process::Command::new(crate::recorder::windows_exe("cmd.exe")).raw_arg(line).envs(vars).current_dir(std::env::temp_dir()).creation_flags(CREATE_NO_WINDOW).spawn().map(|_| ())
+}
+
+/// `restart`'s `cmd` line (it waits with `ping`, Windows' PING.EXE by its full path), and the
+/// variables it reads the two paths from. The paths are never in the line, where cmd would expand
+/// a `%name%` in them: it doesn't expand a variable's value again, and with delayed expansion off
+/// (`/v:off`, whatever the registry says) a `!` is only a `!`. `/d` skips any AutoRun command.
+fn restart_line<'a>(exe: &'a Path, ping: &'a Path) -> (&'static str, [(&'static str, &'a Path); 2]) {
+    (r#"/d /v:off /c ""%RV_PING%" -n 3 127.0.0.1 >nul & start "" "%RV_EXE%"""#, [("RV_PING", ping), ("RV_EXE", exe)])
 }
 
 fn fetch(inst: &Installer, dest: &Path, p: &Shared) -> anyhow::Result<()> {
@@ -388,6 +390,18 @@ mod tests {
         });
         assert_eq!(other.join().unwrap(), Some("9.0.0".into()));
         assert!(found().is_none());
+    }
+
+    /// The exe's path goes only through a variable, never into cmd's line, so a `%name%` or `!`
+    /// in it is never expanded.
+    #[test]
+    fn restart_line_holds_no_path() {
+        let exe = Path::new(r"D:\Downloads\%TEMP%\a!b & c\ReplayVault.exe");
+        let ping = Path::new(r"C:\Windows\System32\PING.EXE");
+        let (line, vars) = restart_line(exe, ping);
+        assert_eq!(line, r#"/d /v:off /c ""%RV_PING%" -n 3 127.0.0.1 >nul & start "" "%RV_EXE%"""#);
+        assert!(!line.contains(":\\") && !line.contains("Downloads") && !line.to_lowercase().contains("ping "), "{line}");
+        assert_eq!(vars, [("RV_PING", ping), ("RV_EXE", exe)]);
     }
 
     #[test]

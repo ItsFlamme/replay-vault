@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
@@ -28,7 +28,17 @@ const THUMB_PX: (usize, usize) = (THUMB_W * 2, THUMB_H * 2);
 const THUMB_WAIT: Duration = Duration::from_millis(400);
 
 static THREAD: OnceLock<u32> = OnceLock::new();
-static TEXT: Mutex<(Kind, String, String)> = Mutex::new((Kind::Saved, String::new(), String::new()));
+static TEXT: Mutex<Text> = Mutex::new(Text { kind: Kind::Saved, title: String::new(), detail: String::new(), save_done: None });
+
+/// What the popup shows, and when a save last finished (`show_clip`). One lock for both, so an
+/// older "Saving clip..." (from the recorder's thread) never covers a newer "Clip saved" (from
+/// the listener's).
+struct Text {
+    kind: Kind,
+    title: String,
+    detail: String,
+    save_done: Option<Instant>,
+}
 /// The thumbnail (BGRA, top-down) and length ("0:30") of the clip the popup is for.
 static THUMB: Mutex<Option<(Vec<u8>, String)>> = Mutex::new(None);
 /// The bar's colour (the app's accent), as [r, g, b].
@@ -48,6 +58,20 @@ pub enum Kind {
     Info,
     /// Something failed or stopped: no light, the title in amber.
     Warning,
+    /// A clip is being saved and isn't yet: no light, and it stays up until replaced (`shown_for`).
+    Saving,
+}
+
+/// How long a popup stays up: one for a save on its way until it's replaced (at most 30 s), the
+/// others a moment.
+fn shown_for(kind: Kind) -> u32 {
+    if kind == Kind::Saving { 30_000 } else { 2_500 }
+}
+
+/// Whether a "Saving..." popup for a save asked for at `pressed` may show, when a save last
+/// finished at `save_done`: not for a press at or before it, whose clip is already shown saved.
+fn saving_shows(pressed: Instant, save_done: Option<Instant>) -> bool {
+    save_done.is_none_or(|done| pressed > done)
 }
 
 /// Starts the popup's thread. Call once.
@@ -61,12 +85,24 @@ pub fn start() {
 
 /// Shows the popup for a few seconds: `title` (e.g. "Clip saved") over `detail` (e.g. the file name).
 pub fn show(kind: Kind, title: &str, detail: String) {
-    post(kind, title, detail, None);
+    post(kind, title, detail, None, None);
 }
 
-fn post(kind: Kind, title: &str, detail: String, thumb: Option<(Vec<u8>, String)>) {
-    *THUMB.lock().unwrap() = thumb;
-    *TEXT.lock().unwrap() = (kind, title.to_string(), detail);
+/// Shows that the save asked for at `pressed` is on its way ("Saving clip...", the game), until
+/// replaced; dropped if that save's clip already showed as saved.
+pub fn show_saving(title: &str, detail: String, pressed: Instant) {
+    post(Kind::Saving, title, detail, None, Some(pressed));
+}
+
+fn post(kind: Kind, title: &str, detail: String, thumb: Option<(Vec<u8>, String)>, pressed: Option<Instant>) {
+    {
+        let mut text = TEXT.lock().unwrap();
+        if pressed.is_some_and(|p| !saving_shows(p, text.save_done)) {
+            return;
+        }
+        *THUMB.lock().unwrap() = thumb;
+        (text.kind, text.title, text.detail) = (kind, title.to_string(), detail);
+    }
     if let Some(&id) = THREAD.get() {
         unsafe {
             let _ = PostThreadMessageW(id, SHOW, WPARAM(0), LPARAM(0));
@@ -75,8 +111,9 @@ fn post(kind: Kind, title: &str, detail: String, thumb: Option<(Vec<u8>, String)
 }
 
 /// `show` for a saved clip, with its thumbnail and length if they're decoded within THUMB_WAIT;
-/// blocks the caller that long at most.
+/// blocks the caller that long at most. From now on, a "Saving..." for an earlier press is dropped.
 pub fn show_clip(title: &str, detail: String, clip: &Path) {
+    TEXT.lock().unwrap().save_done = Some(Instant::now());
     let (tx, rx) = mpsc::channel();
     let clip = clip.to_path_buf();
     std::thread::spawn(move || {
@@ -84,7 +121,7 @@ pub fn show_clip(title: &str, detail: String, clip: &Path) {
             let _ = tx.send(t);
         }
     });
-    post(Kind::Saved, title, detail, rx.recv_timeout(THUMB_WAIT).ok());
+    post(Kind::Saved, title, detail, rx.recv_timeout(THUMB_WAIT).ok(), None);
 }
 
 /// A clip's thumbnail for the popup and its length ("0:30"). The keyframe near the end: the
@@ -179,7 +216,7 @@ unsafe fn run(tx: mpsc::Sender<u32>) {
                 let flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
                 let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), r.right - w - gap, r.top + gap, w, h, flags);
                 let _ = InvalidateRect(Some(hwnd), None, true);
-                SetTimer(Some(hwnd), HIDE_TIMER, 2500, None);
+                SetTimer(Some(hwnd), HIDE_TIMER, shown_for(TEXT.lock().unwrap().kind), None);
             } else {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -253,7 +290,10 @@ unsafe fn paint(hdc: HDC) {
         let [r, g, b] = *BAR.lock().unwrap();
         fill(hdc, RECT { left: 0, top: 0, right: px(6), bottom: h }, rgb(r, g, b));
         SetBkMode(hdc, TRANSPARENT);
-        let (kind, title, detail) = TEXT.lock().unwrap().clone();
+        let (kind, title, detail) = {
+            let t = TEXT.lock().unwrap();
+            (t.kind, t.title.clone(), t.detail.clone())
+        };
         let mut left = px(20);
         if let Some((pic, len)) = THUMB.lock().unwrap().as_ref() {
             let (x, tw, th) = (px(THUMB_X), px(THUMB_W as i32), px(THUMB_H as i32));
@@ -308,7 +348,8 @@ unsafe fn paint(hdc: HDC) {
 }
 
 /// Whether the VCR's display shows the red light for a popup, and its title's color: the light
-/// only for a save, the title in amber for a warning and in the display's green otherwise.
+/// only for a save (not one still on its way), the title in amber for a warning and in the
+/// display's green otherwise.
 fn vcr_title(kind: Kind) -> (bool, COLORREF) {
     (kind == Kind::Saved, if kind == Kind::Warning { amber() } else { rgb(95, 227, 208) })
 }
@@ -373,26 +414,65 @@ mod tests {
         assert_eq!(vcr_title(Kind::Saved), (true, rgb(95, 227, 208)));
         assert_eq!(vcr_title(Kind::Info), (false, rgb(95, 227, 208)));
         assert_eq!(vcr_title(Kind::Warning), (false, amber()));
+        assert_eq!(vcr_title(Kind::Saving), (false, rgb(95, 227, 208)), "on its way isn't saved yet");
+    }
+
+    /// A save on its way stays up until replaced (at most 30 s); the others go after 2.5 s.
+    #[test]
+    fn saving_stays_up_longer() {
+        assert_eq!(shown_for(Kind::Saving), 30_000);
+        for k in [Kind::Saved, Kind::Info, Kind::Warning] {
+            assert_eq!(shown_for(k), 2_500);
+        }
+    }
+
+    /// "Saving..." for a press at or before the last finished save never shows over its "Clip
+    /// saved"; one for a later press does.
+    #[test]
+    fn saving_never_covers_a_newer_save() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        assert!(saving_shows(t0, None));
+        assert!(!saving_shows(ms(100), Some(ms(500))), "pressed before the save finished");
+        assert!(!saving_shows(ms(500), Some(ms(500))));
+        assert!(saving_shows(ms(600), Some(ms(500))), "a new press");
+    }
+
+    fn set_text(kind: Kind, title: &str, detail: &str) {
+        let mut t = TEXT.lock().unwrap();
+        (t.kind, t.title, t.detail) = (kind, title.into(), detail.into());
     }
 
     /// Paints the popup for a real clip (from SCREENS_FOLDER, else the clips folder) into an
     /// off-screen bitmap (no window) and saves it as target\screens\toast.png to look at, and as
-    /// the VCR's display as toast-vcr.png; then a warning on the VCR's display as
-    /// toast-vcr-warning.png. cargo test toast_screen -- --ignored
+    /// the VCR's display as toast-vcr.png; the same with a game in front of the name
+    /// (toast-game*.png); then, in both looks, a save on its way (toast-saving*.png) and a clip not
+    /// saved with the time left (toast-not-saved*.png). cargo test toast_screen -- --ignored
     #[test]
     #[ignore]
     fn toast_screen() {
         let folder = std::env::var("SCREENS_FOLDER").unwrap_or_else(|_| crate::config::Config::load().folder);
         let clip = crate::clips::list(&folder, 5).into_iter().find(|c| !c.is_picture).expect("a clip");
         *THUMB.lock().unwrap() = Some(thumbnail(&clip.path).unwrap());
-        *TEXT.lock().unwrap() = (Kind::Saved, "Clip saved".into(), clip.name.clone());
+        set_text(Kind::Saved, "Clip saved", &clip.name);
         for (vcr, name) in [(false, "toast.png"), (true, "toast-vcr.png")] {
             VCR.store(vcr, Ordering::Relaxed);
             save_toast(name);
         }
+        set_text(Kind::Saved, "Clip saved", "VALORANT 11-15-2026 12-05-20 AM.mp4");
+        for (vcr, name) in [(false, "toast-game.png"), (true, "toast-game-vcr.png")] {
+            VCR.store(vcr, Ordering::Relaxed);
+            save_toast(name);
+        }
         *THUMB.lock().unwrap() = None;
-        *TEXT.lock().unwrap() = (Kind::Warning, "Clip not saved".into(), "Open Replay Vault to see why".into());
-        save_toast("toast-vcr-warning.png");
+        let not_saved = crate::save_flow::not_saved_detail("Alt+F10", Duration::from_secs(165), crate::save_flow::Failure::NoFile, false);
+        for (kind, title, detail, name) in [(Kind::Saving, "Saving clip...", "VALORANT", "toast-saving"), (Kind::Warning, "Clip not saved", not_saved.as_str(), "toast-not-saved")] {
+            set_text(kind, title, detail);
+            for (vcr, look) in [(false, ""), (true, "-vcr")] {
+                VCR.store(vcr, Ordering::Relaxed);
+                save_toast(&format!("{name}{look}.png"));
+            }
+        }
     }
 
     fn save_toast(name: &str) {

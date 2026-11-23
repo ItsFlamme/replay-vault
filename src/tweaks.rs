@@ -109,8 +109,13 @@ fn write(key: &str, value: &str, data: &Value) -> anyhow::Result<()> {
     result.ok().map_err(|e| anyhow::anyhow!("couldn't change {key}\\{value}: {}", e.message()))
 }
 
+/// Held across each read, change and save of tweaks.json (`change`, `restore`): the recorder
+/// thread and `tidy` can both change it at start, and neither may lose the other's original.
+static RECORD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Sets a value, keeping its original the first time.
 fn change(key: &str, value: &str, data: Value) -> anyhow::Result<()> {
+    let _guard = RECORD.lock();
     let mut map = saved();
     let id = format!("{key}|{value}");
     if let std::collections::btree_map::Entry::Vacant(e) = map.entry(id) {
@@ -125,6 +130,7 @@ fn change(key: &str, value: &str, data: Value) -> anyhow::Result<()> {
 
 /// Puts one value back to its original, if this app ever changed it.
 fn restore(key: &str, value: &str) -> anyhow::Result<()> {
+    let _guard = RECORD.lock();
     let mut map = saved();
     let Some(original) = map.remove(&format!("{key}|{value}")) else { return Ok(()) };
     write(key, value, &original)?;
@@ -337,7 +343,32 @@ pub fn set_amd_off(off: bool) -> anyhow::Result<()> {
 /// per exe path, so another copy's (its own private OBS) is its own.
 pub fn set_gpu_high(exe: &Path, on: bool) -> anyhow::Result<()> {
     let value = exe.display().to_string();
-    if on { change(GPU_KEY, &value, json!({ "string": "GpuPreference=2;" })) } else { restore(GPU_KEY, &value) }
+    if on { change(GPU_KEY, &value, gpu_high()) } else { restore(GPU_KEY, &value) }
+}
+
+/// The data `set_gpu_high` writes.
+pub(crate) fn gpu_high() -> Value {
+    json!({ "string": "GpuPreference=2;" })
+}
+
+/// The GPU preferences recorded in this copy's own tweaks.json: (exe path, its original, its data
+/// in the registry now). For `tidy`, which decides; reads the registry, never changes it.
+pub(crate) fn gpu_entries() -> Vec<(String, Value, Value)> {
+    gpu_recorded(&saved()).into_iter().map(|(exe, original)| {
+        let now = read(GPU_KEY, &exe);
+        (exe, original, now)
+    }).collect()
+}
+
+/// The GPU preferences among the record's entries ("key|value" -> original), by exe path.
+fn gpu_recorded(map: &BTreeMap<String, Value>) -> Vec<(String, Value)> {
+    map.iter().filter_map(|(id, original)| id.split_once('|').filter(|(key, _)| *key == GPU_KEY).map(|(_, exe)| (exe.to_string(), original.clone()))).collect()
+}
+
+/// Puts back one GPU preference this copy set (for `tidy`), dropping it from tweaks.json the way
+/// turning the option off does.
+pub(crate) fn restore_gpu(exe: &str) -> anyhow::Result<()> {
+    restore(GPU_KEY, exe)
 }
 
 /// Whether Remove puts back the value saved as `id` ("key|value"). A copy that may not change the
@@ -385,6 +416,20 @@ mod tests {
         }
         // Only that key itself, not one that starts the same.
         assert!(!restorable(&format!("{GPU_KEY}Other|x"), false));
+    }
+
+    /// Only the GPU key's entries are GPU preferences, not one whose key starts the same.
+    #[test]
+    fn gpu_entries_from_the_record() {
+        let exe = r"E:\Old\obs-studio\bin\64bit\obs64.exe";
+        let map: BTreeMap<String, Value> = [
+            (format!("{GPU_KEY}|{exe}"), Value::Null),
+            (format!("{GPU_KEY}|D:\\x.exe"), json!({ "string": "GpuPreference=1;" })),
+            (format!("{GPU_KEY}Other|F:\\y.exe"), Value::Null),
+            (format!("{}|{}", GAME_BAR[0].0, GAME_BAR[0].1), Value::Null),
+        ]
+        .into();
+        assert_eq!(gpu_recorded(&map), [(r"D:\x.exe".to_string(), json!({ "string": "GpuPreference=1;" })), (exe.to_string(), Value::Null)]);
     }
 
     /// Round trip on a value of our own under HKCU, never a real Windows setting.

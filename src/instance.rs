@@ -19,6 +19,8 @@ mod copy {
     pub const TWEAKS_OFF: &str = "";
     /// For picking the private OBS's folder (Setup).
     pub const OBS_DIR_FIXED: &str = "";
+    /// For a clips or archive folder this copy may not use (General, Setup, the log).
+    pub const CLIPS_DIR_FIXED: &str = "";
 
     impl Instance {
         /// "Replay Vault".
@@ -71,6 +73,13 @@ mod copy {
         pub fn install_root_kept(&self, _root: &Path) -> Option<String> {
             None
         }
+
+        /// Whether this copy may keep clips in `dir`, as the clips folder or the archive's. Any
+        /// folder.
+        #[inline]
+        pub const fn clips_dir_allowed(&self, _dir: &str) -> bool {
+            true
+        }
     }
 
     /// The app.
@@ -88,7 +97,10 @@ mod copy {
         fn nothing_turned_off() {
             assert_eq!(*current(), Instance);
             assert_eq!(Instance.install_root_kept(Path::new(r"C:\Users\You\AppData\Local\replay-vault")), None);
-            assert_eq!((UPDATES_OFF, UPDATE_CHECK_OFF, TWEAKS_OFF, OBS_DIR_FIXED), ("", "", "", ""));
+            assert_eq!((UPDATES_OFF, UPDATE_CHECK_OFF, TWEAKS_OFF, OBS_DIR_FIXED, CLIPS_DIR_FIXED), ("", "", "", "", ""));
+            for dir in [r"D:\Videos\Replay Vault Clips", r"\\nas\clips", "", r"..\x"] {
+                assert!(Instance.clips_dir_allowed(dir), "{dir}");
+            }
         }
     }
 }
@@ -116,5 +128,6 @@ mod tests {
         assert_eq!(i.label(), "Replay Vault");
         assert_eq!(i.firewall_rule(), "Replay Vault recorder");
         assert!(i.legacy_names_allowed() && i.updates_allowed() && i.windows_tweaks_allowed() && i.may_change_windows_settings() && i.obs_dir_allowed());
+        assert!(i.clips_dir_allowed(r"C:\Users\You\Videos\Replay Vault Clips"));
     }
 }

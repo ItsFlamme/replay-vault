@@ -62,11 +62,10 @@ pub fn list_read(folder: &str, max: usize) -> (Vec<Clip>, Vec<PathBuf>) {
         .chain(found)
         .filter_map(|(e, group)| {
             let path = e.path();
-            let ext = path.extension()?.to_string_lossy().to_lowercase();
-            let is_picture = is_picture(&path);
-            if !(is_picture || matches!(ext.as_str(), "mp4" | "mkv" | "mov")) {
+            if !is_clip(&path) || e.file_name().to_str().is_some_and(is_app_temp) {
                 return None;
             }
+            let is_picture = is_picture(&path);
             let m = e.metadata().ok()?;
             let modified = m.modified().ok()?;
             // A recording OBS is still writing can't be played or moved yet. OBS's writers let
@@ -85,6 +84,60 @@ pub fn list_read(folder: &str, max: usize) -> (Vec<Clip>, Vec<PathBuf>) {
 /// A screenshot or GIF, not a video.
 pub fn is_picture(path: &Path) -> bool {
     path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png") || e.eq_ignore_ascii_case("gif"))
+}
+
+/// The kinds of file `list` shows: videos, screenshots and GIFs.
+pub(crate) fn is_clip(path: &Path) -> bool {
+    is_picture(path) || path.extension().is_some_and(|e| ["mp4", "mkv", "mov"].iter().any(|k| e.eq_ignore_ascii_case(k)))
+}
+
+/// What `copy_checked` puts after a copy's name until it's whole (`<name>.mp4.part`).
+pub(crate) const COPY_PART: &str = ".part";
+
+/// What an export (trim, share copy, GIF, montage) has before its extension until it's whole
+/// (`<stem>.rv-export.mp4`, see `make_export`), so one cut short never looks like a clip.
+pub(crate) const EXPORT_TEMP: &str = "rv-export";
+
+/// What `obs::center_clip` writes a clip's centered copy as, beside it, before it takes the
+/// clip's place (`<stem>.rv-centering.mp4`, see `centering_temp`).
+pub(crate) const CENTERING_TEMP: &str = "rv-centering";
+
+/// Where `out` is made before it gets its name: `<stem>.rv-export.<ext>` beside it. The extension
+/// stays last, as Windows picks the container by it. Fixed, so the name pickers can see it's taken.
+pub(crate) fn export_temp(out: &Path) -> PathBuf {
+    app_temp(out, EXPORT_TEMP, &out.extension().unwrap_or_default().to_string_lossy())
+}
+
+/// Where a clip's centered copy is made: `<stem>.rv-centering.mp4` beside it (an MP4 whatever
+/// the clip's extension's case, as Windows picks the container by it).
+pub(crate) fn centering_temp(clip: &Path) -> PathBuf {
+    app_temp(clip, CENTERING_TEMP, "mp4")
+}
+
+fn app_temp(path: &Path, tag: &str, ext: &str) -> PathBuf {
+    path.with_file_name(format!("{}.{tag}.{ext}", path.file_stem().unwrap_or_default().to_string_lossy()))
+}
+
+/// Which of the app's own files in the making (`EXPORT_TEMP`, `CENTERING_TEMP`) `name` is:
+/// `<stem>.<tag>.<ext>` with a stem.
+pub(crate) fn app_temp_of(name: &str) -> Option<&'static str> {
+    let p = Path::new(name);
+    p.extension()?;
+    let rest = p.file_stem()?.to_str()?;
+    [EXPORT_TEMP, CENTERING_TEMP].into_iter().find(|tag| rest.strip_suffix(tag).and_then(|s| s.strip_suffix('.')).is_some_and(|s| !s.is_empty()))
+}
+
+/// Whether `name` is one of the app's own files in the making (or cut short), never a clip: `list`
+/// never shows one, so it's never starred, tagged, shared, counted, cleaned up or archived.
+pub(crate) fn is_app_temp(name: &str) -> bool {
+    app_temp_of(name).is_some()
+}
+
+/// Whether `path`'s name is an app temp's (`is_app_temp`). Every name the app gives a clip or lets
+/// the user give one (`rename`, `move_into`, `copy_name`, `montage_name`) is checked against it, so
+/// a clip is never hidden from the list or taken for a leftover.
+fn temp_named(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(is_app_temp)
 }
 
 /// The folder name for whatever is in front (by its window title only; the game's process is
@@ -141,6 +194,7 @@ pub fn rename(path: &Path, name: &str) -> anyhow::Result<PathBuf> {
     }
     anyhow::ensure!(!stem.is_empty(), "the name can't be empty");
     let dest = path.with_file_name(format!("{stem}{ext}"));
+    anyhow::ensure!(!temp_named(&dest), "that name is kept for the app's own files. Pick another.");
     // Only the case changing is the same file to Windows.
     let same = dest.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase();
     if dest == path {
@@ -151,40 +205,74 @@ pub fn rename(path: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Ok(dest)
 }
 
-/// Moves a file into `dir` (made if needed) with `prefix` and a space put in front of its name
-/// (none if empty), never over an existing file; returns where it went.
-/// Retries for a few seconds in case OBS hasn't let go of it yet. To another drive or a NAS,
-/// which Windows can't move to, it's copied, checked and then removed.
+/// The name (without extension) a file called `stem` gets with `prefix` (a game) put in front:
+/// "VALORANT 11-21-2026 05-53-32 PM" for OBS's "Replay 11-21-2026 05-53-32 PM" (the game takes
+/// the place of OBS's word) or for a date alone, "VALORANT Ace" for any other name, and `stem`
+/// unchanged for no prefix. A game called Replay keeps OBS's word after it ("Replay Replay
+/// 11-21-2026 05-53-32 PM", the older style), so a placed clip never looks like one OBS just wrote.
+pub fn placed_stem(stem: &str, prefix: &str) -> String {
+    use crate::recorder::{REPLAY_PREFIX, is_stamp};
+    if prefix.is_empty() {
+        return stem.to_string();
+    }
+    let date = stem.strip_prefix(REPLAY_PREFIX).unwrap_or(stem);
+    match is_stamp(date) {
+        true if REPLAY_PREFIX.trim_end() == prefix => format!("{prefix} {REPLAY_PREFIX}{date}"),
+        true => format!("{prefix} {date}"),
+        false => format!("{prefix} {stem}"),
+    }
+}
+
+/// Moves a file into `dir` (made if needed), named by `placed_stem` with `prefix`, never over an
+/// existing file; returns where it went.
+/// Retries for a few seconds (`move_retry_wait`) in case OBS hasn't let go of it yet, and logs
+/// how long that took. To another drive or a NAS, which Windows can't move to, it's copied,
+/// checked and then removed.
 pub fn move_into(path: &Path, dir: &Path, prefix: &str) -> std::io::Result<PathBuf> {
     if path.parent() == Some(dir) && prefix.is_empty() {
         return Ok(path.to_path_buf());
     }
     std::fs::create_dir_all(dir)?;
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-    let stem = if prefix.is_empty() { stem } else { format!("{prefix} {stem}") };
+    let stem = placed_stem(&path.file_stem().unwrap_or_default().to_string_lossy(), prefix);
     let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let dest = (1..)
         .map(|n| dir.join(if n == 1 { format!("{stem}{ext}") } else { format!("{stem} ({n}){ext}") }))
-        .find(|p| !p.exists())
+        .find(|p| !p.exists() && !temp_named(p))
         .unwrap();
-    let mut tries = 0;
+    let (started, mut tries) = (std::time::Instant::now(), 0);
     loop {
         match std::fs::rename(path, &dest) {
-            Ok(()) => return Ok(dest),
-            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => return copy_then_remove(path, &dest).map(|()| dest),
-            Err(_) if tries < 10 => {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(500));
+            Ok(()) => {
+                if tries > 0 {
+                    crate::log::write(&format!("Moved a clip after {tries} retries ({} ms): {}", started.elapsed().as_millis(), dest.display()));
+                }
+                return Ok(dest);
             }
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => return copy_then_remove(path, &dest).map(|()| dest),
+            Err(e) => match move_retry_wait(tries) {
+                Some(wait) => {
+                    tries += 1;
+                    std::thread::sleep(wait);
+                }
+                None => return Err(e),
+            },
         }
     }
+}
+
+/// How long `move_into` waits before its retry after `tries` retries: 50, 100, 200 ms, then 500 ms
+/// each, so a clip OBS lets go of quickly moves at once; None once about 5 s are used up.
+fn move_retry_wait(tries: u32) -> Option<std::time::Duration> {
+    const STEPS: [u64; 4] = [50, 100, 200, 500];
+    let wait = |n: u32| STEPS[(n as usize).min(STEPS.len() - 1)];
+    let waited: u64 = (0..tries).map(wait).sum();
+    (waited + wait(tries) <= 5_000).then(|| std::time::Duration::from_millis(wait(tries)))
 }
 
 /// Copies `path` to `dest` through a ".part" file, so a copy cut short never looks like the clip,
 /// and checks the size.
 fn copy_checked(path: &Path, dest: &Path) -> std::io::Result<()> {
-    let part = PathBuf::from(format!("{}.part", dest.display()));
+    let part = PathBuf::from(format!("{}{COPY_PART}", dest.display()));
     let copied = (|| {
         let size = std::fs::metadata(path)?.len();
         std::fs::copy(path, &part)?;
@@ -484,6 +572,7 @@ pub(crate) fn load_json<T: serde::de::DeserializeOwned + Default>(file: &Path) -
     read(file).or_else(|| read(&file.with_extension("json.bak"))).unwrap_or_default()
 }
 
+
 /// Held across a read, change and save of the stars, tags, notes, fingerprints and lost clips
 /// (`edit_store`, `moved`), and by every save of them, so one never lands in the middle of another's
 /// edit. write_json's own lock only covers one write.
@@ -514,18 +603,29 @@ fn save_unlocked<T: serde::Serialize + serde::de::DeserializeOwned>(file: &Path,
     saved.is_ok()
 }
 
+/// Every file in the settings folder saved through `write_json` (config.rs, the stores here and
+/// upload.rs), so `tidy` knows which `.json.tmp` files a save cut short left (`tmp_of`). A new one
+/// saved that way must be added here, or its leftover is never tidied.
+pub(crate) const STORE_FILES: [&str; 8] = ["config.json", "favorites.json", "tags.json", "notes.json", "fingerprints.json", "lost.json", "filed.json", "uploads.json"];
+
+/// The new file `write_json` writes before it takes `file`'s place.
+pub(crate) fn tmp_of(file: &Path) -> PathBuf {
+    file.with_extension("json.tmp")
+}
+
 /// Written to a new file, flushed to the disk, that then replaces the old one, so a crash, power
 /// cut or full disk mid-write never leaves half a file. The old one is kept as `.json.bak` once a
 /// day, so a bad day can be undone (and a damaged file has something to come back from).
 /// Only an old file that reads back as a `T` is kept: one that doesn't (`[]` for the settings, say)
 /// is what the backup is there to come back from, so it never takes its place.
+/// A new file in the settings folder saved through here goes in `STORE_FILES`.
 pub(crate) fn write_json<T: serde::Serialize + serde::de::DeserializeOwned>(file: &Path, value: &T) -> std::io::Result<()> {
     use std::io::Write;
     // The window, the archive and the cleanup threads can save at once: one at a time.
     static LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOCK.lock();
     let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")));
-    let (tmp, bak) = (file.with_extension("json.tmp"), file.with_extension("json.bak"));
+    let (tmp, bak) = (tmp_of(file), file.with_extension("json.bak"));
     let text = serde_json::to_string_pretty(value)?;
     // Without the flush, a power cut soon after can leave the renamed file empty.
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
@@ -1165,6 +1265,26 @@ pub fn cleanup_plan(clips: &[Clip], favs: &std::collections::BTreeSet<String>, r
 
 static CLEANUP: Mutex<Option<(String, Cleanup, String)>> = Mutex::new(None);
 
+/// Held (shared) by each auto-cleanup and archive pass while it works, so `tidy` can tell one is
+/// running (`passes_idle`) and keep out of the clips folder meanwhile. Taken first, never while
+/// holding upload.rs's LOCK, STORES or write_json's LOCK.
+static PASSES: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// One pass's hold on `PASSES`.
+fn pass_running() -> std::sync::RwLockReadGuard<'static, ()> {
+    PASSES.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A hold that keeps auto-cleanup and archive passes from starting, if none is running now;
+/// None while one is. The holder must not take upload.rs's LOCK, STORES or write_json's LOCK.
+pub(crate) fn passes_idle() -> Option<std::sync::RwLockWriteGuard<'static, ()>> {
+    match PASSES.try_write() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// The folder and limits auto-cleanup works with, and the folder it may work in anyway (`ok`, see
 /// `rules_off`), from the saved settings.
 pub fn set_cleanup(folder: &str, ok: &str, rule: Cleanup) {
@@ -1181,6 +1301,7 @@ pub fn start_cleanup() {
         if rule == Cleanup::default() || folder.is_empty() {
             return;
         }
+        let _pass = pass_running();
         // It would take the user's own videos and pictures too.
         if let Some(why) = folder_risk(&folder, &ok) {
             if !risky {
@@ -1309,6 +1430,7 @@ pub fn start_archive() {
     let mut skipped = std::collections::HashSet::new();
     let mut held = false;
     every(300, &ARCHIVE, move |(folder, rule, ok)| {
+        let _pass = pass_running();
         if let Some(why) = folder_risk(&folder, &ok) {
             if !held {
                 crate::log::write(&format!("The archive is off: the clips folder {folder} is {why}, where it would also move your own videos and pictures."));
@@ -1647,25 +1769,90 @@ pub fn size(bytes: u64) -> String {
 
 /// A free name next to `src` for a copy marked `tag`: "Clip (trim).mp4", "Clip (trim 2).mp4", ...
 /// Always .mp4 except for a GIF: Windows writes the file in the container its extension names,
-/// and it has no writer for .mkv or .mov, so a copy of one of those is made as an .mp4.
+/// and it has no writer for .mkv or .mov, so a copy of one of those is made as an .mp4. A name
+/// whose export is still being made (`export_temp`) counts as taken.
 pub fn copy_name(src: &Path, tag: &str) -> PathBuf {
     let stem = src.file_stem().unwrap_or_default().to_string_lossy();
     let gif = src.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif"));
     let ext = if gif { "gif" } else { "mp4" };
     (1..)
         .map(|n| src.with_file_name(if n == 1 { format!("{stem} ({tag}).{ext}") } else { format!("{stem} ({tag} {n}).{ext}") }))
-        .find(|p| !p.exists())
+        .find(|p| free_name(p))
         .unwrap()
 }
 
 /// A free name in `folder` for a montage made at `now`: "Montage 2026-11-07 10-53-12.mp4", then
-/// "... (2).mp4" and so on if that's taken.
+/// "... (2).mp4" and so on if that's taken (or being made, see `copy_name`).
 pub fn montage_name(folder: &Path, now: SystemTime) -> PathBuf {
     let stem = format!("Montage {}", stamp(now));
     (1..)
         .map(|n| folder.join(if n == 1 { format!("{stem}.mp4") } else { format!("{stem} ({n}).mp4") }))
-        .find(|p| !p.exists())
+        .find(|p| free_name(p))
         .unwrap()
+}
+
+/// No file has the name `p`, no export is being made for it, and it isn't an app temp's.
+fn free_name(p: &Path) -> bool {
+    !p.exists() && !export_temp(p).exists() && !temp_named(p)
+}
+
+/// Makes an export with `make` under a hidden name (`export_temp` of what `pick` picks first,
+/// `copy_name` or `montage_name`), then gives it the name `pick` picks, never over a file: one that
+/// took the name meanwhile (a second trim of the same clip) stays, and the export gets the next
+/// free name. Something can hold the new file for a moment (antivirus, Explorer's thumbnails), so
+/// that's retried for about 5 s; held longer, the whole file is kept under its hidden name and the
+/// error says where (`kept_note`). On any other failure the hidden file is removed. Returns the
+/// name it got.
+pub(crate) fn make_export(pick: impl Fn() -> PathBuf, make: impl FnOnce(&Path) -> anyhow::Result<()>) -> anyhow::Result<PathBuf> {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_SHARING_VIOLATION};
+    use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
+    use windows::core::{HRESULT, HSTRING};
+    let mut out = pick();
+    let tmp = export_temp(&out);
+    let is = |e: &windows::core::Error, codes: &[windows::Win32::Foundation::WIN32_ERROR]| codes.iter().any(|c| e.code() == HRESULT::from_win32(c.0));
+    let mut keep = false;
+    let named = make(&tmp).and_then(|()| {
+        let from = HSTRING::from(tmp.as_os_str());
+        let (mut tries, mut taken) = (0, 0);
+        loop {
+            // No MOVEFILE_REPLACE_EXISTING: a file already there stays.
+            match unsafe { MoveFileExW(&from, &HSTRING::from(out.as_os_str()), MOVE_FILE_FLAGS(0)) } {
+                Ok(()) => return Ok(out),
+                Err(e) if is(&e, &[ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION]) => {
+                    if tries == 10 {
+                        keep = true;
+                        // In the log too, as the page's message can be replaced by the next one.
+                        let note = kept_note(&tmp, &out);
+                        crate::log::write(&format!("Couldn't name an export: {note}"));
+                        anyhow::bail!("{note}");
+                    }
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                // Taken meanwhile: the next free name (`pick` counts this one's hidden file as
+                // taking the first). A few times at most, should names keep being taken.
+                Err(e) if is(&e, &[ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS]) && taken < 10 => {
+                    taken += 1;
+                    out = pick();
+                }
+                Err(e) => anyhow::bail!("couldn't name it {}: {e}", out.file_name().unwrap_or_default().to_string_lossy()),
+            }
+        }
+    });
+    if named.is_err() && !keep {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    named
+}
+
+/// What to tell the user when the export `tmp` was made but something held it, so it couldn't be
+/// named `out`: where it is and how to keep it, as the tidy-up may recycle it after a day.
+fn kept_note(tmp: &Path, out: &Path) -> String {
+    let name = out.file_name().unwrap_or_default().to_string_lossy();
+    format!(
+        "it was made, but another program had it open, so it couldn't be named {name}. It's saved as {}. Rename it to {name} in File Explorer to keep it; the app may move it to the Recycle Bin after a day.",
+        tmp.display()
+    )
 }
 
 #[cfg(test)]
@@ -1749,6 +1936,149 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert!(listed.iter().any(|c| c.path == gif && c.is_picture));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An export's hidden name keeps its extension last; only that exact shape counts as one, `list`
+    /// never shows it, and the name pickers count its name as taken.
+    #[test]
+    fn export_temps_are_hidden_and_taken() {
+        assert_eq!(export_temp(Path::new(r"D:\Clips\VALORANT\Replay 1 (trim).mp4")), Path::new(r"D:\Clips\VALORANT\Replay 1 (trim).rv-export.mp4"));
+        assert_eq!(export_temp(Path::new(r"D:\Clips\Replay 1 (GIF).gif")), Path::new(r"D:\Clips\Replay 1 (GIF).rv-export.gif"));
+        assert_eq!(centering_temp(Path::new(r"D:\Clips\VALORANT\Replay 1.MP4")), Path::new(r"D:\Clips\VALORANT\Replay 1.rv-centering.mp4"));
+        assert_eq!(app_temp_of("Replay 1 (trim).rv-export.mp4"), Some(EXPORT_TEMP));
+        assert_eq!(app_temp_of("x.rv-export.gif"), Some(EXPORT_TEMP));
+        assert_eq!(app_temp_of("Replay 1.rv-centering.mp4"), Some(CENTERING_TEMP));
+        for not in ["x.mp4", "rv-export.mp4", ".rv-export.mp4", "x.rv-export", "x rv-export.mp4", "x.rv-exports.mp4", "rv-export x.mp4", "x.centering.mp4", ".rv-centering.mp4", "x.rv-centering"] {
+            assert!(!is_app_temp(not), "{not}");
+        }
+        let dir = std::env::temp_dir().join(format!("instant-replay-export-temps-{}", crate::config::random_hex()));
+        std::fs::create_dir_all(dir.join("VALORANT")).unwrap();
+        for f in ["Ace.mp4", "Ace (trim).rv-export.mp4", "Ace.rv-centering.mp4", r"VALORANT\b.mp4", r"VALORANT\b (GIF).rv-export.gif", r"VALORANT\b.rv-centering.mp4", r"VALORANT\b.centering.mp4"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        // The old centering name stays listed: it may be starred or shared.
+        let mut listed: Vec<String> = list(&dir.display().to_string(), 10).into_iter().map(|c| c.name).collect();
+        listed.sort();
+        assert_eq!(listed, ["Ace.mp4", "b.centering.mp4", "b.mp4"]);
+        assert_eq!(copy_name(&dir.join("Ace.mp4"), "trim").file_name().unwrap(), "Ace (trim 2).mp4");
+        assert_eq!(copy_name(&dir.join(r"VALORANT\b.gif"), "GIF").file_name().unwrap(), "b (GIF 2).gif");
+        let now = SystemTime::now();
+        std::fs::write(export_temp(&dir.join(format!("Montage {}.mp4", stamp(now)))), b"x").unwrap();
+        assert_eq!(montage_name(&dir, now).file_name().unwrap().to_string_lossy(), format!("Montage {} (2).mp4", stamp(now)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A clip can't be renamed to an app temp's name, with either tag, typed with or without the
+    /// extension: it would vanish from the list and be taken for a leftover.
+    #[test]
+    fn rename_refuses_app_temp_names() {
+        let dir = std::env::temp_dir().join(format!("instant-replay-rename-temp-{}", crate::config::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("Ace.mp4");
+        std::fs::write(&clip, b"x").unwrap();
+        for typed in ["Ace.rv-export", "Ace.rv-export.mp4", "Ace.rv-centering", "Ace.rv-centering.MP4"] {
+            let e = rename(&clip, typed).unwrap_err();
+            assert_eq!(e.to_string(), "that name is kept for the app's own files. Pick another.", "{typed}");
+            assert!(clip.exists(), "{typed}");
+        }
+        assert_eq!(rename(&clip, "Ace rv-export").unwrap(), dir.join("Ace rv-export.mp4"), "only the exact shape is kept");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A placed clip never gets an app temp's name: a game whose name ends with a tag only goes in
+    /// front, and a clip whose own name would be one gets a number.
+    #[test]
+    fn placed_clips_never_get_temp_names() {
+        for game in ["VALORANT.rv-export", "x.rv-centering"] {
+            for stem in ["Replay 11-21-2026 05-53-32 PM", "2026-11-06 18-42-33", "Ace"] {
+                let name = format!("{}.mp4", placed_stem(stem, game));
+                assert!(!is_app_temp(&name), "{name}");
+            }
+        }
+        let (from, to) = (std::env::temp_dir().join(format!("instant-replay-placed-temp-{}", crate::config::random_hex())), std::env::temp_dir().join(format!("instant-replay-placed-temp-to-{}", crate::config::random_hex())));
+        std::fs::create_dir_all(&from).unwrap();
+        let odd = from.join("x.rv-export.mp4");
+        std::fs::write(&odd, b"x").unwrap();
+        let moved = move_into(&odd, &to, "").unwrap();
+        assert_eq!(moved, to.join("x.rv-export (2).mp4"));
+        assert!(!is_app_temp(&moved.file_name().unwrap().to_string_lossy()));
+        std::fs::remove_dir_all(&from).unwrap();
+        std::fs::remove_dir_all(&to).unwrap();
+    }
+
+    /// An export is made under its hidden name, then named; a failed one leaves nothing; a file
+    /// that took the name meanwhile is kept as it was and the new one gets the next free name.
+    #[test]
+    fn exports_are_named_once_whole() {
+        let dir = std::env::temp_dir().join(format!("instant-replay-make-export-{}", crate::config::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("Ace.mp4");
+        let pick = || copy_name(&src, "trim");
+        let out = dir.join("Ace (trim).mp4");
+        let got = make_export(pick, |tmp| {
+            assert_eq!(tmp, export_temp(&out));
+            std::fs::write(tmp, b"new")?;
+            assert!(list(&dir.display().to_string(), 10).is_empty(), "not listed while it's made");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, out);
+        assert_eq!(std::fs::read(&out).unwrap(), b"new");
+        assert!(!export_temp(&out).exists());
+        let e = make_export(pick, |tmp| {
+            std::fs::write(tmp, b"half")?;
+            anyhow::bail!("cut short")
+        });
+        assert_eq!(e.unwrap_err().to_string(), "cut short");
+        let second = dir.join("Ace (trim 2).mp4");
+        assert!(!second.exists() && !export_temp(&second).exists());
+        // Another trim takes "(trim 2)" while this one is made: this one becomes "(trim 3)".
+        let got = make_export(pick, |tmp| {
+            std::fs::write(tmp, b"second")?;
+            std::fs::write(&second, b"other")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, dir.join("Ace (trim 3).mp4"));
+        assert_eq!(std::fs::read(&got).unwrap(), b"second");
+        assert_eq!(std::fs::read(&second).unwrap(), b"other", "never replaced");
+        assert_eq!(std::fs::read(&out).unwrap(), b"new", "never replaced");
+        assert!(!export_temp(&second).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An export something keeps open past the retries is kept whole under its hidden name, and
+    /// the error says where and what to do. Takes about 5 s (the retries).
+    #[test]
+    fn a_held_export_is_kept_and_told() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("instant-replay-held-export-{}", crate::config::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("Ace (trim).mp4");
+        let holder = std::cell::RefCell::new(None);
+        let e = make_export(
+            || out.clone(),
+            |tmp| {
+                std::fs::write(tmp, b"whole")?;
+                // Opened sharing nothing, as an antivirus scan might: it can't be renamed.
+                *holder.borrow_mut() = Some(std::fs::File::options().read(true).share_mode(0).open(tmp)?);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        let tmp = export_temp(&out);
+        assert_eq!(e.to_string(), kept_note(&tmp, &out));
+        assert!(e.to_string().contains(&tmp.display().to_string()), "{e}");
+        let log = std::fs::read_to_string(crate::log::path()).unwrap();
+        assert!(log.contains(&format!("Couldn't name an export: {e}")), "in the log too");
+        drop(holder);
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"whole", "kept");
+        assert!(!out.exists());
+        assert_eq!(
+            kept_note(Path::new(r"D:\Clips\Ace (trim).rv-export.mp4"), Path::new(r"D:\Clips\Ace (trim).mp4")),
+            r"it was made, but another program had it open, so it couldn't be named Ace (trim).mp4. It's saved as D:\Clips\Ace (trim).rv-export.mp4. Rename it to Ace (trim).mp4 in File Explorer to keep it; the app may move it to the Recycle Bin after a day."
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The daily backup is taken only from an old file that reads back as what's being saved: valid
@@ -2312,7 +2642,48 @@ mod tests {
         let sorted = dir.join("2026-11-07 21-41-00.mp4");
         std::fs::write(&sorted, b"clip").unwrap();
         assert_eq!(move_into(&sorted, &dir.join("VALORANT"), "VALORANT").unwrap(), dir.join(r"VALORANT\VALORANT 2026-11-07 21-41-00.mp4"));
+        // OBS's "Replay" goes, and a second clip of the same second is numbered, never put over the first.
+        for (n, want) in [(1u8, "VALORANT 11-21-2026 05-53-32 PM.mp4"), (2, "VALORANT 11-21-2026 05-53-32 PM (2).mp4")] {
+            let obs = dir.join("Replay 11-21-2026 05-53-32 PM.mp4");
+            std::fs::write(&obs, [n]).unwrap();
+            assert_eq!(move_into(&obs, &dir, "VALORANT").unwrap(), dir.join(want));
+            assert_eq!(std::fs::read(dir.join(want)).unwrap(), [n]);
+        }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The game takes the place of OBS's "Replay" in either name style, goes in front of a date
+    /// alone or any other name, and nothing changes without one.
+    #[test]
+    fn placed_names() {
+        assert_eq!(placed_stem("Replay 11-21-2026 05-53-32 PM", "VALORANT"), "VALORANT 11-21-2026 05-53-32 PM");
+        assert_eq!(placed_stem("Replay 2026-11-21 17-53-32", "Elden Ring"), "Elden Ring 2026-11-21 17-53-32");
+        assert_eq!(placed_stem("11-21-2026 05-53-32 PM", "VALORANT"), "VALORANT 11-21-2026 05-53-32 PM");
+        assert_eq!(placed_stem("2026-11-21 17-53-32", "Desktop"), "Desktop 2026-11-21 17-53-32");
+        // Not OBS's name: as before, the game goes in front of all of it.
+        for other in ["Replay 1", "Replay  2026-11-21 17-53-32", "Replay 2026-11-21 17-53-32 (trim)", "replay 2026-11-21 17-53-32", "Ace"] {
+            assert_eq!(placed_stem(other, "VALORANT"), format!("VALORANT {other}"));
+        }
+        for stem in ["Replay 11-21-2026 05-53-32 PM", "VALORANT Replay 11-21-2026 05-53-32 PM", "x"] {
+            assert_eq!(placed_stem(stem, ""), stem);
+        }
+        // A game called Replay: never OBS's own name again.
+        assert_eq!(placed_stem("Replay 11-21-2026 05-53-32 PM", "Replay"), "Replay Replay 11-21-2026 05-53-32 PM");
+        assert_eq!(placed_stem("2026-11-21 17-53-32", "Replay"), "Replay Replay 2026-11-21 17-53-32");
+        assert_eq!(placed_stem("Ace", "Replay"), "Replay Ace");
+        assert_eq!(placed_stem("2026-11-21 17-53-32", "replay"), "replay 2026-11-21 17-53-32");
+    }
+
+    /// A held clip is tried again soon (50, 100, 200 ms), then every 500 ms, for about 5 s in all
+    /// (as before the quick first retries).
+    #[test]
+    fn move_retries_back_off() {
+        let waits: Vec<u64> = (0..).map_while(move_retry_wait).map(|d| d.as_millis() as u64).collect();
+        assert_eq!(waits[..5], [50, 100, 200, 500, 500]);
+        assert!(waits[3..].iter().all(|&w| w == 500));
+        let total: u64 = waits.iter().sum();
+        assert!((4_500..=5_000).contains(&total), "{total} ms");
+        assert_eq!(move_retry_wait(waits.len() as u32), None);
     }
 
     #[test]

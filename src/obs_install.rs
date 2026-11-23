@@ -17,9 +17,21 @@ const RELEASES: &str = "https://api.github.com/repos/obsproject/obs-studio/relea
 const VC_REDIST: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
 const AGENT: &str = "replay-vault";
 
+/// What the app keeps in the install folder, by name (`tidy` and Remove go by these alone): the
+/// private copy, a downloaded update waiting for the next start, the last swap's old copy, what
+/// `fetch` unpacks into (`dest.with_extension("partial")`, the same for the copy and the update)
+/// and the download itself.
+pub(crate) const PRIVATE: &str = "obs-studio";
+pub(crate) const STAGED: &str = "obs-studio.update";
+pub(crate) const OLD: &str = "obs-studio.old";
+pub(crate) const PARTIAL: &str = "obs-studio.partial";
+pub(crate) const DOWNLOAD: &str = "obs-download.zip";
+/// The VC++ installer's name in its `vc-` folder (`vc_runtime`).
+pub(crate) const VC_REDIST_FILE: &str = "vc_redist.x64.exe";
+
 /// %LOCALAPPDATA%\replay-vault. An OBS copy installed before the rename stays where it is
 /// (obs-instant-replay): moving it would break the firewall rule and graphics setting that name its exe.
-fn base() -> PathBuf {
+pub(crate) fn base() -> PathBuf {
     if let Some(d) = crate::config::local_data() {
         return d.join("obs");
     }
@@ -218,29 +230,64 @@ fn set_dacl(dir: &Path, sddl: &str, tree: bool) -> anyhow::Result<()> {
 
 /// Our private copy, and where a downloaded update waits until the next start.
 pub fn private_dir() -> PathBuf {
-    install_root().join("obs-studio")
+    install_root().join(PRIVATE)
 }
 
 /// Moves what the app keeps in the install folder to the Recycle Bin (the private OBS, a waiting
-/// update or download, the update stamp), then removes the folder if that left it empty. Only
-/// these by name, so anything else in a folder the user picked stays. Returns what couldn't go.
+/// update or download, the update stamp) and the VC++ installers' `vc-` folders, then removes the
+/// folder (and the `vc-` folders' one, if it's another) if that left it empty. Only these by name,
+/// so anything else in a folder the user picked stays. Returns what couldn't go.
 pub fn recycle_install_root() -> Vec<String> {
     let root = install_root();
     if let Some(why) = crate::instance::current().install_root_kept(&root) {
         return vec![why];
     }
-    let ours = [private_dir(), staged_dir(), root.join("obs-studio.old"), root.join("obs-studio.partial"), root.join("obs-download.zip"), update_stamp(), crate::app_update::installer_path()];
+    let mut ours = vec![private_dir(), staged_dir(), root.join(OLD), root.join(PARTIAL), root.join(DOWNLOAD), update_stamp(), crate::app_update::installer_path()];
+    ours.extend(vc_folders(&base()));
     let problems = ours
         .iter()
         .filter(|p| p.exists())
         .filter_map(|p| crate::clips::recycle(p).err().map(|e| format!("{}: {e:#}", p.display())))
         .collect();
     let _ = fs::remove_dir(&root);
+    if !same_dir(&base(), &root) {
+        let _ = fs::remove_dir(base());
+    }
     problems
 }
 
+/// The `vc-` folders in `base` that are surely `vc_runtime`'s (`is_vc_folder`, `holds_only_redist`).
+fn vc_folders(base: &Path) -> Vec<PathBuf> {
+    let Ok(items) = fs::read_dir(base) else { return Vec::new() };
+    items
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && e.file_name().to_str().is_some_and(is_vc_folder))
+        .map(|e| e.path())
+        .filter(|p| holds_only_redist(p))
+        .collect()
+}
+
+/// Whether `name` is one `vc_runtime` gives its folder: "vc-" and exactly `config::random_hex`'s
+/// digits (lower case hex, as many as it makes).
+pub(crate) fn is_vc_folder(name: &str) -> bool {
+    static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let len = *LEN.get_or_init(|| crate::config::random_hex().len());
+    name.strip_prefix("vc-").is_some_and(|hex| hex.len() == len && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+/// Whether the folder `dir` holds nothing but the VC++ installer (or nothing at all). Anything else
+/// in it, or a folder that can't be read whole, means no.
+pub(crate) fn holds_only_redist(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|items| items.into_iter().all(|e| e.is_ok_and(|e| e.file_name() == VC_REDIST_FILE && e.file_type().is_ok_and(|t| t.is_file()))))
+}
+
+/// Whether two folders are the same as written, ignoring the case of letters (as Windows does).
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
+    a.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).eq(b.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()))
+}
+
 fn staged_dir() -> PathBuf {
-    install_root().join("obs-studio.update")
+    install_root().join(STAGED)
 }
 
 /// When the update check last ran; next to the private copy, so its folder is known to exist.
@@ -248,7 +295,7 @@ fn update_stamp() -> PathBuf {
     install_root().join("last-update-check")
 }
 
-fn exe_in(dir: &Path) -> PathBuf {
+pub(crate) fn exe_in(dir: &Path) -> PathBuf {
     dir.join(r"bin\64bit\obs64.exe")
 }
 
@@ -425,7 +472,7 @@ fn fetch(rel: &Release, dest: &Path, p: &Shared) -> anyhow::Result<()> {
     if let Some(fixed) = secure_install_root()? {
         crate::log::write(&format!("Made the private OBS folder {} private to this account ({fixed}).", install_root().display()));
     }
-    let zip_path = install_root().join("obs-download.zip");
+    let zip_path = install_root().join(DOWNLOAD);
     // Kept open from download to unpacking, and no one else may write to it meanwhile, so what's
     // unpacked is exactly the bytes whose checksum was checked.
     let mut file = {
@@ -505,16 +552,21 @@ fn vc_runtime(p: &Shared) -> anyhow::Result<()> {
     // A new folder each time, so nothing can be swapped in at a known path before it runs.
     let dir = base().join(format!("vc-{}", crate::config::random_hex()));
     fs::create_dir_all(&dir)?;
-    let path = dir.join("vc_redist.x64.exe");
+    // Whatever happened, the folder goes after.
+    let ran = run_vc_redist(&dir.join(VC_REDIST_FILE), p);
+    let _ = fs::remove_dir_all(&dir);
+    ran
+}
+
+/// Downloads the VC++ installer to `path`, checks its signature and runs it.
+fn run_vc_redist(path: &Path, p: &Shared) -> anyhow::Result<()> {
     let mut resp = get(VC_REDIST, None)?;
-    io::copy(&mut resp.body_mut().as_reader(), &mut File::create(&path)?)?;
-    if !signed_by_microsoft(&path) {
-        let _ = fs::remove_dir_all(&dir);
+    io::copy(&mut resp.body_mut().as_reader(), &mut File::create(path)?)?;
+    if !signed_by_microsoft(path) {
         anyhow::bail!("the downloaded Visual C++ installer isn't signed by Microsoft, so it wasn't run");
     }
     set(p, "Installing the Visual C++ runtime", 0, 0);
-    let status = Command::new(&path).args(["/install", "/passive", "/norestart"]).status()?;
-    let _ = fs::remove_dir_all(&dir);
+    let status = Command::new(path).args(["/install", "/passive", "/norestart"]).status()?;
     // 3010 = installed, restart recommended; the DLLs are usable right away.
     if !status.success() && status.code() != Some(3010) && !has_vc_runtime() {
         anyhow::bail!("the Visual C++ runtime installer didn't finish (code {:?})", status.code());
@@ -734,18 +786,14 @@ pub(crate) fn prune(dir: &Path) {
     }
 }
 
-/// Swaps in a downloaded update, and takes OBS's debug files out of our copy (`prune`). Call
-/// before the recorder starts.
+/// Swaps in a downloaded update. Call before the recorder starts. What a swap leaves behind (the
+/// old copy, if a file in it was still in use) and OBS's debug files go in `tidy`.
 pub fn apply_staged_update() -> Option<String> {
-    prune(&private_dir());
-    // The last swap's old copy, if a file in it was still in use then: deleted for good, not
-    // recycled.
-    let _ = fs::remove_dir_all(install_root().join("obs-studio.old"));
     let staged = staged_dir();
     let version = fs::read_to_string(staged.join("version.txt")).ok()?.trim().to_string();
     recorder::stop();
     // Same folder as the copy, so the renames never cross drives.
-    let old = install_root().join("obs-studio.old");
+    let old = install_root().join(OLD);
     let _ = fs::remove_dir_all(&old);
     if fs::rename(private_dir(), &old).is_err() || fs::rename(&staged, private_dir()).is_err() {
         // Put things back the way they were if the swap failed half way.
@@ -758,20 +806,29 @@ pub fn apply_staged_update() -> Option<String> {
     Some(version)
 }
 
+/// How often `check_for_update` asks GitHub.
+const CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
+
+/// Whether the update check is due, from when it last ran (`last`, None if never): a day after.
+/// A time after `now` (the clock was put back) counts as due, so a wrong clock can't stop the
+/// checks; the check then stamps the real time.
+fn due(last: Option<SystemTime>, now: SystemTime) -> bool {
+    last.is_none_or(|t| now.duration_since(t).ok().is_none_or(|age| age >= CHECK_EVERY))
+}
+
 /// Background check, at most once a day, for a newer OBS than our private copy. A newer one
 /// is downloaded and unpacked next to it and swapped in at the next app start, so a running
 /// replay buffer is never cut off. Returns the version that was staged, if any.
 pub fn check_for_update() -> anyhow::Result<Option<String>> {
     let Some(current) = private_version() else { return Ok(None) };
     let stamp = update_stamp();
-    let recent = fs::metadata(&stamp)
-        .and_then(|m| m.modified())
-        .is_ok_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() < Duration::from_secs(24 * 3600));
-    if recent || staged_dir().join("version.txt").exists() {
+    let last = fs::metadata(&stamp).and_then(|m| m.modified()).ok();
+    if !due(last, SystemTime::now()) || staged_dir().join("version.txt").exists() {
         return Ok(None);
     }
     let rel = latest_release()?;
-    fs::write(&stamp, b"")?;
+    // Its time set outright: writing an empty file over an empty one may not move it.
+    File::create(&stamp)?.set_modified(SystemTime::now())?;
     let newer = match (last_version_stamp(&rel.version), last_version_stamp(&current)) {
         (Some(new), Some(cur)) => new > cur,
         _ => false,
@@ -1019,6 +1076,77 @@ mod tests {
         assert!(fixed.is_some_and(|f| !f.contains("downloaded again")));
         assert!(kept, "a copy nobody else could change is kept");
         assert!(inner.is_some_and(|f| f.contains("downloaded again")) && removed, "an open folder inside counts too");
+    }
+
+    /// The update check runs a day after the last one, or when there was none; a stamp from the
+    /// future (the clock was put back) doesn't hold it off.
+    #[test]
+    fn update_check_due() {
+        let now = SystemTime::now();
+        let hours = |h: u64| Duration::from_secs(h * 3600);
+        assert!(due(None, now));
+        assert!(!due(Some(now - hours(1)), now));
+        assert!(!due(Some(now - hours(23)), now));
+        assert!(due(Some(now - hours(25)), now));
+        assert!(due(Some(now + hours(1)), now), "a stamp from the future");
+    }
+
+    /// Rewriting an empty file over an empty one may leave its time as it was, so the stamp sets
+    /// its time outright. Prints what Windows did with the plain rewrite (`--nocapture`).
+    #[test]
+    fn update_stamp_moves() {
+        let dir = std::env::temp_dir().join(format!("replay-vault-stamp-{}", crate::config::random_hex()));
+        fs::create_dir_all(&dir).unwrap();
+        let stamp = dir.join("last-update-check");
+        let two_days = SystemTime::now() - Duration::from_secs(2 * 86_400);
+        fs::write(&stamp, b"").unwrap();
+        File::options().write(true).open(&stamp).unwrap().set_modified(two_days).unwrap();
+        fs::write(&stamp, b"").unwrap();
+        let plain = fs::metadata(&stamp).unwrap().modified().unwrap();
+        eprintln!("fs::write over an empty file: modified time {}", if plain > two_days + Duration::from_secs(60) { "moved" } else { "did not move" });
+        File::options().write(true).open(&stamp).unwrap().set_modified(two_days).unwrap();
+        File::create(&stamp).unwrap().set_modified(SystemTime::now()).unwrap();
+        let now = fs::metadata(&stamp).unwrap().modified().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!due(Some(now), SystemTime::now()), "the stamp reads as just checked");
+    }
+
+    /// `fetch` unpacks into PARTIAL for both the copy and the update; the names tidy and Remove go by.
+    #[test]
+    fn partial_name_matches_fetch() {
+        assert_eq!(Path::new(PRIVATE).with_extension("partial"), Path::new(PARTIAL));
+        assert_eq!(Path::new(STAGED).with_extension("partial"), Path::new(PARTIAL));
+        assert_eq!(exe_in(&Path::new(r"E:\x").join(PRIVATE)), PathBuf::from(r"E:\x\obs-studio\bin\64bit\obs64.exe"));
+    }
+
+    /// Only `vc_runtime`'s own folder names: "vc-" and exactly random_hex's lower case digits.
+    #[test]
+    fn vc_folder_names() {
+        let hex = crate::config::random_hex();
+        assert!(is_vc_folder(&format!("vc-{hex}")));
+        assert!(is_vc_folder(&format!("vc-{}", "0123456789abcdef".repeat(2))));
+        for not in [format!("vc-{}", &hex[1..]), format!("vc-{hex}0"), format!("vc-{}", "0123456789ABCDEF".repeat(2)), format!("vc-{}g", &hex[1..]), format!("VC-{hex}"), format!("vc_{hex}"), hex.clone(), "vc-".into()] {
+            assert!(!is_vc_folder(&not), "{not}");
+        }
+    }
+
+    /// A vc- folder counts only if it holds nothing but the installer (or nothing).
+    #[test]
+    fn vc_folder_contents() {
+        let dir = std::env::temp_dir().join(format!("replay-vault-vc-{}", crate::config::random_hex()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(holds_only_redist(&dir), "empty");
+        fs::write(dir.join(VC_REDIST_FILE), b"x").unwrap();
+        assert!(holds_only_redist(&dir));
+        fs::write(dir.join("other.txt"), b"x").unwrap();
+        assert!(!holds_only_redist(&dir), "another file");
+        fs::remove_file(dir.join("other.txt")).unwrap();
+        fs::create_dir(dir.join("sub")).unwrap();
+        assert!(!holds_only_redist(&dir), "a folder inside");
+        assert!(!holds_only_redist(&dir.join("missing")), "not there");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(same_dir(Path::new(r"C:\Users\X\AppData\Local\replay-vault"), Path::new(r"c:\users\x\appdata\local\Replay-Vault\")));
+        assert!(!same_dir(Path::new(r"C:\Users\X\AppData\Local\replay-vault"), Path::new(r"D:\OBS")));
     }
 
     #[test]

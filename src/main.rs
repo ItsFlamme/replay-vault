@@ -21,9 +21,11 @@ mod overlay;
 mod perf;
 mod profile;
 mod recorder;
+mod save_flow;
 mod session;
 mod startup;
 mod support;
+mod tidy;
 mod player;
 mod toast;
 mod tweaks;
@@ -318,6 +320,8 @@ struct App {
     applied: String,
     hotkey_error: Option<String>,
     capturing: Option<Target>,
+    /// A key just picked that couldn't be used, with why, shown under its row until the next capture.
+    capture_error: Option<(Target, String)>,
     /// When a key capture last ended. Esc cancels a capture on the hotkey thread a moment
     /// before the window sees the same press, which must not then hide the app.
     capture_ended: Option<std::time::Instant>,
@@ -490,6 +494,8 @@ struct App {
     slim: Slim,
     /// The mic is muted with its key (until unmuted or the app closes).
     mic_muted: bool,
+    /// A save failed and its moment is still in the replay until then (`Event::SaveAgain`).
+    save_again: Option<std::time::Instant>,
     /// A display change the recorder hasn't been restarted for yet (see `follow_displays`).
     display_wait: Option<DisplayWait>,
     /// When a display change last restarted the recorder.
@@ -647,26 +653,34 @@ impl App {
         store_look(&cfg);
         toast_look();
         toast::start();
-        let clips_root = std::path::PathBuf::from(&cfg.folder);
+        let (clips_root, shared_ok) = (cfg.folder.clone(), cfg.shared_folder_ok.clone());
         let archive = (cfg.archive_days > 0 && !cfg.archive_folder.trim().is_empty()).then(|| std::path::PathBuf::from(cfg.archive_folder.trim()));
-        std::thread::spawn(move || covers::tidy(&clips_root, archive.as_deref()));
+        std::thread::spawn(move || tidy::settings_phase(&clips_root, archive.as_deref(), &shared_ok));
         let ctx = cc.egui_ctx.clone();
         let repaint: obs::Repaint = Arc::new(move || ctx.request_repaint());
         let (update_tx, update_repaint) = (ev_tx.clone(), repaint.clone());
         std::thread::spawn(move || obs::run(cmd_rx, ev_tx, repaint));
         // Keeps our private OBS copy current; it only ever downloads, the swap waits for a restart.
-        std::thread::spawn(move || loop {
-            let msg = match obs_install::check_for_update() {
-                Ok(Some(v)) => Some(format!("OBS {v} downloaded. It installs the next time the app starts.")),
-                Ok(None) => None,
-                Err(e) => Some(format!("Couldn't check for OBS updates: {e:#}")),
-            };
-            if let Some(msg) = msg {
-                log::write(&msg);
-                let _ = update_tx.send(Event::Status(msg));
+        // First, once, what an earlier download or swap left in its folder: on this thread, so it
+        // never meets a download here.
+        std::thread::spawn(move || {
+            if let Some(note) = tidy::install_root_phase() {
+                let _ = update_tx.send(Event::Status(note));
                 update_repaint();
             }
-            std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
+            loop {
+                let msg = match obs_install::check_for_update() {
+                    Ok(Some(v)) => Some(format!("OBS {v} downloaded. It installs the next time the app starts.")),
+                    Ok(None) => None,
+                    Err(e) => Some(format!("Couldn't check for OBS updates: {e:#}")),
+                };
+                if let Some(msg) = msg {
+                    log::write(&msg);
+                    let _ = update_tx.send(Event::Status(msg));
+                    update_repaint();
+                }
+                std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
+            }
         });
 
         let ctx = cc.egui_ctx.clone();
@@ -675,7 +689,7 @@ impl App {
         // The app's hotkeys work even while a game has focus.
         let ctx = cc.egui_ctx.clone();
         let hotkey_cmds = cmd_tx.clone();
-        let hook = hotkey::install(move |action| {
+        let hook = hotkey::install(move |action, at| {
             let cmd = match action {
                 hotkey::Action::Overlay => {
                     TOGGLE_PRESSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -686,7 +700,7 @@ impl App {
                 hotkey::Action::Screenshot => Cmd::Screenshot,
                 hotkey::Action::Replay => Cmd::ToggleReplay,
                 hotkey::Action::Mic => Cmd::ToggleMic,
-                hotkey::Action::SaveKey => Cmd::save_key_pressed(),
+                hotkey::Action::SaveKey => Cmd::save_key_pressed(at),
             };
             let _ = hotkey_cmds.send(cmd);
         });
@@ -790,6 +804,7 @@ impl App {
             applied: String::new(),
             hotkey_error: None,
             capturing: None,
+            capture_error: None,
             capture_ended: None,
             conflicts: Vec::new(),
             conflicts_keys: Vec::new(),
@@ -883,12 +898,18 @@ impl App {
             encoder_hint: None,
             slim: Slim::Visible,
             mic_muted: false,
+            save_again: None,
             display_wait: None,
             display_restarted: None,
         }
     }
 
-    fn handle_events(&mut self) {
+    /// How long a failed save's moment stays in the replay, while it does (no I/O: from an Instant).
+    fn save_again_left(&self) -> Option<std::time::Duration> {
+        self.save_again.and_then(|until| until.checked_duration_since(std::time::Instant::now())).filter(|left| !left.is_zero())
+    }
+
+    fn handle_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.events.try_recv() {
             match ev {
                 Event::Status(s) => self.status = s,
@@ -899,7 +920,13 @@ impl App {
                 Event::EncoderSkipped { frames, effort } => self.encoder_hint = Some((frames, effort)),
                 Event::Recording(on) => self.recording = on,
                 Event::MicMuted(on) => self.mic_muted = on,
+                Event::SaveAgain(until) => self.save_again = until,
             }
+        }
+        // Another pass when the moment leaves the replay, so the offer to save it again goes.
+        let save_again = self.save_again_left();
+        if let Some(left) = save_again {
+            ctx.request_repaint_after(left);
         }
         // A recorder that went away took its recording with it.
         self.recording &= self.connected;
@@ -923,7 +950,8 @@ impl App {
                 (true, false) => "Paused".to_string(),
                 _ => "Recorder not running".to_string(),
             };
-            let shown = (status, format!("Save clip ({})", self.saved.hotkey), self.connected, self.buffer, self.start_with_windows);
+            let save = if save_again.is_some() { "Save again" } else { "Save clip" };
+            let shown = (status, format!("{save} ({})", self.saved.hotkey), self.connected, self.buffer, self.start_with_windows);
             if menu.shown.as_ref() != Some(&shown) {
                 menu.status.set_text(&shown.0);
                 menu.save.set_text(&shown.1);
@@ -1351,6 +1379,13 @@ impl App {
                 };
                 if ui.add(line).on_hover_ui(hover).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     let _ = self.cmds.send(Cmd::ToggleMic);
+                }
+            }
+            // A save that failed while its moment is still in the replay: one click saves it.
+            if let Some(words) = self.save_again_left().and_then(save_flow::left_words) {
+                let line = egui::Label::new(RichText::new("Clip not saved. Save again").small().color(pal().amber)).sense(egui::Sense::click());
+                if ui.add(line).on_hover_text(format!("The moment is still in the replay for {words}. Click to save it.")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    let _ = self.cmds.send(Cmd::Save);
                 }
             }
             // A key another program took since the keys were set (Keybinds says who and what to
@@ -1792,8 +1827,9 @@ impl App {
 }
 
 /// Takes the app itself off the PC once it has quit. An installed copy runs its uninstaller,
-/// which also takes away the Start menu and desktop shortcuts. A portable copy deletes its exe
-/// and notices a moment after it quits. A dev build is left alone.
+/// which also takes away the Start menu and desktop shortcuts. A portable copy recycles the
+/// notices this build shipped beside it, then deletes its exe a moment after it quits. A dev
+/// build is left alone.
 fn uninstall_app() -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1802,19 +1838,131 @@ fn uninstall_app() -> anyhow::Result<()> {
     if app_update::installed() {
         std::process::Command::new(dir.join("unins000.exe")).args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]).spawn()?;
     } else if !DEV_BUILD {
-        let files: Vec<String> = [exe.clone(), dir.join("LICENSE"), dir.join("NOTICE"), dir.join("THIRD-PARTY-NOTICES.md"), dir.join("README.md"), dir.join("debug.log")]
-            .iter()
-            .map(|p| format!("\"{}\"", p.display()))
-            .collect();
-        // Waits about 2 s for this process to end, so its exe can be deleted. rd only removes
-        // the folder if nothing else is in it.
-        std::process::Command::new("cmd")
-            .raw_arg(format!("/c ping -n 3 127.0.0.1 >nul & del /f /q {} & rd \"{}\"", files.join(" "), dir.display()))
-            .current_dir(std::env::temp_dir())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()?;
+        // Before the folder's rd, so it can find the folder empty.
+        let kept = recycle_shipped(dir, clips::recycle);
+        let ping = recorder::windows_exe("PING.EXE");
+        let (line, vars) = self_delete(&exe, dir, &ping);
+        std::process::Command::new(recorder::windows_exe("cmd.exe")).raw_arg(line).envs(vars).current_dir(std::env::temp_dir()).creation_flags(CREATE_NO_WINDOW).spawn()?;
+        if !kept.is_empty() {
+            anyhow::bail!("{}", kept.join("; "));
+        }
     }
     Ok(())
+}
+
+/// The `cmd` line that deletes only `exe`, which can't go while it runs (it waits about 2 s for
+/// this process to end, with `ping`, Windows' PING.EXE by its full path), then `dir` only if
+/// nothing else is in it (rd, not recursive); and the variables it reads the three paths from. The
+/// paths are never in the line, where cmd would expand a `%name%` in them: it doesn't expand a
+/// variable's value again, and with delayed expansion off (`/v:off`, whatever the registry says) a
+/// `!` is only a `!`. `/d` skips any AutoRun command. The line is in one more pair of quotes,
+/// which cmd takes off, as it starts with one.
+fn self_delete<'a>(exe: &'a std::path::Path, dir: &'a std::path::Path, ping: &'a std::path::Path) -> (&'static str, [(&'static str, &'a std::path::Path); 3]) {
+    (r#"/d /v:off /c ""%RV_PING%" -n 3 127.0.0.1 >nul & del /f /q "%RV_EXE%" & rd "%RV_DIR%"""#, [("RV_PING", ping), ("RV_EXE", exe), ("RV_DIR", dir)])
+}
+
+/// The notices the portable zip carries beside the exe, as this build has them: tools/release.ps1
+/// copies them from the root of the same checkout this exe is built from, so a shipped one is
+/// byte for byte these. Compared exactly, line endings and all. debug.log is never one: Chromium
+/// writes it, so the app can't tell it's its own.
+const SHIPPED: [(&str, &[u8]); 4] = [
+    ("LICENSE", include_bytes!("../LICENSE")),
+    ("NOTICE", include_bytes!("../NOTICE")),
+    ("THIRD-PARTY-NOTICES.md", include_bytes!("../THIRD-PARTY-NOTICES.md")),
+    ("README.md", include_bytes!("../README.md")),
+];
+
+/// Whether a file beside a portable exe is one this build shipped: its exact name and exact bytes.
+/// A file the user made with the same name (the exe sitting in Downloads), or a notice from another
+/// version (a portable copy updated in place only gets a new exe), doesn't match and stays.
+fn shipped(name: &str, bytes: &[u8]) -> bool {
+    SHIPPED.iter().any(|(n, b)| *n == name && *b == bytes)
+}
+
+/// Removes (with `remove`) only the files in `dir` that `shipped` proves are this build's notices.
+/// Anything else is never read past its size. Returns what couldn't be removed, saying why.
+fn recycle_shipped(dir: &std::path::Path, remove: impl Fn(&std::path::Path) -> anyhow::Result<()>) -> Vec<String> {
+    let mut kept = Vec::new();
+    for (name, bytes) in SHIPPED {
+        let path = dir.join(name);
+        // A plain file of the right size first, so a link or a big file isn't read.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if !meta.is_file() || meta.len() != bytes.len() as u64 || !std::fs::read(&path).is_ok_and(|b| shipped(name, &b)) {
+            continue;
+        }
+        if let Err(e) = remove(&path) {
+            kept.push(format!("{name}: {e:#}"));
+        }
+    }
+    kept
+}
+
+#[cfg(test)]
+mod remove_tests {
+    use super::*;
+
+    /// Only an exact name with exact bytes is this build's: one byte off, another version's
+    /// README, an unknown name or debug.log always stays.
+    #[test]
+    fn only_shipped_notices_go() {
+        let license = include_bytes!("../LICENSE");
+        assert!(shipped("LICENSE", license));
+        let mut changed = license.to_vec();
+        changed[0] ^= 1;
+        assert!(!shipped("LICENSE", &changed), "one byte changed");
+        assert!(!shipped("LICENSE", &license[..license.len() - 1]), "one byte short");
+        assert!(!shipped("README.md", b"# Replay Vault 0.1.0\r\nAn older README.\r\n"), "another version's README");
+        assert!(!shipped("README.md", license), "right bytes, wrong name");
+        assert!(!shipped("notes.txt", license), "unknown name");
+        assert!(!shipped("debug.log", b""));
+        assert!(!shipped("debug.log", license));
+        assert!(SHIPPED.iter().all(|(n, b)| shipped(n, b)));
+    }
+
+    /// In a temp folder: the matching notices go, a changed one, debug.log and the user's own
+    /// files stay, and a remover that fails says which.
+    #[test]
+    fn recycles_only_proven_files() {
+        let dir = std::env::temp_dir().join(format!("rv-remove-test-{}", config::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("LICENSE"), include_bytes!("../LICENSE")).unwrap();
+        std::fs::write(dir.join("NOTICE"), include_bytes!("../NOTICE")).unwrap();
+        let mut readme = include_bytes!("../README.md").to_vec();
+        readme.push(b'x');
+        std::fs::write(dir.join("README.md"), &readme).unwrap();
+        std::fs::write(dir.join("debug.log"), b"chromium").unwrap();
+        std::fs::write(dir.join("photo.jpg"), b"mine").unwrap();
+        let gone = std::cell::RefCell::new(Vec::new());
+        let kept = recycle_shipped(&dir, |p| {
+            gone.borrow_mut().push(p.file_name().unwrap().to_string_lossy().into_owned());
+            if p.ends_with("NOTICE") { anyhow::bail!("in use") }
+            std::fs::remove_file(p)?;
+            Ok(())
+        });
+        assert_eq!(*gone.borrow(), ["LICENSE", "NOTICE"]);
+        assert_eq!(kept, ["NOTICE: in use"]);
+        assert!(!dir.join("LICENSE").exists());
+        for f in ["NOTICE", "README.md", "debug.log", "photo.jpg"] {
+            assert!(dir.join(f).exists(), "{f} stays");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The paths go only through variables, never into cmd's line, so a `%name%` or `!` in them
+    /// is never expanded; rd stays non-recursive.
+    #[test]
+    fn self_delete_line_holds_no_path() {
+        let (exe, dir) = (std::path::Path::new(r"D:\Downloads\%TEMP%\a!b & c\ReplayVault.exe"), std::path::Path::new(r"D:\Downloads\%TEMP%\a!b & c"));
+        let ping = recorder::windows_exe("PING.EXE");
+        let (line, vars) = self_delete(exe, dir, &ping);
+        assert_eq!(line, r#"/d /v:off /c ""%RV_PING%" -n 3 127.0.0.1 >nul & del /f /q "%RV_EXE%" & rd "%RV_DIR%"""#);
+        assert!(!line.contains(":\\") && !line.contains("Downloads") && !line.contains("/s") && !line.to_lowercase().contains("ping "), "{line}");
+        assert_eq!(vars, [("RV_PING", ping.as_path()), ("RV_EXE", exe), ("RV_DIR", dir)]);
+        assert!(ping.is_absolute() && ping.to_string_lossy().to_lowercase().ends_with(r"system32\ping.exe"), "{}", ping.display());
+        // Run by its full path, never a cmd.exe beside a portable exe.
+        let cmd = recorder::windows_exe("cmd.exe");
+        assert!(cmd.is_absolute() && cmd.to_string_lossy().to_lowercase().ends_with(r"system32\cmd.exe"), "{}", cmd.display());
+    }
 }
 
 impl App {
@@ -1955,7 +2103,7 @@ impl eframe::App for App {
             overlay::hide();
             ui.ctx().request_repaint();
         }
-        self.handle_events();
+        self.handle_events(ui.ctx());
         // From the tray too: the recorder follows a display change while the window is hidden.
         self.follow_displays(ui.ctx());
         self.pump_jobs(ui.ctx());
@@ -3306,7 +3454,7 @@ mod tests {
             app
         });
         h.run();
-        let item = "The sidebar, the Clips page and the settings pages have a cleaner layout, and the Retro theme now reaches every screen.";
+        let item = "Saving a clip shows Saving clip... with the game as soon as the app sees the click or the save key, until Clip saved replaces it.";
         assert!(h.query_by_label(item).is_some());
         h.get_by_label_contains("(this version)").click();
         // Past the closing animation.
@@ -3826,7 +3974,7 @@ mod tests {
             let _ = UnregisterHotKey(None, 0xA3);
         });
         held_rx.recv().unwrap();
-        let _ = hotkey::install(|_| {});
+        let _ = hotkey::install(|_, _| {});
         assert_eq!(hotkey::set_combo(hotkey::Action::Mic, Some(c)), Ok(hotkey::Held::Shared));
         done_tx.send(()).unwrap();
         other.join().unwrap();
@@ -3834,10 +3982,14 @@ mod tests {
         assert_eq!(hotkey::set_combo(hotkey::Action::Mic, None), Ok(hotkey::Held::Ours));
     }
 
+    /// Held by tests that fake a key capture: the capture state is one for the whole process.
+    pub(crate) static CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Picking a key another action already has moves it, rather than refusing; the save key's
     /// own key isn't taken from it.
     #[test]
     fn a_picked_key_moves_from_another_action() {
+        let _one = CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
         let mut h = egui_kittest::Harness::builder().with_max_steps(4).with_accessibility_check(false).build_eframe(|cc| App::preview(cc));
         let app = h.state_mut();
         (app.cfg.hotkey, app.cfg.hotkey_screenshot, app.cfg.hotkey_record) = ("Alt+F10".into(), "Alt+F12".into(), String::new());
@@ -4016,6 +4168,29 @@ mod tests {
         h.get_by_label("Mic muted").click();
         h.run_steps(2);
         assert!(rx.try_iter().any(|c| matches!(c, Cmd::ToggleMic)));
+    }
+
+    /// A failed save offers to save again in the status box while its moment is in the replay;
+    /// clicking saves. Once the moment is gone, so is the offer.
+    #[test]
+    fn status_box_offers_to_save_again() {
+        use egui_kittest::kittest::Queryable;
+        let (tx, rx) = mpsc::channel();
+        let mut h = egui_kittest::Harness::builder().with_max_steps(12).with_size([1100.0, 700.0]).with_accessibility_check(false).build_eframe(move |cc| {
+            let mut app = App::preview(cc);
+            (app.cmds, app.tab) = (tx, Tab::Keybinds);
+            app
+        });
+        h.run_steps(2);
+        assert!(h.query_by_label("Clip not saved. Save again").is_none());
+        h.state_mut().save_again = Some(std::time::Instant::now() + std::time::Duration::from_secs(160));
+        h.run_steps(2);
+        h.get_by_label("Clip not saved. Save again").click();
+        h.run_steps(2);
+        assert!(rx.try_iter().any(|c| matches!(c, Cmd::Save)));
+        h.state_mut().save_again = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(1));
+        h.run_steps(2);
+        assert!(h.query_by_label("Clip not saved. Save again").is_none());
     }
 
     /// Pictures in a temp folder `name`: a.png in VALORANT's folder, b.png not sorted.

@@ -176,7 +176,7 @@ fn demos() {
         let mut h = egui_kittest::Harness::builder().with_size(SIZE).with_accessibility_check(false).wgpu().build_eframe(move |cc| {
             let mut app = demo_app(cc, &f);
             // The paths a new user would see, not this PC's.
-            app.cfg.folder = r"C:\Users\You\Videos\Replay Vault".into();
+            app.cfg.folder = r"C:\Users\You\Videos\Replay Vault Clips".into();
             app.cfg.obs_dir = r"C:\Users\You\AppData\Local\replay-vault\obs-studio".into();
             app.saved = app.cfg.clone();
             obs_install::set_install_root(r"C:\Users\You\AppData\Local\replay-vault");
